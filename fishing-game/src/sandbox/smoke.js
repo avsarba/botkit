@@ -1,0 +1,14 @@
+import * as THREE from 'three';
+import { Sky } from 'three/addons/objects/Sky.js';
+const r = new THREE.WebGLRenderer({ antialias: true });
+r.setSize(innerWidth, innerHeight);
+document.body.appendChild(r.domElement);
+const s = new THREE.Scene();
+const sky = new Sky(); sky.scale.setScalar(1000); s.add(sky);
+sky.material.uniforms.sunPosition.value.set(0.3, 0.1, -1);
+const c = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 2000);
+const m = new THREE.Mesh(new THREE.TorusKnotGeometry(1, 0.3, 128, 16), new THREE.MeshStandardMaterial({ color: 0x3388aa }));
+m.position.z = -5; s.add(m); s.add(new THREE.HemisphereLight(0xffffff, 0x333333, 2));
+console.log('renderer', r.capabilities.isWebGL2 ? 'webgl2' : 'webgl1', r.getContext().getParameter(r.getContext().VERSION));
+let f = 0; r.setAnimationLoop(() => { f++; m.rotation.y += 0.02; r.render(s, c); });
+window.__game = { debug: { stats: () => ({ frames: f }) } };

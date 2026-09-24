@@ -1,0 +1,16 @@
+{
+  "name": "loon-lake-angler",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Loon Lake Angler: a realistic 3D fishing game that runs in the browser (three.js, WebGL).",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "shoot": "node tools/harness.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "three": "0.170.0"
+  },
+  "license": "MIT"
+}

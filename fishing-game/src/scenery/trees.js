@@ -513,11 +513,26 @@ export function buildSpruce(seed, kind = 'white') {
     for (let i = 0; i < n; i++) {
       const ang = off + (i / n) * Math.PI * 2 + (rng() - 0.5) * 0.5;
       const len = R * (0.8 + rng() * 0.35);
-      const wid = Math.max(0.5, len * (kind === 'fir' ? 0.62 : 0.72));
       const droop0 = kind === 'fir' ? 0.08 + rng() * 0.1 : 0.14 + rng() * 0.12;
       const droop1 = kind === 'fir' ? 0.2 + rng() * 0.15 : 0.42 + rng() * 0.25;
       const roll = (rng() - 0.5) * 0.6;
-      addCard(B, REGION.spruce, new THREE.Vector3(Math.cos(ang) * 0.06, h + (rng() - 0.5) * 0.25, Math.sin(ang) * 0.06), ang, len, wid, droop0, droop1, 0, 0, lightAO * (0.9 + rng() * 0.2), tint, roll);
+      const ao = lightAO * (0.9 + rng() * 0.2);
+      const y0 = h + (rng() - 0.5) * 0.25;
+      const wf = kind === 'fir' ? 0.58 : 0.64;
+      if (len < 2.1) {
+        addCard(B, REGION.spruce, new THREE.Vector3(Math.cos(ang) * 0.06, y0, Math.sin(ang) * 0.06), ang, len, Math.max(0.5, len * wf), droop0, droop1, 0, 0, ao, tint, roll);
+      } else {
+        // long lower branches: an inner spray and a drooping outer spray, fanned apart, so they
+        // read as layered foliage instead of one flat plate
+        const l1 = len * 0.58;
+        addCard(B, REGION.spruce, new THREE.Vector3(Math.cos(ang) * 0.06, y0, Math.sin(ang) * 0.06), ang, l1, Math.max(0.5, l1 * 0.85), droop0, droop0 + 0.12, 0, 0, ao * 0.85, tint, roll);
+        const a2 = ang + (rng() - 0.5) * 0.35;
+        const sx = Math.cos(ang) * len * 0.38;
+        const sz = Math.sin(ang) * len * 0.38;
+        const sy = y0 - Math.sin(droop0 + 0.06) * len * 0.38 + 0.08;
+        const l2 = len * 0.66;
+        addCard(B, REGION.spruce, new THREE.Vector3(sx, sy, sz), a2, l2, Math.max(0.5, l2 * 0.78), droop1 * 0.6, droop1 + 0.1, 0, 0, ao, tint, -roll);
+      }
     }
     // a few steep "filler" cards give the side silhouette body
     if (wi % 2 === 0 && tH < 0.85) {

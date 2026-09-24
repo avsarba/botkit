@@ -14,9 +14,9 @@ import { makeNoise2, fbm2 } from './noise.js';
 import { dataTexture } from './texutil.js';
 
 const QUALITY = {
-  high: { detailR: 130, sectors: 6, band: 1.0, interior: 0.55, far: 0.24, shellAz: 420, shellGrowth: 1.03, shellR1: 1900, spireP: 0.5, ridges: 2 },
-  medium: { detailR: 100, sectors: 6, band: 0.85, interior: 0.45, far: 0.18, shellAz: 330, shellGrowth: 1.036, shellR1: 1700, spireP: 0.2, ridges: 2 },
-  low: { detailR: 65, sectors: 4, band: 0.65, interior: 0.3, far: 0.12, shellAz: 240, shellGrowth: 1.045, shellR1: 1500, spireP: 0.12, ridges: 1 },
+  high: { detailR: 110, sectors: 6, band: 1.0, interior: 0.55, far: 0.24, shellAz: 420, shellGrowth: 1.03, shellR1: 2300, spireP: 0.5, skylineAz: 2400, ridges: 2 },
+  medium: { detailR: 90, sectors: 6, band: 0.85, interior: 0.45, far: 0.18, shellAz: 330, shellGrowth: 1.036, shellR1: 2100, spireP: 0.2, skylineAz: 1500, ridges: 2 },
+  low: { detailR: 60, sectors: 4, band: 0.65, interior: 0.3, far: 0.12, shellAz: 240, shellGrowth: 1.045, shellR1: 1800, spireP: 0.12, skylineAz: 800, ridges: 1 },
 };
 
 // species: near-geometry variants and impostor templates (seeds)
@@ -31,55 +31,77 @@ const SPECIES = [
 
 const CAP = { size: 1024, cw: 128, ch: 256 };
 
-// Render albedo (sqrt-encoded) and crown normals of each template into two atlases.
+// Render albedo (sqrt-encoded) and crown normals of each template into a two-attachment
+// render target (one pass, one depth buffer).
 function captureImpostors(renderer, templates, atlas) {
-  const opts = { minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: true, depthBuffer: true, format: THREE.RGBAFormat, type: THREE.UnsignedByteType };
-  const rtA = new THREE.WebGLRenderTarget(CAP.size, CAP.size, opts);
-  const rtN = new THREE.WebGLRenderTarget(CAP.size, CAP.size, opts);
-  rtA.texture.generateMipmaps = rtN.texture.generateMipmaps = true;
-  rtA.texture.anisotropy = rtN.texture.anisotropy = 4;
-  const vs = `
-    varying vec2 vUv; varying vec3 vCol; varying vec3 vN;
-    void main() {
-      vUv = uv;
-      #ifdef USE_COLOR
-      vCol = color;
-      #else
-      vCol = vec3(1.0);
-      #endif
-      vN = normal;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    }`;
-  const matA = new THREE.ShaderMaterial({
+  const rt = new THREE.WebGLRenderTarget(CAP.size, CAP.size, {
+    minFilter: THREE.LinearMipmapLinearFilter,
+    magFilter: THREE.LinearFilter,
+    generateMipmaps: true,
+    depthBuffer: true,
+    format: THREE.RGBAFormat,
+    type: THREE.UnsignedByteType,
+    count: 2,
+  });
+  for (const t of rt.textures) {
+    t.generateMipmaps = true;
+    t.anisotropy = 4;
+  }
+  const mat = new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3,
     uniforms: { map: { value: atlas } },
-    vertexShader: vs,
-    fragmentShader: `uniform sampler2D map; varying vec2 vUv; varying vec3 vCol; varying vec3 vN;
-      void main() { vec4 t = texture2D(map, vUv); if (t.a < 0.3) discard; gl_FragColor = vec4(sqrt(max(t.rgb * vCol, 0.0)), 1.0); }`,
+    vertexShader: `
+      out vec2 vUv; out vec3 vCol; out vec3 vN;
+      void main() {
+        vUv = uv;
+        #ifdef USE_COLOR
+        vCol = color;
+        #else
+        vCol = vec3(1.0);
+        #endif
+        vN = normal;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: `
+      uniform sampler2D map;
+      in vec2 vUv; in vec3 vCol; in vec3 vN;
+      layout(location = 0) out vec4 gAlbedo;
+      layout(location = 1) out vec4 gNormal;
+      void main() {
+        vec4 t = texture(map, vUv);
+        if (t.a < 0.3) discard;
+        gAlbedo = vec4(sqrt(max(t.rgb * vCol, 0.0)), 1.0);
+        gNormal = vec4(normalize(vN) * 0.5 + 0.5, 1.0);
+      }`,
     side: THREE.DoubleSide,
     vertexColors: true,
   });
-  const matN = new THREE.ShaderMaterial({
-    uniforms: { map: { value: atlas } },
-    vertexShader: vs,
-    fragmentShader: `uniform sampler2D map; varying vec2 vUv; varying vec3 vCol; varying vec3 vN;
-      void main() { vec4 t = texture2D(map, vUv); if (t.a < 0.3) discard; gl_FragColor = vec4(normalize(vN) * 0.5 + 0.5, 1.0); }`,
-    side: THREE.DoubleSide,
-    vertexColors: true,
+  // clear pass: albedo -> average foliage color (no dark mip fringes), normal -> facing
+  const clearMat = new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    uniforms: { uAvg: { value: new THREE.Vector3() } },
+    vertexShader: 'void main() { gl_Position = vec4(position.xy * 2.0, 0.999, 1.0); }',
+    fragmentShader: `uniform vec3 uAvg;
+      layout(location = 0) out vec4 gAlbedo;
+      layout(location = 1) out vec4 gNormal;
+      void main() { gAlbedo = vec4(uAvg, 0.0); gNormal = vec4(0.5, 0.5, 1.0, 0.0); }`,
+    depthWrite: false,
+    depthTest: false,
   });
   const scene = new THREE.Scene();
-  const mesh = new THREE.Mesh(templates[0].geometry, matA);
+  const mesh = new THREE.Mesh(templates[0].geometry, mat);
   mesh.frustumCulled = false;
   scene.add(mesh);
+  const clearScene = new THREE.Scene();
+  const clearQuad = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), clearMat);
+  clearQuad.frustumCulled = false;
+  clearScene.add(clearQuad);
   const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 400);
   cam.position.set(0, 0, 200);
   cam.lookAt(0, 0, 0);
   const prevRT = renderer.getRenderTarget();
-  const prevColor = new THREE.Color();
-  renderer.getClearColor(prevColor);
-  const prevAlpha = renderer.getClearAlpha();
   const prevAuto = renderer.autoClear;
   const prevShadow = renderer.shadowMap.autoUpdate;
-  renderer.autoClear = true;
   renderer.shadowMap.autoUpdate = false;
   const cols = CAP.size / CAP.cw;
   templates.forEach((t, i) => {
@@ -96,31 +118,28 @@ function captureImpostors(renderer, templates, atlas) {
     cam.top = t.height + 0.1;
     cam.bottom = t.height + 0.1 - span;
     cam.updateProjectionMatrix();
+    rt.viewport.set(cx, cy, CAP.cw, CAP.ch);
+    rt.scissor.set(cx, cy, CAP.cw, CAP.ch);
+    rt.scissorTest = true;
+    renderer.setRenderTarget(rt);
+    renderer.autoClear = false;
+    renderer.clearDepth();
+    clearMat.uniforms.uAvg.value.set(t.avg[0], t.avg[1], t.avg[2]);
+    renderer.render(clearScene, cam);
     mesh.geometry = t.geometry;
-    for (const [rt, mat, clear] of [
-      [rtA, matA, t.avg],
-      [rtN, matN, [0.5, 0.5, 1]],
-    ]) {
-      rt.viewport.set(cx, cy, CAP.cw, CAP.ch);
-      rt.scissor.set(cx, cy, CAP.cw, CAP.ch);
-      rt.scissorTest = true;
-      mesh.material = mat;
-      renderer.setClearColor(new THREE.Color().setRGB(clear[0], clear[1], clear[2], THREE.LinearSRGBColorSpace), 0);
-      renderer.setRenderTarget(rt);
-      renderer.render(scene, cam);
-    }
+    renderer.render(scene, cam);
   });
+  rt.scissorTest = false;
   renderer.setRenderTarget(prevRT);
-  renderer.setClearColor(prevColor, prevAlpha);
   renderer.autoClear = prevAuto;
   renderer.shadowMap.autoUpdate = prevShadow;
-  matA.dispose();
-  matN.dispose();
-  rtA.scissorTest = rtN.scissorTest = false;
-  return { albedo: rtA, normal: rtN };
+  mat.dispose();
+  clearMat.dispose();
+  clearQuad.geometry.dispose();
+  return { rt, albedo: rt.textures[0], normal: rt.textures[1] };
 }
 
-export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
+export function buildForest({ env, quality, renderer, shared, grid, culler }) {
   const Q = QUALITY[quality] || QUALITY.high;
   const group = new THREE.Group();
   group.name = 'forest';
@@ -170,9 +189,9 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
   const nearMat = new THREE.MeshLambertMaterial({ map: atlas, alphaTest: 0.42, side: THREE.DoubleSide, vertexColors: true });
   nearMat.name = 'scenery.trees';
   patchMaterial(nearMat, shared, { sway: { amp: 0.35, freq: 0.9, wave: 0.03, invH: 1 / 20, flutter: 0.05 }, noFlip: true, alphaMip: 0.5, transl: 0.22, wrap: 0.22 });
-  const impMat = new THREE.MeshLambertMaterial({ map: imp.albedo.texture, alphaTest: 0.45, side: THREE.DoubleSide });
+  const impMat = new THREE.MeshLambertMaterial({ map: imp.albedo, alphaTest: 0.45, side: THREE.DoubleSide });
   impMat.name = 'scenery.impostors';
-  patchMaterial(impMat, shared, { impostor: true, alphaMip: 0.7, transl: 0.18, wrap: 0.22, extraUniforms: { uImpNormal: { value: imp.normal.texture } } });
+  patchMaterial(impMat, shared, { impostor: true, alphaMip: 0.7, transl: 0.18, wrap: 0.22, extraUniforms: { uImpNormal: { value: imp.normal } } });
 
   // ---------- placement
   const S = Q.sectors;
@@ -229,6 +248,10 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
   };
 
   const { n, half, cell, h, dist } = grid;
+  const exactH = (x, z) => {
+    const v = env.getTerrainHeight(x, z);
+    return Number.isFinite(v) ? v : grid.heightAt(x, z);
+  };
   const clearing = (x, z) => {
     // mowed clearing where the dock meets land
     const cx = Math.max(0, Math.abs(x) - 7);
@@ -258,7 +281,10 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
       const sp = SPECIES.find((s) => s.id === spId);
       let height = sp.h[0] + (sp.h[1] - sp.h[0]) * Math.pow(rng(), 0.8);
       if (d < 6) height *= 0.85;
-      const yBase = Math.min(grid.heightAt(x - 0.6, z), grid.heightAt(x + 0.6, z), grid.heightAt(x, z - 0.6), grid.heightAt(x, z + 0.6)) - 0.2;
+      // near trees stand on the exact terrain; far ones can use the sampled grid
+      const hAt = R < Q.detailR + 10 ? exactH : grid.heightAt;
+      if (hAt(x, z) < 0.3) continue; // the jittered spot slipped into the water
+      const yBase = Math.min(hAt(x - 0.6, z), hAt(x + 0.6, z), hAt(x, z - 0.6), hAt(x, z + 0.6)) - 0.2;
       let lean = 0;
       let leanDir = 0;
       if (d < 10) {
@@ -283,7 +309,7 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
       // crown-sized stipple: dark gaps between lit crowns, reads as individual trees far away
       float st = sNoise3(vSWorld * vec3(0.3, 0.16, 0.3));
       float st2 = sNoise3(vSWorld * vec3(0.75, 0.4, 0.75));
-      float fine = 1.0 - smoothstep(900.0, 1800.0, dist);
+      float fine = 1.0 - smoothstep(1500.0, 2600.0, dist);
       diffuseColor.rgb *= (0.6 + 0.6 * nA) * mix(0.85, 0.3 + 1.2 * st * st * (0.7 + 0.6 * st2), fine);
     }`,
     bump: `(sNoise3(vSWorld * vec3(0.16, 0.1, 0.16)) * 3.2 + sNoise3(vSWorld * 0.55) * 0.9 * (1.0 - smoothstep(150.0, 450.0, length(vViewPosition)))) * (1.0 - smoothstep(600.0, 1400.0, length(vViewPosition)))`,
@@ -301,7 +327,8 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
     const edge = smoothstep(2.5, 6, d) * (0.35 + 0.65 * smoothstep(8, 55, d));
     let c = 14.5 + fbm2(noise, x * 0.008, z * 0.008, 3) * 6;
     // understory near the dock (the 3D trees stand in it)
-    c = c * smoothstep(Q.detailR - 30, Q.detailR + 25, R) + 3.2 * (1 - smoothstep(Q.detailR - 30, Q.detailR + 25, R));
+    const under = 1.3 + 0.9 * fbm2(noise, x * 0.09 + 3, z * 0.09, 2);
+    c = c * smoothstep(Q.detailR - 30, Q.detailR + 25, R) + under * (1 - smoothstep(Q.detailR - 30, Q.detailR + 25, R));
     const slope = grid.inside(x, z) ? grid.slopeAt(x, z) : 0.3;
     c *= 1 - 0.85 * smoothstep(0.9, 1.5, slope);
     c *= clearing(x, z);
@@ -321,6 +348,7 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
     const cDark = new THREE.Color().setRGB(30 / 255, 45 / 255, 36 / 255, THREE.SRGBColorSpace);
     const cMid = new THREE.Color().setRGB(38 / 255, 54 / 255, 40 / 255, THREE.SRGBColorSpace);
     const cDecid = new THREE.Color().setRGB(58 / 255, 76 / 255, 42 / 255, THREE.SRGBColorSpace);
+    const cShrub = new THREE.Color().setRGB(76 / 255, 98 / 255, 50 / 255, THREE.SRGBColorSpace);
     const tmp = new THREE.Color();
     for (let ri = 0; ri < NR; ri++) {
       const R = radii[ri];
@@ -339,6 +367,11 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
         tmp.copy(cDark).lerp(cMid, clamp(0.5 + dn * 1.5, 0, 1));
         const decid = smoothstep(0.18, 0.4, fbm2(noise, x * 0.012 + 4, z * 0.012 - 2, 3));
         tmp.lerp(cDecid, decid * 0.7);
+        // alder / dogwood / sweet-gale shrubs along the water's edge are lighter and warmer
+        if (c > 0.3 && grid.inside(x, z)) {
+          const dw = grid.distAt(x, z);
+          if (dw < 22) tmp.lerp(cShrub, (1 - smoothstep(6, 22, dw)) * 0.75);
+        }
         col[k * 3] = tmp.r;
         col[k * 3 + 1] = tmp.g;
         col[k * 3 + 2] = tmp.b;
@@ -350,6 +383,81 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
         }
       }
     }
+    // Serrated tree-line on every visible ridge: march each azimuth outward from the dock and
+    // put conifer spires where the canopy top forms a silhouette (a local maximum of elevation
+    // angle that is not hidden by anything nearer).
+    const eyeY = DOCK.deckY + 1.65;
+    const SKY_AZ = Q.skylineAz;
+    for (let sa = 0; sa < SKY_AZ; sa++) {
+      const th = ((sa + rng()) / SKY_AZ) * Math.PI * 2;
+      const az = th > Math.PI ? th - Math.PI * 2 : th;
+      if (Math.abs(az) > 2.6) continue; // never seen behind the dock
+      const sx = Math.sin(th);
+      const sz = -Math.cos(th);
+      let best = -Infinity;
+      let prev = -Infinity;
+      let prevR = 0;
+      let prevH = 0;
+      let rising = false;
+      for (let R = Q.detailR + 40; R < Q.shellR1; R *= 1.012) {
+        const x = sx * R;
+        const z = sz * R;
+        const hh = grid.heightAt(x, z);
+        const c = canopyAt(x, z, hh, R);
+        const top = hh + (c > 0.3 ? c : 0);
+        const el = (top - eyeY) / R;
+        if (el < prev && rising && prev >= best - 1e-4 && prevH > 0.3) {
+          // silhouette at the previous sample: a few spires around it
+          const n = 1 + (rng() < 0.6 ? 1 : 0);
+          for (let k = 0; k < n; k++) {
+            const r = prevR * (1 - rng() * 0.012);
+            const jx = sx * r + (rng() - 0.5) * 6;
+            const jz = sz * r + (rng() - 0.5) * 6;
+            const hb = grid.heightAt(jx, jz);
+            const cc = canopyAt(jx, jz, hb, r);
+            if (cc < 4) continue;
+            const spId = rng() < 0.55 ? 'spruceW' : rng() < 0.6 ? 'fir' : 'spruceB';
+            addTree(spId, jx, jz, hb - 0.3, cc + 2 + rng() * 7, 0, 0, true);
+          }
+        }
+        rising = el > prev;
+        if (el > best) best = el;
+        prev = el;
+        prevR = R;
+        prevH = c;
+      }
+    }
+    // normals from the whole polar grid (no seams at chunk borders)
+    const nrm = new Float32Array(NR * AZ * 3);
+    for (let ri = 0; ri < NR; ri++) {
+      const r0 = Math.max(0, ri - 1);
+      const r1 = Math.min(NR - 1, ri + 1);
+      for (let a = 0; a < AZ; a++) {
+        const k = ri * AZ + a;
+        const ka = ri * AZ + ((a + 1) % AZ);
+        const kb = ri * AZ + ((a + AZ - 1) % AZ);
+        const kr1 = r1 * AZ + a;
+        const kr0 = r0 * AZ + a;
+        const tx = xs[ka] - xs[kb];
+        const ty = ys[ka] - ys[kb];
+        const tz = zs[ka] - zs[kb];
+        const rx = xs[kr1] - xs[kr0];
+        const ry = ys[kr1] - ys[kr0];
+        const rz = zs[kr1] - zs[kr0];
+        let nx = ry * tz - rz * ty;
+        let ny = rz * tx - rx * tz;
+        let nz = rx * ty - ry * tx;
+        if (ny < 0) {
+          nx = -nx;
+          ny = -ny;
+          nz = -nz;
+        }
+        const l = Math.hypot(nx, ny, nz) || 1;
+        nrm[k * 3] = nx / l;
+        nrm[k * 3 + 1] = ny / l;
+        nrm[k * 3 + 2] = nz / l;
+      }
+    }
     const meshes = [];
     const perSector = Math.ceil(AZ / S);
     for (let s = 0; s < S; s++) {
@@ -357,6 +465,7 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
       const a1 = Math.min(AZ, a0 + perSector);
       const pos = [];
       const cl = [];
+      const nl = [];
       const idx = [];
       const map = new Int32Array(NR * (a1 - a0 + 1)).fill(-1);
       const vid = (ri, a) => {
@@ -367,6 +476,7 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
         map[key] = pos.length / 3;
         pos.push(xs[k], ys[k], zs[k]);
         cl.push(col[k * 3], col[k * 3 + 1], col[k * 3 + 2]);
+        nl.push(nrm[k * 3], nrm[k * 3 + 1], nrm[k * 3 + 2]);
         return map[key];
       };
       for (let ri = 0; ri < NR - 1; ri++) {
@@ -387,11 +497,12 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
       const g = new THREE.BufferGeometry();
       g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
       g.setAttribute('color', new THREE.Float32BufferAttribute(cl, 3));
+      g.setAttribute('normal', new THREE.Float32BufferAttribute(nl, 3));
       g.setIndex(pos.length / 3 > 65535 ? new THREE.Uint32BufferAttribute(idx, 1) : new THREE.Uint16BufferAttribute(idx, 1));
-      g.computeVertexNormals();
       g.computeBoundingSphere();
       const m = new THREE.Mesh(g, shellMat);
       m.name = `forest.canopy.${s}`;
+      if (culler) culler.add(m, (a0 / AZ) * Math.PI * 2, (a1 / AZ) * Math.PI * 2); // azimuth == th here
       meshes.push(m);
     }
     return meshes;
@@ -428,6 +539,7 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mesh.computeBoundingSphere();
     mesh.name = `forest.near.${g.sp.id}.${key}`;
+    if (culler) culler.addSector(mesh, Math.floor(Number(key.split('|')[1]) / 2), S);
     group.add(mesh);
     nearCount += list.length;
   }
@@ -453,6 +565,7 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mesh.computeBoundingSphere();
     mesh.name = `forest.far.${si}`;
+    if (culler) culler.addSector(mesh, si, S);
     group.add(mesh);
     farCount += list.length;
   });
@@ -495,8 +608,8 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
     const tex = dataTexture(data, W, H, { srgb: false, repeat: true, anisotropy: 4 });
     tex.wrapT = THREE.ClampToEdgeWrapping;
     const layers = [
-      { R: 2080, base: 0.42, color: 0x27352c, amp: 110, lift: 45, seed: 3.1 },
-      { R: 2420, base: 0.6, color: 0x2e3b36, amp: 150, lift: 70, seed: 7.7 },
+      { R: 2360, base: 0.5, color: 0x27352c, amp: 110, lift: 45, seed: 3.1 },
+      { R: 2470, base: 0.62, color: 0x2e3b36, amp: 150, lift: 70, seed: 7.7 },
     ].slice(0, Q.ridges);
     const meshes = [];
     const hazeUniforms = [];

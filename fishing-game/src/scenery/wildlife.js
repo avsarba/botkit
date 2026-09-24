@@ -7,6 +7,7 @@ import { makeRng, clamp, smoothstep, damp, LAYERS } from '../config.js';
 import { MeshBuilder } from './geo.js';
 import { builderFromGeometry } from './props.js';
 import { dataTexture } from './texutil.js';
+import { patchMaterial } from './shaderlib.js';
 
 const srgb = (r, g, b) => new THREE.Color().setRGB(r / 255, g / 255, b / 255, THREE.SRGBColorSpace);
 
@@ -148,6 +149,16 @@ function buildBirdGeometry(kind) {
       B.quad(e0, e1, tp2, tp);
     }
   }
+  // light birds from above even when seen from below (sky-lit undersides, no black silhouettes)
+  for (let i = 0; i < B.count; i++) {
+    const nx = B.n[i * 3];
+    const ny = B.n[i * 3 + 1] + 1.6;
+    const nz = B.n[i * 3 + 2];
+    const l = Math.hypot(nx, ny, nz) || 1;
+    B.n[i * 3] = nx / l;
+    B.n[i * 3 + 1] = ny / l;
+    B.n[i * 3 + 2] = nz / l;
+  }
   const g = B.build();
   g.userData.wingStart = wingStart;
   return g;
@@ -204,7 +215,8 @@ function buildDragonflyGeometry() {
 }
 
 // ---------------------------------------------------------------- system
-export function buildWildlife({ env, quality, events, grid, reedAnchors }) {
+export function buildWildlife({ env, quality, events, grid, reedAnchors, shared }) {
+  const sharedU = shared;
   const group = new THREE.Group();
   group.name = 'wildlife';
   const rng = makeRng(31337);
@@ -290,6 +302,7 @@ export function buildWildlife({ env, quality, events, grid, reedAnchors }) {
     if (!birdMats[kind]) {
       birdMats[kind] = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
       birdMats[kind].name = 'scenery.bird';
+      patchMaterial(birdMats[kind], sharedU, { noFlip: true });
     }
     const geo = buildBirdGeometry(kind);
     const mesh = new THREE.Mesh(geo, birdMats[kind]);
@@ -382,7 +395,7 @@ export function buildWildlife({ env, quality, events, grid, reedAnchors }) {
     } else if (L.state === 'diving') {
       // lunge forward and slip under head-first
       const k = clamp(L.t / 1.3, 0, 1);
-      L.pitch = Math.sin(k * Math.PI * 0.5) * 0.55;
+      L.pitch = -Math.sin(k * Math.PI * 0.5) * 0.55; // nose down (rotation.x < 0 tips the bill down)
       L.bob = surfaceY - k * k * 0.75;
       L.pos.x -= Math.sin(L.heading) * 0.6 * dt;
       L.pos.z -= Math.cos(L.heading) * 0.6 * dt;
@@ -403,7 +416,7 @@ export function buildWildlife({ env, quality, events, grid, reedAnchors }) {
       }
     } else if (L.state === 'surfacing') {
       const k = clamp(L.t / 0.9, 0, 1);
-      L.pitch = (1 - k) * -0.3;
+      L.pitch = (1 - k) * 0.3; // pops up bill-first
       L.bob = surfaceY - (1 - k) * (1 - k) * 0.5;
       if (k >= 1) {
         L.state = 'swim';
@@ -458,13 +471,17 @@ export function buildWildlife({ env, quality, events, grid, reedAnchors }) {
       }
       setWings(b.geo, flap, fold);
       b.mesh.position.set(x, y, z);
-      b.mesh.rotation.set(0, yaw, -b.dir * 0.28, 'YXZ');
+      // bank into the turn: lower the wing on the side of the circle centre
+      const rightX = Math.cos(yaw);
+      const rightZ = -Math.sin(yaw);
+      const side = rightX * (b.c.x - x) + rightZ * (b.c.z - z) > 0 ? 1 : -1;
+      b.mesh.rotation.set(0, yaw, -side * 0.28, 'YXZ');
     }
   }
 
   function updateFlies(dt, time, hours, wind) {
     if (!flies.length) return;
-    const active = hours > 8.5 && hours < 19 && wind < 0.75;
+    const active = hours > 7.5 && hours < 19.5 && wind < 0.75 && !dfMesh.userData.sceneryHidden;
     dfMesh.visible = active;
     if (!active) return;
     for (let i = 0; i < flies.length; i++) {

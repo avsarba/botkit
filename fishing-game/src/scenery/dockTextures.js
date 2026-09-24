@@ -551,7 +551,7 @@ export function makeGalvanizedTextures(size = 256) {
       color[i + 2] = clamp(g * 1.01, 0, 255);
       color[i + 3] = 255;
       orm[i] = 255;
-      orm[i + 1] = clamp(0.55 + val * 0.1 + oxide * 0.3 + grime * 0.08, 0, 1) * 255;
+      orm[i + 1] = clamp(0.62 + val * 0.08 + oxide * 0.25 + grime * 0.08, 0, 1) * 255;
       orm[i + 2] = clamp(1 - oxide * 0.45, 0, 1) * 255;
       orm[i + 3] = 255;
     }

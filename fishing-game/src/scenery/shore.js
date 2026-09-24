@@ -138,19 +138,19 @@ function makeReedCardTexture() {
   for (let v = 0; v < 2; v++) {
     const x0 = v * 256;
     R.clip(x0, 0, 256, 256);
-    const n = v === 0 ? 120 : 170;
+    const n = v === 0 ? 90 : 120;
     for (let i = 0; i < n; i++) {
       // denser in the middle of the stand, ragged uneven top
       const u = (rng() + rng() + rng()) / 3;
       const bx = x0 + 12 + u * 232;
       const edge = 1 - Math.abs(u - 0.5) * 1.6;
-      const hgt = (0.35 + rng() * 0.55) * H * (0.45 + 0.55 * edge);
+      const hgt = (0.25 + rng() * 0.7) * H * (0.35 + 0.65 * edge);
       const lean = (rng() - 0.5) * (v === 0 ? 46 : 16);
-      const g = 0.75 + rng() * 0.4;
+      const g = 0.7 + rng() * 0.4;
       const dry = rng() < 0.12;
-      const cr = dry ? 132 : (v === 0 ? 82 : 56) * g;
-      const cg = dry ? 118 : (v === 0 ? 98 : 78) * g;
-      const cb = dry ? 80 : (v === 0 ? 56 : 42) * g;
+      const cr = dry ? 118 : (v === 0 ? 70 : 50) * g;
+      const cg = dry ? 106 : (v === 0 ? 86 : 70) * g;
+      const cb = dry ? 72 : (v === 0 ? 48 : 38) * g;
       const steps = 8;
       let px = bx;
       let py = H - 1;
@@ -224,7 +224,7 @@ function makeLilyTexture() {
 
 function buildPadGeometry() {
   const B = new MeshBuilder();
-  const segs = 12;
+  const segs = 10;
   const c = B.vert([0, 0.002, 0], [0, 1, 0], [0.5, 0.5]);
   const ring = [];
   for (let j = 0; j <= segs; j++) {
@@ -399,7 +399,7 @@ function addLog(B, rng, a, b, r0, r1, tint, topTint, stubs = 3, sides = 8) {
 }
 
 // ---------------------------------------------------------------- build
-export function buildShore({ env, quality, shared, grid }) {
+export function buildShore({ env, quality, shared, grid, culler }) {
   const Q = QUALITY[quality] || QUALITY.high;
   const group = new THREE.Group();
   group.name = 'shore';
@@ -492,14 +492,15 @@ export function buildShore({ env, quality, shared, grid }) {
     mesh.computeBoundingSphere();
     mesh.layers.enable(LAYERS.UNDERWATER);
     mesh.name = `shore.reeds.${key}`;
+    if (culler) culler.addSector(mesh, Number(key.split('|')[1]), S);
     group.add(mesh);
     reedMeshes.push(mesh);
   }
   // far reed cards (face the dock)
   const reedTex = makeReedCardTexture();
-  const cardMat = new THREE.MeshLambertMaterial({ map: reedTex, alphaTest: 0.55, side: THREE.DoubleSide });
+  const cardMat = new THREE.MeshLambertMaterial({ map: reedTex, alphaTest: 0.6, side: THREE.DoubleSide });
   cardMat.name = 'scenery.reedCards';
-  patchMaterial(cardMat, shared, { cellUV: true, alphaMip: 0.3, sway: { amp: 0.08, freq: 1.5, wave: 0.18, invH: 1 }, transl: 0.3 });
+  patchMaterial(cardMat, shared, { cellUV: true, alphaMip: 0.08, sway: { amp: 0.08, freq: 1.5, wave: 0.18, invH: 1 }, transl: 0.3 });
   const cardGeo = new THREE.PlaneGeometry(1, 1).translate(0, 0.5, 0);
   reedFar.forEach((list, si) => {
     if (!list.length) return;
@@ -523,6 +524,7 @@ export function buildShore({ env, quality, shared, grid }) {
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mesh.computeBoundingSphere();
     mesh.name = `shore.reedCards.${si}`;
+    if (culler) culler.addSector(mesh, si, S);
     group.add(mesh);
   });
   cardGeo.dispose();
@@ -590,6 +592,7 @@ export function buildShore({ env, quality, shared, grid }) {
     mesh.computeBoundingSphere();
     mesh.name = 'shore.lilypads';
     mesh.receiveShadow = true;
+    mesh.layers.enable(LAYERS.NO_REFLECT); // flat on the surface: no visible mirror image
     group.add(mesh);
   }
   if (flowers.length) {
@@ -610,6 +613,7 @@ export function buildShore({ env, quality, shared, grid }) {
       mesh.instanceMatrix.needsUpdate = true;
       mesh.computeBoundingSphere();
       mesh.name = white ? 'shore.waterlily' : 'shore.pondlily';
+      mesh.layers.enable(LAYERS.NO_REFLECT);
       group.add(mesh);
     }
   }

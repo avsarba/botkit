@@ -1,20 +1,49 @@
 // Scenery sandbox: the scenery module on a contract-shaped lake (cove left, rocky point right,
 // sunken timber, hills), with a physical sky, sun + shadows and a simple water plane.
 //   node build.mjs --entry src/sandbox/scenery.js --out dist/sandbox-scenery.html --template none
-// window.__view(name) switches camera views (eye, down, left, right, far, back, loon, ...).
-// Add #stub to the URL to run on the plain stubEnvironment instead.
+// window.__view(name) switches camera views (eye, down, left, right, far, cove, point, back,
+// loon, waterline, ...); window.__frames() counts frames since the last switch, window.__tris()
+// lists triangles per scenery group. URL hash options (set location.hash then reload):
+//   #stub          plain stubEnvironment (bowl lake) instead of the contract-shaped sandbox lake
+//   #q=medium|low  build quality          #sun=x,y,z  sun direction     #h=6.5  time-of-day sun
+//   #clear         more transparent water (inspect pilings/rocks/timber)   #birdtest  wildlife close-ups
 import * as THREE from 'three';
 import { Sky } from 'three/addons/objects/Sky.js';
 import { makeSandbox, stubEnvironment, stubWater } from './stubs.js';
 import { createScenery } from '../scenery/index.js';
 import { makeRng, clamp, smoothstep, DOCK } from '../config.js';
 import { makeNoise2, fbm2 } from '../scenery/noise.js';
+import { createEnvironment } from '../environment/index.js';
+import { createWater } from '../water/index.js';
 
 const quality = (location.hash.match(/q=(\w+)/) || [])[1] || 'high';
 const useStub = location.hash.includes('stub');
+const useReal = location.hash.includes('real');
 const { renderer, scene, camera, events, frame, ctx } = makeSandbox({ quality });
 renderer.toneMappingExposure = 0.55;
+const hours = Number((location.hash.match(/h=([\d.]+)/) || [])[1] || 8.0);
+if (useReal) runReal();
+else runSandbox();
 
+// ------------------------------------------------------------------ real environment + water
+function runReal() {
+  frame.hours = hours;
+  const env = createEnvironment(ctx);
+  env.setTimeOfDay(hours);
+  const t0 = performance.now();
+  const scenery = createScenery({ ...ctx, env });
+  const buildMs = performance.now() - t0;
+  const water = createWater({ ...ctx, env });
+  scenery.attachWater(water);
+  console.log(`[scenery] built in ${buildMs.toFixed(0)} ms on the real environment (quality ${quality})`);
+  console.log('[scenery] stats', JSON.stringify(scenery.stats));
+  startLoop(scenery, (f) => {
+    env.setTimeOfDay(hours);
+    env.update(f);
+  }, (f) => water.update(f), buildMs);
+}
+
+function runSandbox() {
 const base = stubEnvironment({ scene, renderer });
 // remove the stub's placeholder ground + dock box; keep its lights for reference only
 const stubMeshes = [];
@@ -145,7 +174,6 @@ su.turbidity.value = 3.5;
 su.rayleigh.value = 1.2;
 su.mieCoefficient.value = 0.004;
 su.mieDirectionalG.value = 0.8;
-const hours = Number((location.hash.match(/h=([\d.]+)/) || [])[1] || 8.0);
 const sunAz = THREE.MathUtils.degToRad(-20 + (hours - 12) * 15); // rough path, sun south-ish
 const sunEl = THREE.MathUtils.degToRad(Math.max(-6, 55 * Math.sin(((hours - 6) / 14.2) * Math.PI)));
 env.sunDirection.set(Math.sin(sunAz) * Math.cos(sunEl), Math.sin(sunEl), -Math.cos(sunAz) * Math.cos(sunEl)).normalize();
@@ -197,15 +225,32 @@ water.mesh.material.opacity = 0.8;
 const t0 = performance.now();
 const scenery = createScenery({ ...ctx, env });
 scenery.attachWater && scenery.attachWater(water);
-window.__loonPos = () => scenery.debug.loonPosition();
-window.__trackPos = { loon: () => scenery.debug.loonPosition(), bird: () => scenery.debug.birdPosition(3), gull: () => scenery.debug.birdPosition(0), fly: () => scenery.debug.flyPosition(0) };
 if (location.hash.includes('clear')) water.mesh.material.opacity = 0.35;
+if (location.hash.includes('birdtest')) {
+  // close-up clones of the wildlife meshes in front of the camera (shared geometry/material)
+  let k = 0;
+  scenery.object3d.traverse((o) => {
+    if (!o.isMesh || !/wildlife\.(gull|raven|eagle|loon)/.test(o.name)) return;
+    const c = new THREE.Mesh(o.geometry, o.material);
+    c.position.set(-1.5 + k * 1.0, 2.4, -3.2);
+    c.rotation.set(0.5, 0.6, 0);
+    c.scale.setScalar(o.name.includes('loon') ? 1.4 : 0.8);
+    scene.add(c);
+    k++;
+  });
+}
 const buildMs = performance.now() - t0;
 console.log(`[scenery] built in ${buildMs.toFixed(0)} ms (quality ${quality}, ${useStub ? 'stub env' : 'sandbox env'})`);
 console.log('[scenery] stats', JSON.stringify(scenery.stats));
 console.log('[scenery] dockTopAt(0,0)=', scenery.dockTopAt(0, 0), ' dockTopAt(3,0)=', scenery.dockTopAt(3, 0));
 
-// ------------------------------------------------------------------ views
+startLoop(scenery, null, null, buildMs);
+}
+
+// ------------------------------------------------------------------ views + loop
+function startLoop(scenery, preUpdate, postUpdate, buildMs) {
+window.__loonPos = () => scenery.debug.loonPosition();
+window.__trackPos = { loon: () => scenery.debug.loonPosition(), bird: () => scenery.debug.birdPosition(3), gull: () => scenery.debug.birdPosition(0), raven: () => scenery.debug.birdPosition(2), fly: () => scenery.debug.flyPosition(0) };
 const eye = DOCK.deckY + 1.65;
 const VIEWS = {
   eye: { yaw: 0, pitch: -6, fov: 60 },
@@ -220,7 +265,8 @@ const VIEWS = {
   backright: { yaw: -100, pitch: -12, fov: 60 },
   loon: { yaw: 0, pitch: -1.5, fov: 8, track: 'loon' },
   eagle: { yaw: 0, pitch: 0, fov: 2.5, track: 'bird' },
-  gull: { yaw: 0, pitch: 0, fov: 3, track: 'gull' },
+  gull: { yaw: 0, pitch: 0, fov: 0.8, track: 'gull' },
+  raven: { yaw: 0, pitch: 0, fov: 0.8, track: 'raven' },
   fly: { yaw: 0, pitch: 0, fov: 4, track: 'fly' },
   waterline: { yaw: -20, pitch: -68, fov: 50 },
   cove: { yaw: 62, pitch: -9, fov: 28 },
@@ -230,6 +276,8 @@ const VIEWS = {
   rocks: { yaw: -66, pitch: -2.5, fov: 14 },
   reeds: { yaw: 75, pitch: -6, fov: 18 },
   sideleft: { yaw: 90, pitch: -30, fov: 60 },
+  mountains: { yaw: 5, pitch: 6, fov: 16 },
+  mountainsR: { yaw: -55, pitch: 6, fov: 16 },
 };
 let view = VIEWS.eye;
 window.__view = (name) => {
@@ -262,7 +310,9 @@ renderer.setAnimationLoop(() => {
   }
   frame.input.aimYaw = camera.rotation.y;
   frame.input.aimPitch = camera.rotation.x;
+  if (preUpdate) preUpdate(frame);
   scenery.update(frame);
+  if (postUpdate) postUpdate(frame);
   renderer.render(scene, camera);
   frames++;
 });
@@ -282,6 +332,22 @@ function triBudget() {
   return out;
 }
 window.__tris = triBudget;
+window.__visTris = () => {
+  const fr = new THREE.Frustum().setFromProjectionMatrix(new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse));
+  const out = {};
+  scenery.object3d.traverseVisible((o) => {
+    if (!o.isMesh || (o.frustumCulled && !fr.intersectsObject(o))) return;
+    const g = o.geometry;
+    const tris = ((g.index ? g.index.count : g.attributes.position.count) / 3) * (o.isInstancedMesh ? o.count : 1);
+    const key = o.name.split('.').slice(0, 2).join('.');
+    out[key] = (out[key] || 0) + Math.round(tris);
+  });
+  return out;
+};
+window.__sceneryVisible = (v) => {
+  scenery.object3d.visible = !!v;
+  frames = 0;
+};
 console.log('[scenery] tris', JSON.stringify(triBudget()));
 window.__game = {
   debug: {
@@ -295,3 +361,4 @@ window.__game = {
     }),
   },
 };
+}

@@ -33,6 +33,7 @@ export function buildDock({ env, quality, renderer }) {
     const bb = flipV ? 1 - b : b;
     return [(0.5 + u * (W - 1)) / W, (band + k * stripH + 0.5 + bb * (stripH - 1)) / H];
   };
+  const texU = (x) => Math.min(1, Math.max(0, (x + 0.9) / 1.8));
   const endUV = (p, a, b) => [((p + 0.02 + a * 0.96) * (W / DECK_LAYOUT.endPatches)) / W, (0.5 + b * (band - 1)) / H];
 
   const wood = new MeshBuilder({ colors: true });
@@ -109,7 +110,8 @@ export function buildDock({ env, quality, renderer }) {
         const dydz = (-cup * 4 * (2 * b - 1) + twist * (a - 0.5) * 2) / PLANK.w;
         const dydx = (twist * (2 * b - 1)) / (x1 - x0);
         const nl = Math.hypot(dydx, 1, dydz);
-        top.push(pb.vert([x, topY(a, b), z], [-dydx / nl, 1 / nl, -dydz / nl], stripUV(k, a, 1 - b, flipU, flipV), tint));
+        // texture u follows the real x so screw heads stay over the stringers on notched planks
+        top.push(pb.vert([x, topY(a, b), z], [-dydx / nl, 1 / nl, -dydz / nl], stripUV(k, texU(x), 1 - b, flipU, flipV), tint));
       }
     }
     for (let ib = 0; ib < NB - 1; ib++) {
@@ -131,8 +133,8 @@ export function buildDock({ env, quality, renderer }) {
         const x = x0 + (x1 - x0) * a;
         const yt = topY(a, b) - 0.0015;
         const z = side * hw;
-        const t0 = pb.vert([x, yt, z], [0, 0, side], stripUV(k, a, side < 0 ? 0.99 : 0.01, flipU, flipV), tint);
-        const t1 = pb.vert([x, yt - PLANK.thick + 0.002, z], [0, 0, side], stripUV(k, a, side < 0 ? 0.73 : 0.27, flipU, flipV), tint);
+        const t0 = pb.vert([x, yt, z], [0, 0, side], stripUV(k, texU(x), side < 0 ? 0.99 : 0.01, flipU, flipV), tint);
+        const t1 = pb.vert([x, yt - PLANK.thick + 0.002, z], [0, 0, side], stripUV(k, texU(x), side < 0 ? 0.73 : 0.27, flipU, flipV), tint);
         ids.push([t0, t1]);
       }
       for (let ia = 0; ia < NA - 1; ia++) {
@@ -159,10 +161,10 @@ export function buildDock({ env, quality, renderer }) {
     // bottom (seen in the reflection)
     {
       const yb = deckTopY + dy - PLANK.thick;
-      const v0 = pb.vert([x0, yb, -hw], [0, -1, 0], stripUV(k, 0, 0.1, !flipU, flipV), tint);
-      const v1 = pb.vert([x1, yb, -hw], [0, -1, 0], stripUV(k, 1, 0.1, !flipU, flipV), tint);
-      const v2 = pb.vert([x1, yb, hw], [0, -1, 0], stripUV(k, 1, 0.9, !flipU, flipV), tint);
-      const v3 = pb.vert([x0, yb, hw], [0, -1, 0], stripUV(k, 0, 0.9, !flipU, flipV), tint);
+      const v0 = pb.vert([x0, yb, -hw], [0, -1, 0], stripUV(k, texU(x0), 0.1, !flipU, flipV), tint);
+      const v1 = pb.vert([x1, yb, -hw], [0, -1, 0], stripUV(k, texU(x1), 0.1, !flipU, flipV), tint);
+      const v2 = pb.vert([x1, yb, hw], [0, -1, 0], stripUV(k, texU(x1), 0.9, !flipU, flipV), tint);
+      const v3 = pb.vert([x0, yb, hw], [0, -1, 0], stripUV(k, texU(x0), 0.9, !flipU, flipV), tint);
       pb.quad(v0, v1, v2, v3);
     }
     wood.append(pb, _m);
@@ -287,8 +289,8 @@ export function buildDock({ env, quality, renderer }) {
     // header across the bent (lake face of the pilings)
     lumber(0, (hdrTop + hdrBot) / 2, zb - 0.1 - STRINGER.w / 2, 2.14, STRINGER.h, STRINGER.w);
     // X-brace on the shore face of every other wet bent
-    if (wetBent && bi % 2 === 0) {
-      const zf = zb + 0.13 + 0.019;
+    if (wetBent && bedMin < -0.9 && bi % 2 === 0) {
+      const zf = zb + 0.108 + 0.019;
       const yHi = hdrBot - 0.05;
       const yLo = Math.max(bedMin + 0.35, -3.5);
       for (const dir of [-1, 1]) {
@@ -375,13 +377,14 @@ export function buildDock({ env, quality, renderer }) {
     roughnessMap: galvTex.ormMap,
     metalnessMap: galvTex.ormMap,
     roughness: 1,
-    metalness: 0.6,
+    metalness: 0.45,
     vertexColors: true,
-    envMapIntensity: 0.8,
+    envMapIntensity: 0.7,
   });
   galvMat.name = 'scenery.galvanized';
   const galvMesh = new THREE.Mesh(galv.build(), galvMat);
   galvMesh.name = 'dock.hardware';
+  galvMesh.layers.enable(LAYERS.NO_REFLECT); // small deck props: hidden by the deck in the mirror
   galvMesh.castShadow = true;
   galvMesh.receiveShadow = true;
   group.add(galvMesh);
@@ -402,11 +405,15 @@ export function buildDock({ env, quality, renderer }) {
   });
   tbPaintMat.name = 'scenery.tacklebox';
   const tbPaint = new THREE.Mesh(tb.paint.build(), tbPaintMat);
+  tbPaint.name = 'dock.tackleBox.paint';
   tbPaint.castShadow = true;
+  tbPaint.layers.enable(LAYERS.NO_REFLECT);
   tbPaint.receiveShadow = true;
   tbGroup.add(tbPaint);
   const tbHw = new THREE.Mesh(tb.hardware.build(), galvMat);
+  tbHw.name = 'dock.tackleBox.hardware';
   tbHw.castShadow = true;
+  tbHw.layers.enable(LAYERS.NO_REFLECT);
   tbGroup.add(tbHw);
   group.add(tbGroup);
 
@@ -418,13 +425,23 @@ export function buildDock({ env, quality, renderer }) {
   const rope = new THREE.Mesh(ropeGeo, ropeMat);
   rope.name = 'dock.rope';
   rope.castShadow = true;
+  rope.layers.enable(LAYERS.NO_REFLECT);
   rope.receiveShadow = true;
   group.add(rope);
 
   const metalMaterials = [galvMat, tbPaintMat];
 
+  // Deck top (DOCK.deckY) over the deck footprint; the top of a post where a piling pokes up
+  // through/beside the deck edge (lake-end mooring posts, stubs along the sides); else null.
   function dockTopAt(x, z) {
     if (!Number.isFinite(x) || !Number.isFinite(z)) return null;
+    if (Math.abs(x) > 1.1 || z < DOCK.endZ - 0.2 || z > DOCK.shoreZ + 0.2) return null;
+    for (let i = 0; i < pileSpecs.length; i++) {
+      const p = pileSpecs[i];
+      const dx = x - p.x;
+      const dz = z - p.z;
+      if (dx * dx + dz * dz <= p.r * p.r) return p.yTop;
+    }
     if (Math.abs(x) <= DOCK.width / 2 && z >= DOCK.endZ && z <= DOCK.shoreZ) return DOCK.deckY;
     return null;
   }

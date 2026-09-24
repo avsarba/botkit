@@ -339,16 +339,16 @@ export function buildBucket() {
     V(0.1425, 0.2445),
   ];
   const g1 = new THREE.LatheGeometry(shell, 36);
-  b.append(builderFromGeometry(g1, null, [1, 1, 1], [5, 1.3]));
+  b.append(builderFromGeometry(g1, null, [0.82, 0.82, 0.8], [5, 1.3]));
   g1.dispose();
   const lidPts = [V(0.1455, 0.2405), V(0.1415, 0.2475), V(0.118, 0.2515), V(0.082, 0.2545), V(0.0765, 0.2555), V(0.0755, 0.2625), V(0.0715, 0.2645), V(0.0, 0.2645)];
   const g2 = new THREE.LatheGeometry(lidPts, 36);
-  b.append(builderFromGeometry(g2, null, [0.93, 0.93, 0.92], [5, 1]));
+  b.append(builderFromGeometry(g2, null, [0.78, 0.78, 0.76], [5, 1]));
   g2.dispose();
   // flip door with a hinge and a small knob
   const door = new THREE.CylinderGeometry(0.066, 0.066, 0.003, 28);
   door.translate(0, 0.2665, 0);
-  b.append(builderFromGeometry(door, null, [0.88, 0.88, 0.87], [2, 2]));
+  b.append(builderFromGeometry(door, null, [0.72, 0.72, 0.7], [2, 2]));
   door.dispose();
   const hinge = new THREE.CylinderGeometry(0.004, 0.004, 0.04, 8);
   hinge.rotateZ(Math.PI / 2);

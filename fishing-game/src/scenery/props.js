@@ -489,8 +489,8 @@ export function buildRopeCoil(origin, cleat, seed = 5) {
   }
   const curve = new THREE.CatmullRomCurve3(pts, false, 'centripetal');
   const length = curve.getLength();
-  const segs = Math.floor(length / 0.009);
-  const g = new THREE.TubeGeometry(curve, segs, R, 7, false);
+  const segs = Math.floor(length / 0.012);
+  const g = new THREE.TubeGeometry(curve, segs, R, 6, false);
   // one texture repeat per lay length
   const uv = g.attributes.uv;
   for (let i = 0; i < uv.count; i++) uv.setX(i, (uv.getX(i) * length) / 0.042);

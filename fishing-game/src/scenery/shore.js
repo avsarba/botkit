@@ -116,15 +116,15 @@ function buildBulrushClump(seed) {
 function buildSedgeTuft(seed) {
   const rng = makeRng(seed);
   const B = new MeshBuilder({ colors: true });
-  const n = 26 + Math.floor(rng() * 12);
-  const cBase = srgb(70, 66, 40);
+  const n = 40 + Math.floor(rng() * 16);
+  const cBase = srgb(84, 86, 50);
   for (let i = 0; i < n; i++) {
     const g = 0.85 + rng() * 0.3;
-    const mid = srgb(118 * g, 128 * g, 70 * g);
-    const tip = rng() < 0.4 ? srgb(160, 146, 96) : srgb(132 * g, 138 * g, 80 * g);
+    const mid = srgb(126 * g, 140 * g, 74 * g);
+    const tip = rng() < 0.4 ? srgb(172, 160, 108) : srgb(140 * g, 150 * g, 84 * g);
     const a = rng() * Math.PI * 2;
-    const r = rng() * 0.08;
-    blade(B, rng, Math.cos(a) * r, Math.sin(a) * r, a, 0.45 + rng() * 0.5, 0.008 + rng() * 0.006, 0.12 + rng() * 0.2, 0.25 + rng() * 0.45, 3, cBase, mid, tip, (rng() - 0.5));
+    const r = rng() * 0.12;
+    blade(B, rng, Math.cos(a) * r, Math.sin(a) * r, a, 0.35 + rng() * 0.45, 0.009 + rng() * 0.006, 0.06 + rng() * 0.14, 0.12 + rng() * 0.3, 3, cBase, mid, tip, rng() - 0.5);
   }
   return B;
 }
@@ -138,16 +138,19 @@ function makeReedCardTexture() {
   for (let v = 0; v < 2; v++) {
     const x0 = v * 256;
     R.clip(x0, 0, 256, 256);
-    const n = v === 0 ? 150 : 220;
+    const n = v === 0 ? 120 : 170;
     for (let i = 0; i < n; i++) {
-      const bx = x0 + 10 + rng() * 236;
-      const hgt = (0.45 + rng() * 0.5) * H * (1 - Math.abs(bx - x0 - 128) / 300);
-      const lean = (rng() - 0.5) * (v === 0 ? 40 : 14);
+      // denser in the middle of the stand, ragged uneven top
+      const u = (rng() + rng() + rng()) / 3;
+      const bx = x0 + 12 + u * 232;
+      const edge = 1 - Math.abs(u - 0.5) * 1.6;
+      const hgt = (0.35 + rng() * 0.55) * H * (0.45 + 0.55 * edge);
+      const lean = (rng() - 0.5) * (v === 0 ? 46 : 16);
       const g = 0.75 + rng() * 0.4;
-      const dry = rng() < 0.1;
-      const cr = dry ? 150 : (v === 0 ? 92 : 62) * g;
-      const cg = dry ? 132 : (v === 0 ? 112 : 88) * g;
-      const cb = dry ? 88 : (v === 0 ? 62 : 46) * g;
+      const dry = rng() < 0.12;
+      const cr = dry ? 132 : (v === 0 ? 82 : 56) * g;
+      const cg = dry ? 118 : (v === 0 ? 98 : 78) * g;
+      const cb = dry ? 80 : (v === 0 ? 56 : 42) * g;
       const steps = 8;
       let px = bx;
       let py = H - 1;
@@ -155,12 +158,12 @@ function makeReedCardTexture() {
         const t = s / steps;
         const nx = bx + lean * t * t;
         const ny = H - 1 - hgt * t;
-        const k = t < 0.2 ? 0.55 : 1;
-        R.line(px, py, nx, ny, (v === 0 ? 2.2 : 1.4) * (1 - t * 0.6), cr * k, cg * k, cb * k);
+        const k = t < 0.18 ? 0.5 : 1;
+        R.line(px, py, nx, ny, (v === 0 ? 1.8 : 1.2) * (1 - t * 0.7), cr * k, cg * k, cb * k);
         px = nx;
         py = ny;
       }
-      if (v === 0 && rng() < 0.08) R.ellipse(bx + lean * 0.5, H - 1 - hgt * 0.75, 2.4, 9, 0, 80, 52, 32);
+      if (v === 0 && rng() < 0.07) R.ellipse(bx + lean * 0.45, H - 1 - hgt * 0.72, 2.2, 8, 0, 78, 50, 32);
     }
   }
   R.unclip();
@@ -221,7 +224,7 @@ function makeLilyTexture() {
 
 function buildPadGeometry() {
   const B = new MeshBuilder();
-  const segs = 18;
+  const segs = 12;
   const c = B.vert([0, 0.002, 0], [0, 1, 0], [0.5, 0.5]);
   const ring = [];
   for (let j = 0; j <= segs; j++) {
@@ -494,9 +497,9 @@ export function buildShore({ env, quality, shared, grid }) {
   }
   // far reed cards (face the dock)
   const reedTex = makeReedCardTexture();
-  const cardMat = new THREE.MeshLambertMaterial({ map: reedTex, alphaTest: 0.5, side: THREE.DoubleSide });
+  const cardMat = new THREE.MeshLambertMaterial({ map: reedTex, alphaTest: 0.55, side: THREE.DoubleSide });
   cardMat.name = 'scenery.reedCards';
-  patchMaterial(cardMat, shared, { cellUV: true, alphaMip: 0.5, sway: { amp: 0.08, freq: 1.5, wave: 0.18, invH: 1 }, transl: 0.3 });
+  patchMaterial(cardMat, shared, { cellUV: true, alphaMip: 0.3, sway: { amp: 0.08, freq: 1.5, wave: 0.18, invH: 1 }, transl: 0.3 });
   const cardGeo = new THREE.PlaneGeometry(1, 1).translate(0, 0.5, 0);
   reedFar.forEach((list, si) => {
     if (!list.length) return;
@@ -507,7 +510,7 @@ export function buildShore({ env, quality, shared, grid }) {
       const yaw = Math.atan2(-t.x, -t.z);
       _q.setFromEuler(_e.set(0, yaw, 0));
       _p.set(t.x, Math.max(t.y, -0.35), t.z);
-      _s.set(2.8 * t.s, 2.1 * t.s, 1);
+      _s.set(2.4 * t.s, 2.0 * t.s, 1);
       _m.compose(_p, _q, _s);
       mesh.setMatrixAt(i, _m);
       const g = 0.85 + rng() * 0.3;

@@ -198,6 +198,8 @@ const t0 = performance.now();
 const scenery = createScenery({ ...ctx, env });
 scenery.attachWater && scenery.attachWater(water);
 window.__loonPos = () => scenery.debug.loonPosition();
+window.__trackPos = { loon: () => scenery.debug.loonPosition(), bird: () => scenery.debug.birdPosition(3), gull: () => scenery.debug.birdPosition(0), fly: () => scenery.debug.flyPosition(0) };
+if (location.hash.includes('clear')) water.mesh.material.opacity = 0.35;
 const buildMs = performance.now() - t0;
 console.log(`[scenery] built in ${buildMs.toFixed(0)} ms (quality ${quality}, ${useStub ? 'stub env' : 'sandbox env'})`);
 console.log('[scenery] stats', JSON.stringify(scenery.stats));
@@ -217,10 +219,17 @@ const VIEWS = {
   back: { yaw: 100, pitch: -12, fov: 60 },
   backright: { yaw: -100, pitch: -12, fov: 60 },
   loon: { yaw: 0, pitch: -1.5, fov: 8, track: 'loon' },
+  eagle: { yaw: 0, pitch: 0, fov: 2.5, track: 'bird' },
+  gull: { yaw: 0, pitch: 0, fov: 3, track: 'gull' },
+  fly: { yaw: 0, pitch: 0, fov: 4, track: 'fly' },
+  waterline: { yaw: -20, pitch: -68, fov: 50 },
   cove: { yaw: 62, pitch: -9, fov: 28 },
   point: { yaw: -58, pitch: -6, fov: 28 },
   timber: { yaw: 25, pitch: -12, fov: 30 },
   trees: { yaw: 85, pitch: 4, fov: 35 },
+  rocks: { yaw: -66, pitch: -2.5, fov: 14 },
+  reeds: { yaw: 75, pitch: -6, fov: 18 },
+  sideleft: { yaw: 90, pitch: -30, fov: 60 },
 };
 let view = VIEWS.eye;
 window.__view = (name) => {
@@ -241,8 +250,8 @@ renderer.setAnimationLoop(() => {
   frame.dt = dt;
   frame.time = time;
   frame.hours = hours;
-  if (view.track === 'loon' && window.__loonPos) {
-    _v.copy(window.__loonPos());
+  if (view.track && window.__trackPos[view.track] && window.__trackPos[view.track]()) {
+    _v.copy(window.__trackPos[view.track]());
     view.yaw = THREE.MathUtils.radToDeg(Math.atan2(-_v.x, -_v.z));
     view.pitch = THREE.MathUtils.radToDeg(Math.atan2(_v.y + 0.2 - eye, Math.hypot(_v.x, _v.z)));
   }
@@ -258,6 +267,22 @@ renderer.setAnimationLoop(() => {
   frames++;
 });
 
+function triBudget() {
+  const out = {};
+  scenery.object3d.traverse((o) => {
+    if (!o.isMesh) return;
+    const g = o.geometry;
+    const tris = (g.index ? g.index.count : g.attributes.position.count) / 3;
+    const n = o.isInstancedMesh ? o.count : 1;
+    let key = o.name.split('.').slice(0, 2).join('.');
+    out[key] = out[key] || { meshes: 0, tris: 0 };
+    out[key].meshes++;
+    out[key].tris += Math.round(tris * n);
+  });
+  return out;
+}
+window.__tris = triBudget;
+console.log('[scenery] tris', JSON.stringify(triBudget()));
 window.__game = {
   debug: {
     stats: () => ({

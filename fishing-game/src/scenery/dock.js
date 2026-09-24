@@ -410,9 +410,9 @@ export function buildDock({ env, quality, renderer }) {
   tbGroup.add(tbHw);
   group.add(tbGroup);
 
-  // dock line coiled on the deck, tail around the cleat at z = 3.05
+  // dock line coiled on the deck beside the player, tail around the end cleat
   const ropeTex = makeRopeTextures();
-  const ropeGeo = buildRopeCoil(new THREE.Vector3(0.38, deckTopY, 2.2), new THREE.Vector3(0.78, deckTopY + 0.052, 3.05));
+  const ropeGeo = buildRopeCoil(new THREE.Vector3(0.45, deckTopY, 0.2), new THREE.Vector3(0.78, deckTopY + 0.052, -0.56));
   const ropeMat = new THREE.MeshStandardMaterial({ map: ropeTex.map, normalMap: ropeTex.normalMap, roughness: 0.93, metalness: 0 });
   ropeMat.name = 'scenery.rope';
   const rope = new THREE.Mesh(ropeGeo, ropeMat);

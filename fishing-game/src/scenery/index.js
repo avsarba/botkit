@@ -76,7 +76,7 @@ export function createScenery(ctx) {
       water = w || null;
     },
     object3d: root,
-    debug: { loonPosition: () => wildlife.loonPosition() },
+    debug: { loonPosition: () => wildlife.loonPosition(), birdPosition: (i) => wildlife.birdPosition(i), flyPosition: (i) => wildlife.flyPosition(i) },
     stats: { forest: forest.stats, shore: shore.stats, ms: { dock: Math.round(tDock), grid: Math.round(tGrid), shore: Math.round(tShore) } },
   };
 }

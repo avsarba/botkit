@@ -14,9 +14,9 @@ import { makeNoise2, fbm2 } from './noise.js';
 import { dataTexture } from './texutil.js';
 
 const QUALITY = {
-  high: { detailR: 150, sectors: 6, band: 1.0, interior: 0.55, far: 0.24, shellAz: 480, shellGrowth: 1.026, shellR1: 1900, spireP: 0.5, ridges: 2 },
-  medium: { detailR: 115, sectors: 6, band: 0.85, interior: 0.45, far: 0.18, shellAz: 360, shellGrowth: 1.032, shellR1: 1700, spireP: 0.2, ridges: 2 },
-  low: { detailR: 75, sectors: 4, band: 0.65, interior: 0.3, far: 0.12, shellAz: 240, shellGrowth: 1.045, shellR1: 1500, spireP: 0.12, ridges: 1 },
+  high: { detailR: 130, sectors: 6, band: 1.0, interior: 0.55, far: 0.24, shellAz: 420, shellGrowth: 1.03, shellR1: 1900, spireP: 0.5, ridges: 2 },
+  medium: { detailR: 100, sectors: 6, band: 0.85, interior: 0.45, far: 0.18, shellAz: 330, shellGrowth: 1.036, shellR1: 1700, spireP: 0.2, ridges: 2 },
+  low: { detailR: 65, sectors: 4, band: 0.65, interior: 0.3, far: 0.12, shellAz: 240, shellGrowth: 1.045, shellR1: 1500, spireP: 0.12, ridges: 1 },
 };
 
 // species: near-geometry variants and impostor templates (seeds)
@@ -169,10 +169,10 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
   // ---------- materials
   const nearMat = new THREE.MeshLambertMaterial({ map: atlas, alphaTest: 0.42, side: THREE.DoubleSide, vertexColors: true });
   nearMat.name = 'scenery.trees';
-  patchMaterial(nearMat, shared, { sway: { amp: 0.35, freq: 0.9, wave: 0.03, invH: 1 / 20, flutter: 0.05 }, noFlip: true, alphaMip: 0.5, transl: 0.22 });
+  patchMaterial(nearMat, shared, { sway: { amp: 0.35, freq: 0.9, wave: 0.03, invH: 1 / 20, flutter: 0.05 }, noFlip: true, alphaMip: 0.5, transl: 0.22, wrap: 0.22 });
   const impMat = new THREE.MeshLambertMaterial({ map: imp.albedo.texture, alphaTest: 0.45, side: THREE.DoubleSide });
   impMat.name = 'scenery.impostors';
-  patchMaterial(impMat, shared, { impostor: true, alphaMip: 0.7, transl: 0.18, extraUniforms: { uImpNormal: { value: imp.normal.texture } } });
+  patchMaterial(impMat, shared, { impostor: true, alphaMip: 0.7, transl: 0.18, wrap: 0.22, extraUniforms: { uImpNormal: { value: imp.normal.texture } } });
 
   // ---------- placement
   const S = Q.sectors;
@@ -284,7 +284,7 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
       float st = sNoise3(vSWorld * vec3(0.3, 0.16, 0.3));
       float st2 = sNoise3(vSWorld * vec3(0.75, 0.4, 0.75));
       float fine = 1.0 - smoothstep(900.0, 1800.0, dist);
-      diffuseColor.rgb *= (0.6 + 0.6 * nA) * mix(1.0, 0.45 + 1.1 * st * (0.75 + 0.5 * st2), fine);
+      diffuseColor.rgb *= (0.6 + 0.6 * nA) * mix(0.85, 0.3 + 1.2 * st * st * (0.7 + 0.6 * st2), fine);
     }`,
     bump: `(sNoise3(vSWorld * vec3(0.16, 0.1, 0.16)) * 3.2 + sNoise3(vSWorld * 0.55) * 0.9 * (1.0 - smoothstep(150.0, 450.0, length(vViewPosition)))) * (1.0 - smoothstep(600.0, 1400.0, length(vViewPosition)))`,
   });
@@ -318,9 +318,9 @@ export function buildForest({ env, quality, renderer, shared, grid, onReady }) {
     const xs = new Float32Array(NR * AZ);
     const zs = new Float32Array(NR * AZ);
     const col = new Float32Array(NR * AZ * 3);
-    const cDark = new THREE.Color().setRGB(36 / 255, 52 / 255, 40 / 255, THREE.SRGBColorSpace);
-    const cMid = new THREE.Color().setRGB(46 / 255, 62 / 255, 44 / 255, THREE.SRGBColorSpace);
-    const cDecid = new THREE.Color().setRGB(66 / 255, 84 / 255, 46 / 255, THREE.SRGBColorSpace);
+    const cDark = new THREE.Color().setRGB(30 / 255, 45 / 255, 36 / 255, THREE.SRGBColorSpace);
+    const cMid = new THREE.Color().setRGB(38 / 255, 54 / 255, 40 / 255, THREE.SRGBColorSpace);
+    const cDecid = new THREE.Color().setRGB(58 / 255, 76 / 255, 42 / 255, THREE.SRGBColorSpace);
     const tmp = new THREE.Color();
     for (let ri = 0; ri < NR; ri++) {
       const R = radii[ri];

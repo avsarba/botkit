@@ -26,13 +26,13 @@ function paintSpruce(R, rx, ry, S, rng) {
   // A flat spruce/fir spray seen from above: main axis from the trunk (left) to the tip (right),
   // alternate side shoots, needles all around each shoot.
   const cols = [
-    [22, 36, 31],
-    [27, 44, 36],
-    [32, 52, 41],
-    [39, 61, 46],
-    [47, 71, 51],
-    [57, 83, 55],
-    [70, 97, 60],
+    [30, 48, 40],
+    [37, 59, 47],
+    [44, 69, 53],
+    [53, 81, 60],
+    [63, 93, 66],
+    [76, 108, 71],
+    [92, 124, 76],
   ];
   const NB = cols.length;
   const needles = [];
@@ -87,12 +87,12 @@ function paintPine(R, rx, ry, S, rng) {
   // Pine spray: a main twig with side twigs, all carrying soft brushes of long needles
   // (white pine: bundles of five, 8-13 cm) that fan forward. Fills a broad oval like a real spray.
   const cols = [
-    [28, 44, 38],
-    [36, 55, 46],
-    [45, 66, 53],
-    [55, 78, 60],
-    [66, 91, 67],
-    [80, 104, 74],
+    [38, 58, 50],
+    [48, 72, 60],
+    [59, 86, 69],
+    [72, 101, 78],
+    [86, 117, 87],
+    [102, 132, 94],
   ];
   const NB = cols.length;
   const needles = [];
@@ -191,9 +191,9 @@ function paintBirch(R, rx, ry, S, rng) {
   leaves.sort((a, b) => a.s - b.s);
   for (const l of leaves) {
     const shade = clamp(0.6 + l.shade * 0.42 - l.r * 0.1, 0.45, 1.05);
-    const r = (62 + l.warm * 18) * shade;
-    const g = (92 + l.warm * 14) * shade;
-    const b = (40 + l.warm * 6) * shade;
+    const r = (70 + l.warm * 20) * shade;
+    const g = (104 + l.warm * 16) * shade;
+    const b = (44 + l.warm * 6) * shade;
     R.leaf(l.x, l.y, l.a, 17 * l.s, 10 * l.s, r, g, b, 1, 1.15);
   }
 }
@@ -396,7 +396,7 @@ function addTrunk(B, base, top, r0, r1, sides, region, segLen, ao0, ao1, bendX =
 // A bent foliage card from `root` along horizontal angle `ang`, length `len`, width `wid`,
 // drooping by d0 (inner) and d1 (outer) radians; crown normals from `axis` (trunk xz).
 const _p = new THREE.Vector3();
-function addCard(B, region, root, ang, len, wid, d0, d1, axisX, axisZ, ao, tint, roll = 0, crownUp = 0.45, uFlip = false) {
+function addCard(B, region, root, ang, len, wid, d0, d1, axisX, axisZ, ao, tint, roll = 0, crownUp = 0.8, uFlip = false) {
   const dx = Math.cos(ang);
   const dz = Math.sin(ang);
   // width axis: horizontal perpendicular, rolled around the branch axis a little
@@ -432,7 +432,7 @@ function addCard(B, region, root, ang, len, wid, d0, d1, axisX, axisZ, ao, tint,
       nx /= hl;
       nz /= hl;
       _p.set(nx, crownUp, nz).normalize();
-      const a = ao * (0.35 + 0.65 * t);
+      const a = ao * (0.55 + 0.45 * t);
       const u = uFlip ? 1 - t : t;
       ids.push(B.vert([vx, vy, vz], [_p.x, _p.y, _p.z], uvIn(region, u, side < 0 ? 0 : 1), [a * tint[0], a * tint[1], a * tint[2]], { aSway: t }));
     }
@@ -478,7 +478,7 @@ function addClump(B, region, cx, cy, cz, size, n, crownC, ao, tint, rng, sway = 
       let ky = (py - crownC.y) * 0.6;
       let kz = pz - crownC.z;
       const kl = Math.hypot(kx, ky, kz) || 1;
-      _p.set((ox / ol) * 0.45 + (kx / kl) * 0.8, (oy / ol) * 0.45 + (ky / kl) * 0.8 + 0.35, (oz / ol) * 0.45 + (kz / kl) * 0.8).normalize();
+      _p.set((ox / ol) * 0.45 + (kx / kl) * 0.8, (oy / ol) * 0.45 + (ky / kl) * 0.8 + 0.6, (oz / ol) * 0.45 + (kz / kl) * 0.8).normalize();
       const aoV = ao * (0.75 + 0.25 * ((b + 1) / 2));
       ids.push(B.vert([px, py, pz], [_p.x, _p.y, _p.z], uvIn(region, (a + 1) / 2, (b + 1) / 2), [aoV * tint[0], aoV * tint[1], aoV * tint[2]], { aSway: sway * (0.6 + 0.4 * ((b + 1) / 2)) }));
     }
@@ -509,7 +509,7 @@ export function buildSpruce(seed, kind = 'white') {
     if (kind === 'black') R *= tH > 0.8 ? 1.25 : tH < 0.3 ? 0.8 : 1;
     const n = kind === 'black' ? 4 : 5 + (rng() < 0.4 ? 1 : 0);
     const off = rng() * Math.PI * 2;
-    const lightAO = 0.5 + 0.5 * Math.pow(tH, 0.7);
+    const lightAO = 0.62 + 0.38 * Math.pow(tH, 0.7);
     for (let i = 0; i < n; i++) {
       const ang = off + (i / n) * Math.PI * 2 + (rng() - 0.5) * 0.5;
       const len = R * (0.8 + rng() * 0.35);
@@ -583,7 +583,7 @@ export function buildPine(seed, kind = 'white') {
       // flat horizontal-ish cards (white pine's layered look) + a couple of steeper ones
       for (let q = 0; q < 2; q++) {
         const a2 = ang + (rng() - 0.5) * 1.6;
-        addCard(B, REGION.pine, new THREE.Vector3(c.x - Math.cos(a2) * size * 0.35, c.y, c.z - Math.sin(a2) * size * 0.35), a2, size, size * 0.8, -0.1 + rng() * 0.15, 0.1 + rng() * 0.25, crownC.x, crownC.z, ao, tint, (rng() - 0.5) * 0.7, 0.55);
+        addCard(B, REGION.pine, new THREE.Vector3(c.x - Math.cos(a2) * size * 0.35, c.y, c.z - Math.sin(a2) * size * 0.35), a2, size, size * 0.8, -0.1 + rng() * 0.15, 0.1 + rng() * 0.25, crownC.x, crownC.z, ao, tint, (rng() - 0.5) * 0.7, 0.85);
       }
       addClump(B, REGION.pine, c.x, c.y + 0.2, c.z, size * 0.9, white ? 1 : 2, crownC, ao * 0.95, tint, rng, 1, 0.2);
     }

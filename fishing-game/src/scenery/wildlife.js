@@ -504,6 +504,8 @@ export function buildWildlife({ env, quality, events, grid, reedAnchors }) {
   return {
     group,
     loonPosition: () => L.pos,
+    birdPosition: (i = 0) => (birds.length ? birds[i % birds.length].mesh.position : null),
+    flyPosition: (i = 0) => (flies.length ? flies[i % flies.length].pos : null),
     update(frame, water) {
       const dt = frame && Number.isFinite(frame.dt) ? clamp(frame.dt, 0, 0.1) : 0.016;
       const time = frame && Number.isFinite(frame.time) ? frame.time : 0;

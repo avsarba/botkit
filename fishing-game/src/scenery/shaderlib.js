@@ -29,7 +29,8 @@ const NORMAL_BEGIN_NOFLIP = THREE.ShaderChunk.normal_fragment_begin.replace('nor
 //   fragRough: glsl        code run after roughnessmap_fragment
 //   bump: glsl expr        height function of vSWorld -> perturbs the normal
 //   fragHeader: glsl       extra functions/uniforms for the fragment shader
-//   haze: true             custom aerial perspective: mix toward fog color by uHaze
+//   wrap: 0.2              normal-independent share of sunlight (foliage multiple scattering)
+//   haze: true             custom aerial perspective: mix toward uHazeColor by uHaze
 //   extraUniforms: {}      additional uniforms (shared by reference)
 export function patchMaterial(material, shared, opts = {}) {
   const key = JSON.stringify(opts, (k, v) => (k === 'extraUniforms' ? Object.keys(v) : v));
@@ -153,6 +154,17 @@ export function patchMaterial(material, shared, opts = {}) {
   float bl = pow(max(dot(normalize(-vViewPosition), sunV), 0.0), 3.0);
   float sunUp = smoothstep(-0.02, 0.08, uSunDir.y);
   reflectedLight.directDiffuse += diffuseColor.rgb * uSunColor * (bl * sunUp * ${f(opts.transl)} * RECIPROCAL_PI);
+}`
+      );
+    }
+    if (opts.wrap) {
+      // foliage: light scattered through the canopy softens the Lambert falloff
+      fs = fs.replace(
+        '#include <lights_fragment_end>',
+        `#include <lights_fragment_end>
+{
+  float sunUpW = smoothstep(-0.02, 0.1, uSunDir.y);
+  reflectedLight.directDiffuse += diffuseColor.rgb * uSunColor * (${f(opts.wrap)} * sunUpW * RECIPROCAL_PI);
 }`
       );
     }

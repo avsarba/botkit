@@ -117,6 +117,7 @@ export function createSplashSystem({ scene, maxParticles = 900, getHeight }) {
   geometry.setAttribute('iVel', velAttr);
   geometry.setAttribute('iData', dataAttr);
   geometry.instanceCount = 0;
+  const attrs = [posAttr, velAttr, dataAttr];
   geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e5);
 
   const uniforms = {
@@ -268,15 +269,19 @@ export function createSplashSystem({ scene, maxParticles = 900, getHeight }) {
         data[i * 4 + 1] = baseAlpha[i] * (1 - t) * (1 - t);
         if (t >= 1) kill(i);
       } else {
-        // drops vanish when they fall back into the lake
-        const surf = getHeight ? getHeight(pos[o], pos[o + 2]) : WATER_LEVEL;
-        if ((pos[o + 1] < surf && vel[o + 1] < 0) || t >= 1 || !Number.isFinite(pos[o + 1])) kill(i);
+        // drops vanish when they fall back into the lake (waves are only a few cm)
+        let under = false;
+        if (vel[o + 1] < 0 && pos[o + 1] < WATER_LEVEL + 0.08) {
+          under = pos[o + 1] < (getHeight ? getHeight(pos[o], pos[o + 2]) : WATER_LEVEL);
+        }
+        if (under || t >= 1 || !Number.isFinite(pos[o + 1])) kill(i);
       }
     }
     geometry.instanceCount = alive;
     object.visible = alive > 0;
     if (alive > 0) {
-      for (const a of [posAttr, velAttr, dataAttr]) {
+      for (let k = 0; k < attrs.length; k++) {
+        const a = attrs[k];
         a.clearUpdateRanges();
         a.addUpdateRange(0, alive * a.itemSize);
         a.needsUpdate = true;

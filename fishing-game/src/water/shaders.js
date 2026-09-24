@@ -20,7 +20,7 @@ const common = /* glsl */ `
 uniform vec4 uWaveA[NW];   // dir.x, dir.z, k, amplitude
 uniform vec4 uWaveB[NW];   // phase, Q, wavelength, -
 uniform vec4 uRingA[MAX_RINGS]; // x, z, age, amplitude (m)
-uniform vec4 uRingB[MAX_RINGS]; // speed, max radius, k, foam
+uniform vec4 uRingB[MAX_RINGS]; // speed, max radius, k, foam (>= 0: impact; -1 - foam: no crater)
 uniform int uRingCount;
 `;
 
@@ -52,7 +52,7 @@ void main() {
   for (int i = 0; i < MAX_RINGS; i++) {
     if (i >= uRingCount) break;
     vec4 R = uRingA[i];
-    if (R.w < 0.003 || R.z > 2.0) continue;
+    if (R.w < 0.003 || R.z > 2.0 || uRingB[i].w < 0.0) continue;
     vec2 dv = x0 - R.xy;
     float s2 = 0.09 + 0.1 * R.z;
     float d2 = dot(dv, dv);
@@ -192,20 +192,23 @@ vec2 rippleSlope(vec2 x0, float foot, inout float var, inout float foam) {
     float rf = S.x * age;
     float lam = 6.2831853 / S.z;
     if (d > rf + 2.0 * lam + 1.2) continue;
-    if (S.w > 0.0) {
-      float fr = (0.2 + 0.45 * S.w) * (1.0 + 0.9 * age);
-      foam += S.w * exp(-age * 0.45) * (1.0 - smoothstep(0.3 * fr, fr, d));
+    float crater = S.w >= 0.0 ? 1.0 : 0.0;
+    float fo = S.w >= 0.0 ? S.w : -S.w - 1.0;
+    if (fo > 0.0) {
+      float fr = (0.2 + 0.45 * fo) * (1.0 + 0.9 * age);
+      foam += fo * exp(-age * 0.45) * (1.0 - smoothstep(0.3 * fr, fr, d));
     }
     float x = d - rf;
     float wdt = x > 0.0 ? 0.5 * lam : lam * (1.0 + 2.0 * age); // trailing crests
     float env = exp(-(x * x) / (wdt * wdt));
     float fade = 1.0 - smoothstep(0.6, 1.0, rf / S.y);
-    float amp = R.w * exp(-age * 0.7) * fade / sqrt(1.0 + 3.0 * rf);
+    // spreading (1/sqrt r) plus viscous/capillary damping that grows with k
+    float amp = R.w * exp(-age * (0.12 + 0.0065 * S.z)) * fade / sqrt(1.0 + 3.0 * rf);
     float aa = 1.0 - smoothstep(0.12 * lam, 0.5 * lam, foot);
     float slope = amp * env * S.z;
     var += (1.0 - aa) * 0.5 * slope * slope;
     float s2 = 0.09 + 0.1 * age;
-    float cr = -R.w * 2.0 * exp(-age * 2.5) * cos(age * 9.0) * exp(-d * d / s2);
+    float cr = -crater * R.w * 2.0 * exp(-age * 2.5) * cos(age * 9.0) * exp(-d * d / s2);
     float crSlope = cr * (-2.0 * d / s2);
     sl += (dv / max(d, 1e-4)) * (slope * aa * cos(S.z * x) + crSlope);
   }
@@ -251,8 +254,12 @@ void main() {
   float foam = 0.0;
   sl += rippleSlope(vX0, foot, var, foam);
   vec3 N = normalize(vec3(-sl.x, 1.0, -sl.y));
+  // Facets turned away from the eye are hidden behind the crests in front of
+  // them; keep N.V at least half the flat surface's (which is tiny far away,
+  // so the far-shore mirror is not lifted into the sky).
   float nv = dot(N, V);
-  if (nv < 0.03) N = normalize(N + V * (0.03 - nv)); // facets turned away are hidden
+  float minNV = 0.5 * clamp(V.y, 0.0, 0.06);
+  if (nv < minNV) N = normalize(N + V * (minNV - nv));
   float NdV = clamp(dot(N, V), 0.0, 1.0);
   float F = 0.02 + 0.98 * pow(1.0 - NdV, 5.0);
 
@@ -316,7 +323,8 @@ void main() {
   vec3 refl;
   #ifdef USE_REFLECTION
     // Offset the mirror lookup by how far the tilted facet turns the reflected
-    // ray, for content ~uReflDist away (ripples streak the reflection).
+    // ray, at the distance of what is mirrored there (reflection depth): near
+    // posts wobble gently, the far treeline breaks up more.
     vec3 R0 = vec3(-V.x, V.y, -V.z);
     vec4 pc = uTexMatrix * vec4(vWorld, 1.0);
     vec2 uv0 = clamp(pc.xy / pc.w, vec2(0.0), vec2(1.0));
@@ -325,7 +333,7 @@ void main() {
     float dR = 600.0;
     if (rz < 0.99999) {
       vec4 vp = uReflProjInv * vec4(uv0 * 2.0 - 1.0, rz * 2.0 - 1.0, 1.0);
-      dR = clamp(length(vp.xyz / vp.w) - dist, 0.25, 600.0);
+      if (abs(vp.w) > 1e-6) dR = clamp(length(vp.xyz / vp.w) - dist, 0.25, 600.0);
     }
     vec4 pa = uTexMatrix * vec4(vWorld + R * dR, 1.0);
     vec4 pb = uTexMatrix * vec4(vWorld + R0 * dR, 1.0);
@@ -333,7 +341,7 @@ void main() {
     if (pa.w > 0.01 && pb.w > 0.01) ruv += pa.xy / pa.w - pb.xy / pb.w;
     // Unresolved ripples blur the mirror image. Facets tilt the reflected ray
     // mostly up/down in a grazing view, so the blur is a vertical streak.
-    float spreadV = 1.1 * sqrt(var) * uReflPxPerRad;            // 1 sigma, target pixels
+    float spreadV = 0.85 * sqrt(var) * uReflPxPerRad;           // ~1 sigma, target pixels
     float spreadH = spreadV * clamp(V.y * 4.0, 0.12, 1.0);
     float lod = log2(max(1.0, max(spreadH, spreadV * 0.4)));
     vec2 uvc = clamp(ruv, vec2(0.001), vec2(0.999));
@@ -346,11 +354,14 @@ void main() {
   #else
     refl = skyFallback(R);
   #endif
-  refl = min(refl, vec3(uReflClamp)); // the sun disc comes from the glint term
+  // The sun disc comes from the glint term; a half-float sky can also hold Inf/NaN there.
+  if (!(dot(refl, vec3(1.0)) < 60000.0)) refl = vec3(uReflClamp);
+  refl = min(refl, vec3(uReflClamp));
 
   // ---- sun glint (Beckmann lobe; roughness = unresolved slope variance) -----
   vec3 L = uSunDir;
-  vec3 H = normalize(L + V);
+  vec3 hv = L + V;
+  vec3 H = hv * inversesqrt(max(dot(hv, hv), 1e-8));
   float NdH = clamp(dot(N, H), 1e-4, 1.0);
   float NdL = dot(N, L);
   float VdH = clamp(dot(V, H), 0.0, 1.0);

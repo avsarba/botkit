@@ -10,10 +10,10 @@ const TWO_PI = Math.PI * 2;
 export function createRipples() {
   const rings = [];
   for (let i = 0; i < MAX_RINGS; i++) {
-    rings.push({ on: false, x: 0, z: 0, t0: 0, amp: 0, speed: 0.3, maxR: 1, k: 50, foam: 0, life: 1, wake: false });
+    rings.push({ on: false, x: 0, z: 0, t0: 0, amp: 0, speed: 0.3, maxR: 1, k: 50, foam: 0, life: 1, wake: false, crater: false });
   }
   const uA = new Float32Array(MAX_RINGS * 4); // x, z, age, amp (m)
-  const uB = new Float32Array(MAX_RINGS * 4); // speed m/s, maxR m, k rad/m, foam 0..1
+  const uB = new Float32Array(MAX_RINGS * 4); // speed m/s, maxR m, k rad/m, foam (>= 0 impact, -1-foam no crater)
   let count = 0;
   let limit = MAX_RINGS;
   let now = 0;
@@ -24,8 +24,9 @@ export function createRipples() {
     return (r.amp * 100 + r.foam) * left * (r.wake ? 0.4 : 1);
   }
 
-  // amp: crest height in meters; lambda: crest spacing in meters; speed: m/s of the ring front
-  function add(x, z, amp, lambda, speed, maxR, foam = 0, delay = 0, wake = false) {
+  // amp: crest height in meters; lambda: crest spacing in meters; speed: m/s of the ring front;
+  // crater: an impact (splash crater and rebound at the centre), not a wake or a plip
+  function add(x, z, amp, lambda, speed, maxR, foam = 0, delay = 0, wake = false, crater = false) {
     if (!Number.isFinite(x) || !Number.isFinite(z) || !(amp > 0)) return;
     let slot = null;
     let worst = Infinity;
@@ -52,7 +53,8 @@ export function createRipples() {
     slot.speed = Math.max(0.05, speed);
     slot.maxR = Math.max(0.1, maxR);
     slot.k = TWO_PI / Math.max(0.02, lambda);
-    slot.foam = foam;
+    slot.foam = clamp(foam, 0, 1);
+    slot.crater = crater;
     slot.life = slot.maxR / slot.speed;
     slot.wake = wake;
   }
@@ -82,7 +84,7 @@ export function createRipples() {
       uB[o] = r.speed;
       uB[o + 1] = r.maxR;
       uB[o + 2] = r.k;
-      uB[o + 3] = r.foam;
+      uB[o + 3] = r.crater ? r.foam : -1 - r.foam; // sign flags "no crater"
       count++;
     }
     for (let i = count; i < MAX_RINGS; i++) {
@@ -91,7 +93,7 @@ export function createRipples() {
       uB[o] = 1;
       uB[o + 1] = 1;
       uB[o + 2] = 1;
-      uB[o + 3] = 0;
+      uB[o + 3] = -1;
     }
   }
 
@@ -106,7 +108,8 @@ export function createRipples() {
     let best = 1.5 * 1.5;
     let free = null;
     let oldest = null;
-    for (const em of emitters) {
+    for (let i = 0; i < emitters.length; i++) {
+      const em = emitters[i];
       if (em.on && now - em.t > 0.5) em.on = false;
       if (!em.on) {
         if (!free) free = em;
@@ -138,7 +141,7 @@ export function createRipples() {
       e.acc -= spacing;
       // Kelvin-like: transverse wavelength ~ 2 pi v^2 / g, rings spread at ~v/3
       // (group velocity), which gives the ~20 degree V behind the object.
-      const amp = clamp(0.0015 + sp * 0.0045, 0.0015, 0.01);
+      const amp = clamp(0.003 + sp * 0.009, 0.003, 0.016);
       const lambda = clamp(0.8 * 2 * Math.PI * sp * sp / 9.81, 0.05, 0.6);
       const ringSpeed = Math.max(0.1, sp * 0.36);
       // emitted slightly ahead: the bow pushes the first crest

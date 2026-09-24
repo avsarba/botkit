@@ -6,7 +6,7 @@
 //    pilings, timber), untextured, depth only, at reduced resolution. The water
 //    shader turns it into the true water thickness in front of each pixel.
 import * as THREE from 'three';
-import { LAYERS } from '../config.js';
+import { LAYERS, WATER_LEVEL } from '../config.js';
 
 export function createPasses(renderer) {
   // ---- reflection ----------------------------------------------------------
@@ -53,7 +53,7 @@ export function createPasses(renderer) {
   // Returns false (and leaves the previous image) when the camera is under water.
   function renderReflection(scene, camera, hidden, w, h) {
     camPos.setFromMatrixPosition(camera.matrixWorld);
-    planePos.set(camPos.x, 0, camPos.z);
+    planePos.set(camPos.x, WATER_LEVEL, camPos.z);
     view.subVectors(planePos, camPos);
     if (view.dot(normal) > -1e-4) return false;
     const rt = ensureReflection(w, h);
@@ -93,8 +93,11 @@ export function createPasses(renderer) {
     reflCam.projectionMatrixInverse.copy(pm).invert();
 
     for (let i = 0; i < hidden.length; i++) hidden[i].visible = false;
-    renderInto(rt, scene, reflCam);
-    for (let i = 0; i < hidden.length; i++) hidden[i].visible = true;
+    try {
+      renderInto(rt, scene, reflCam);
+    } finally {
+      for (let i = 0; i < hidden.length; i++) hidden[i].visible = true;
+    }
     return true;
   }
 
@@ -143,10 +146,13 @@ export function createPasses(renderer) {
     scene.background = null; // the background box would bypass the layer test
     scene.overrideMaterial = depthMaterial;
     for (let i = 0; i < hidden.length; i++) hidden[i].visible = false;
-    renderInto(rt, scene, depthCam);
-    for (let i = 0; i < hidden.length; i++) hidden[i].visible = true;
-    scene.overrideMaterial = ov;
-    scene.background = bg;
+    try {
+      renderInto(rt, scene, depthCam);
+    } finally {
+      for (let i = 0; i < hidden.length; i++) hidden[i].visible = true;
+      scene.overrideMaterial = ov;
+      scene.background = bg;
+    }
     return rt;
   }
 
@@ -159,14 +165,17 @@ export function createPasses(renderer) {
     renderer.xr.enabled = false;
     renderer.shadowMap.autoUpdate = false; // reuse the main pass's shadow maps
     renderer.shadowMap.needsUpdate = false;
-    renderer.setRenderTarget(rt);
-    renderer.state.buffers.depth.setMask(true);
-    if (renderer.autoClear === false) renderer.clear(true, true, true);
-    renderer.render(scene, cam);
-    renderer.setRenderTarget(prevRT);
-    renderer.xr.enabled = prevXr;
-    renderer.shadowMap.autoUpdate = prevShadowAuto;
-    renderer.shadowMap.needsUpdate = prevShadowNeeds;
+    try {
+      renderer.setRenderTarget(rt);
+      renderer.state.buffers.depth.setMask(true);
+      if (renderer.autoClear === false) renderer.clear(true, true, true);
+      renderer.render(scene, cam);
+    } finally {
+      renderer.setRenderTarget(prevRT);
+      renderer.xr.enabled = prevXr;
+      renderer.shadowMap.autoUpdate = prevShadowAuto;
+      renderer.shadowMap.needsUpdate = prevShadowNeeds;
+    }
   }
 
   return {

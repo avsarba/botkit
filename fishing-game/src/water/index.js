@@ -238,6 +238,7 @@ export function createWater(ctx) {
   const E = new THREE.Vector3();
   const tmpC = new THREE.Vector3();
   const lin = (c, out) => (c && c.isColor ? out.set(c.r, c.g, c.b) : c && c.isVector3 ? out.copy(c) : out);
+  const lum = (v) => 0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z;
   let windStrength = Number.isFinite(env.windStrength) ? env.windStrength : 0.25;
 
   function readEnv() {
@@ -258,7 +259,6 @@ export function createWater(ctx) {
     u.uBodyRad.value.set(BODY[0] * E.x, BODY[1] * E.y, BODY[2] * E.z);
     u.uBedEst.value.copy(E).multiplyScalar(BED_EST).max(tmpC.set(1e-4, 1e-4, 1e-4));
     u.uFoamRad.value.copy(E).multiplyScalar(FOAM);
-    const lum = (v) => 0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z;
     u.uReflClamp.value = Math.max(1.5, 7 * (lum(sky) + lum(hor)));
     // low quality: dark forested far shore in the sky reflection, hazed by fog at ~300 m
     let f300 = 0;
@@ -283,6 +283,7 @@ export function createWater(ctx) {
     [0, 0],
     [0, 0],
   ];
+  const detU = [uniforms.uDet0.value, uniforms.uDet1.value, uniforms.uDet2.value];
   function scrollDetail(dt) {
     const a = waves.angle;
     for (let i = 0; i < 3; i++) {
@@ -290,8 +291,7 @@ export function createWater(ctx) {
       const th = -(a + L.rot); // texture +u follows the wind (+ a per-layer twist)
       const c = Math.cos(th);
       const s = Math.sin(th);
-      const u = uniforms['uDet' + i].value;
-      u.set(c, s, 1 / L.tile, L.strength);
+      detU[i].set(c, s, 1 / L.tile, L.strength);
       const dx = Math.cos(a + L.dir) * L.speed * dt;
       const dz = Math.sin(a + L.dir) * L.speed * dt;
       // moving pattern h(x - v t): uv offset -= R * v dt / tile
@@ -360,7 +360,7 @@ export function createWater(ctx) {
     const lam = 0.08 + 0.24 * s;
     const sp = 0.3 + 0.32 * s;
     const R = 1.4 + 4.2 * s;
-    ripples.add(x, z, amp, lam, sp, R, s > 0.3 ? 0.25 + 0.75 * s : 0.3 * s);
+    ripples.add(x, z, amp, lam, sp, R, s > 0.3 ? 0.25 + 0.75 * s : 0.3 * s, 0, false, true);
     // falling drops and the collapsing jet make a second, finer set of rings
     ripples.add(x, z, amp * 0.55, lam * 0.65, sp * 0.8, R * 0.7, 0, 0.3 + 0.25 * s);
     if (s > 0.5) ripples.add(x, z, amp * 0.4, lam * 0.55, sp * 0.7, R * 0.5, 0.2, 0.85);
@@ -371,7 +371,7 @@ export function createWater(ctx) {
     const s = clamp(Number.isFinite(size01) ? size01 : 0.5, 0, 1);
     const x = position.x;
     const z = position.z;
-    ripples.add(x, z, 0.004 + 0.012 * s, 0.16 + 0.2 * s, 0.34 + 0.3 * s, 2 + 3.5 * s, 0.55 + 0.45 * s);
+    ripples.add(x, z, 0.004 + 0.012 * s, 0.16 + 0.2 * s, 0.34 + 0.3 * s, 2 + 3.5 * s, 0.55 + 0.45 * s, 0, false, true);
     ripples.add(x, z, 0.0025 + 0.005 * s, 0.12, 0.3, 1.4 + 2 * s, 0.25, 0.3);
     splashSys.burst(x, getHeight(x, z), z, 0.16 + 0.32 * s, { quality });
   }

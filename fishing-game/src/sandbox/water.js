@@ -309,7 +309,7 @@ function setPreset(name) {
 }
 
 // ---------------------------------------------------------------- scene content
-// drop the stub environment's ground/dock (we only wanted makeSandbox)
+// terrain, forest, dock (the stub environment is not used; only makeSandbox)
 const terrain = buildTerrain();
 scene.add(terrain);
 scene.add(buildForest());

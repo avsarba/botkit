@@ -104,7 +104,9 @@ export const G = 9.81;
 // (terrain / lake bed, fish, lures, the float, submerged timber, dock pilings, rocks, reed stems)
 // also enable LAYERS.UNDERWATER so the water's depth pre-pass can measure how much water lies
 // in front of them. Objects that should not show up in the planar reflection enable NO_REFLECT.
-export const LAYERS = Object.freeze({ UNDERWATER: 3, NO_REFLECT: 4 });
+// LAYERS.REFLECTION holds cheap stand-ins (e.g. a coarse terrain proxy) that ONLY the planar
+// reflection camera renders; the full-detail originals carry NO_REFLECT.
+export const LAYERS = Object.freeze({ UNDERWATER: 3, NO_REFLECT: 4, REFLECTION: 5 });
 
 // Fixed species ids (fish-behavior owns the data, fish-mesh owns the looks).
 export const SPECIES_IDS = Object.freeze([

@@ -826,6 +826,13 @@ export function createRod({ quality = 'high' } = {}) {
       m.needsUpdate = true;
     }
   }
+  // strength of the sky reflection on the rod and reel (a uniform: cheap every frame)
+  let envI = 1;
+  function setEnvIntensity(k) {
+    if (!Number.isFinite(k) || Math.abs(k - envI) < 1e-3) return;
+    envI = k;
+    for (const m of materials) m.envMapIntensity = k;
+  }
 
   setLoad(new THREE.Vector3(0, 0, 0));
 
@@ -839,6 +846,7 @@ export function createRod({ quality = 'high' } = {}) {
     lineExitLocal,
     animateReel,
     setEnvMap,
+    setEnvIntensity,
     dispose() {
       pose.traverse((o) => o.geometry && o.geometry.dispose());
       for (const m of materials) {

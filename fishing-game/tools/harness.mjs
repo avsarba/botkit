@@ -41,7 +41,7 @@ const wait = Number(arg('--wait', '4000'));
 const shots = arg('--shots', '').split(',').filter(Boolean).map(Number);
 const scenario = arg('--scenario', null);
 const evalExpr = arg('--eval', null);
-const timeout = Number(arg('--timeout', '180000'));
+const timeout = Number(arg('--timeout', '900000')); // per Playwright action; software-rendered frames can take seconds
 const quiet = has('--quiet');
 
 const ROOT = resolve('.');

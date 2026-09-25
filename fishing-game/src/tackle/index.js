@@ -3,6 +3,8 @@
 // See CONTRACT.md "Tackle". World units are meters; the lake surface is y = 0.
 import * as THREE from 'three';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+import { Line2 } from 'three/addons/lines/Line2.js';
+import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
 import { TACKLE, LURES, STATES, LAYERS, DOCK, G, clamp, lerp, damp, smoothstep, makeRng } from '../config.js';
 import { createRod, ROD } from './rod.js';
 import { createLureModels } from './lures.js';
@@ -1410,11 +1412,21 @@ export function createTackle(ctx) {
 
   // ------------------------------------------------------------------ env map / line light
   let lastEnvTex;
+  let lastRodTex;
   function syncEnvMap() {
+    // The rod always carries the sky map itself (same PMREM, same programs) so its reflection strength
+    // is its own: scene.environmentIntensity doubles the sky light at night, which left the glossy
+    // clear-coated blank with a bright moonlit edge; the rod keeps well under that.
+    const rodTex = env.envMap || scene.environment || null;
+    if (rodTex !== lastRodTex) {
+      lastRodTex = rodTex;
+      rod.setEnvMap(rodTex);
+    }
+    const night = clamp(finite(env.nightFactor, 0), 0, 1);
+    rod.setEnvIntensity(finite(scene.environmentIntensity, 1) * lerp(1, 0.4, night));
     const tex = scene.environment ? null : env.envMap || null;
     if (tex === lastEnvTex) return;
     lastEnvTex = tex;
-    rod.setEnvMap(tex);
     for (const m of hand.materials) {
       m.envMap = tex;
       m.needsUpdate = true;
@@ -1535,6 +1547,55 @@ export function createTackle(ctx) {
     return vfinite(_pp) ? out.copy(_pp) : null;
   }
 
+  // ------------------------------------------------------------------ casting aid
+  // While the cast charges: a faint hairline ring on the water where it would come down (predictLanding),
+  // fading in with the charge. Screen-space width (Line2), so it reads as a thin ring at any distance;
+  // its radius grows with distance so the far ellipse doesn't collapse to a dash.
+  const AIM_SEGS = 48;
+  const aimPts = new Float32Array((AIM_SEGS + 1) * 3);
+  for (let i = 0; i <= AIM_SEGS; i++) {
+    const a = (i / AIM_SEGS) * Math.PI * 2;
+    aimPts[i * 3] = Math.cos(a);
+    aimPts[i * 3 + 2] = Math.sin(a);
+  }
+  const aimGeom = new LineGeometry();
+  aimGeom.setPositions(aimPts);
+  const aimMat = new LineMaterial({ color: 0xffffff, linewidth: 1.3, worldUnits: false, transparent: true, opacity: 0, depthWrite: false, fog: true });
+  const aimRing = new Line2(aimGeom, aimMat);
+  aimRing.name = 'cast-aim-ring';
+  aimRing.renderOrder = 12; // after the water (which writes no depth)
+  aimRing.frustumCulled = false;
+  aimRing.visible = false;
+  aimRing.layers.enable(LAYERS.NO_REFLECT);
+  scene.add(aimRing);
+  const AIM_TINT = new THREE.Color(0.95, 0.93, 0.86);
+  const _aimP = new THREE.Vector3();
+  let aimA = 0;
+  function updateAimRing(dt, state, input) {
+    const charging = state === STATES.CHARGING && mode === 'home' && !lost;
+    let want = 0;
+    if (charging) {
+      const c = clamp(finite(input.charge01, 0), 0, 1);
+      const p = predictLanding(c, null, _aimP);
+      if (p && env.isWater(p.x, p.z)) {
+        const d = Math.hypot(p.x - camPos.x, p.z - camPos.z);
+        const r = clamp(0.035 * d, 0.3, 1.5);
+        aimRing.position.set(p.x, p.y + 0.02, p.z);
+        aimRing.scale.set(r, 1, r);
+        aimRing.updateMatrixWorld();
+        want = smoothstep(0.06, 0.5, c);
+      }
+    }
+    aimA = charging ? damp(aimA, want, 9, dt) : 0;
+    aimRing.visible = aimA > 0.01;
+    if (!aimRing.visible) return;
+    // a soft off-white that sits a little above the water's brightness by day and stays dim at night
+    const exposure = Math.max(0.2, finite(renderer.toneMappingExposure, 1));
+    const night = clamp(finite(env.nightFactor, 0), 0, 1);
+    aimMat.color.copy(AIM_TINT).multiplyScalar((0.85 / exposure) * lerp(1, 0.3, night));
+    aimMat.opacity = 0.42 * aimA;
+  }
+
   // ------------------------------------------------------------------ public API
   function update(frame) {
     const dt = clamp(finite(frame && frame.dt, 1 / 60), 0, 0.05);
@@ -1568,6 +1629,7 @@ export function createTackle(ctx) {
     rigHidden = state === STATES.CAUGHT;
     if (rigHidden) hideRig();
     updateRestTip(state);
+    updateAimRing(dt, state, input);
     writeSnapshot();
   }
 
@@ -1877,7 +1939,9 @@ export function createTackle(ctx) {
     object: vmRoot,
     dispose() {
       for (const off of offs) if (typeof off === 'function') off();
-      scene.remove(vmRoot, rope.line, tail.line);
+      scene.remove(vmRoot, rope.line, tail.line, aimRing);
+      aimGeom.dispose();
+      aimMat.dispose();
       for (const m of Object.values(models)) for (const o of [m.object, m.bait, m.shot]) if (o) scene.remove(o);
       rope.dispose();
       tail.dispose();

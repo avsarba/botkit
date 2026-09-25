@@ -31,7 +31,7 @@ export default async (h) => {
   assert(landed && landed.onWater, 'float landed on the water');
   assert((await L.state()) === 'waiting', 'WAITING after the float lands');
   await dbg('forceBite("largemouth_bass")');
-  const sb = await waitState('strike', { timeoutS: 300, every: 100 });
+  const sb = await waitState('strike', { gameS: 60, every: 100 });
   log(T(), 'bite opened at game time', sb.time);
   await dbg('strike()');
   const s1 = await stats();
@@ -42,7 +42,7 @@ export default async (h) => {
   const res = await playFight({
     drag: 0.45,
     scale: 8,
-    timeoutS: 1200,
+    gameS: 900,
     onTick: async (s) => {
       if (!fightShot && s.time - s1.time > 3 && s.tensionN > 8 && s.hooked && s.hooked.distanceM > 7) {
         fightShot = true;
@@ -57,7 +57,7 @@ export default async (h) => {
   log(T(), 'fight ended', res.state, 'max tension', res.maxT.toFixed(1), 'N');
   assert(res.state === 'landing' || res.state === 'caught', `fight ends in LANDING/CAUGHT (got ${res.state})`);
   await dbg('setTimeScale(1)');
-  const sc = await waitState('caught', { timeoutS: 300, every: 300 });
+  const sc = await waitState('caught', { gameS: 30, every: 300 });
   assert(sc.records >= 1, 'catch recorded');
   const rec = (await dbg('records()')).slice(-1)[0];
   log(T(), 'record', JSON.stringify(rec));
@@ -68,7 +68,7 @@ export default async (h) => {
   await expectNoNaN();
 
   // release with the real button
-  await h.page.click('#btn-release');
+  await L.click('#btn-release');
   await L.waitFrames(2);
   assert((await L.state()) === 'ready', 'Release -> READY');
   const stored = await L.g('(() => { try { return JSON.parse(localStorage.getItem("loonlake.v1")).records.length; } catch (e) { return -1; } })()');
@@ -104,7 +104,8 @@ export default async (h) => {
     log(T(), `  -> ${s.state} after ${(s.time - tl).toFixed(1)} s of retrieve`);
     if (!bit && s.state === 'waiting') {
       await dbg('setReeling(true)');
-      await waitState(['ready', 'strike'], { timeoutS: 300 });
+      await dbg('setTimeScale(20)');
+      await waitState(['ready', 'strike'], { gameS: 240 });
       await dbg('setReeling(false)');
       if ((await L.state()) === 'strike') {
         bit = true;
@@ -119,13 +120,13 @@ export default async (h) => {
   if (s2.state === 'fighting') {
     await pretty('crank-fight', 2);
     await fast();
-    const res2 = await playFight({ drag: 0.5, scale: 10, timeoutS: 900 });
+    const res2 = await playFight({ drag: 0.5, scale: 10, gameS: 900 });
     log(T(), 'crank fight ended', res2.state);
     if (res2.state === 'fighting') await dbg('landNow()');
-    const c = await waitState(['caught', 'ready', 'waiting', 'escaped', 'snapped'], { timeoutS: 300 });
+    const c = await waitState(['caught', 'ready', 'waiting', 'escaped', 'snapped'], { gameS: 60 });
     if (c.state === 'caught') {
       await pretty('crank-catch', 3);
-      await h.page.click('#btn-keep');
+      await L.click('#btn-keep');
       await L.waitFrames(1);
       assert((await L.state()) === 'ready', 'Keep -> READY');
       const last = (await dbg('records()')).slice(-1)[0];

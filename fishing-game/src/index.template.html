@@ -419,6 +419,23 @@ body {
 .drag-mid .label { color: var(--brass); }
 .drag-val { font: 500 15px/1.1 var(--f-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
+/* touch: the slow-retrieve toggle (Shift on a keyboard) in the dial's free top-right corner, beside the
+   big button; not while a fish is on (the retrieve speed only matters for a lure / float in the water) */
+.slow-chip {
+  display: none;
+  position: absolute; right: -2px; top: -2px;
+  min-width: 46px; min-height: 32px; padding: 6px 8px 5px;
+  font: 600 10px/1 var(--f-ui); letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--muted); background: var(--fill-faint);
+  border: 1px solid var(--hair-strong); border-radius: 6px;
+  touch-action: manipulation;
+}
+.slow-chip::after { content: ""; position: absolute; inset: -7px -4px; } /* 44 px touch target */
+.slow-chip[aria-pressed="true"] { color: var(--text); border-color: var(--line); background: var(--line-soft); }
+#ui[data-input="touch"] .slow-chip { display: block; }
+#ui[data-input="touch"][data-state="fighting"] .slow-chip,
+#ui[data-input="touch"][data-state="landing"] .slow-chip,
+#ui[data-input="touch"][data-state="caught"] .slow-chip { display: none; }
 /* touch: the dial becomes the hold button */
 #ui[data-input="touch"] .action { display: grid; }
 #ui[data-input="touch"] .dial-center { display: none; }
@@ -839,10 +856,11 @@ kbd {
 }
 
 /* ONE rule decides the catch card's form: a bottom sheet when the window is narrow (width <= 720 px)
-   or portrait (aspect <= 0.85: max-aspect-ratio 17/20), otherwise a side panel on the right. Core
+   but not short (landscape phones <= 520 px tall keep the side panel: a sheet would cover the fish),
+   or portrait (aspect <= 0.85: max-aspect-ratio 17/20); otherwise a side panel on the right. Core
    frames the showcase fish from ui.getCatchRect(), so the fish and the card always agree. Keep this
    block last: it must win over the short-landscape side-panel sizing above. */
-@media (max-width: 720px), (max-aspect-ratio: 17/20) {
+@media (max-width: 720px) and (min-height: 521px), (max-aspect-ratio: 17/20) {
   .catch {
     left: 0; right: 0; bottom: 0; top: auto;
     width: auto; max-width: 640px; height: auto; margin: 0 auto;
@@ -931,6 +949,7 @@ kbd {
           <svg id="dial-svg" viewBox="0 0 240 164" aria-hidden="true"></svg>
           <div class="dial-center" aria-hidden="true"><span class="dial-value" id="dial-value">0.0</span><span class="label" id="dial-unit">lb</span></div>
           <button class="action" id="action" type="button" data-mode="ready" aria-label="Hold to cast"><span class="action-main" id="action-main">Cast</span><span class="action-sub" id="action-sub">Hold</span></button>
+          <button class="slow-chip" id="btn-slow" type="button" aria-pressed="false" aria-label="Slow retrieve">Slow</button>
         </div>
         <dl class="readouts">
           <div class="readout"><dt class="label">Line out</dt><dd id="ro-line">0 ft</dd></div>
@@ -974,6 +993,7 @@ kbd {
         <div><dt><kbd>Hold</kbd> the big button</dt><dd>Cast, then reel</dd></div>
         <div><dt><kbd>Tap</kbd> anywhere on a bite</dt><dd>Set the hook</dd></div>
         <div><dt><kbd>–</kbd> <kbd>+</kbd></dt><dd>Drag</dd></div>
+        <div><dt><kbd>Slow</kbd></dt><dd>Slow retrieve</dd></div>
         <div><dt>Lure chips</dt><dd>Lures</dd></div>
         <div class="ctl-note"><dt>In a fight</dt><dd>Drag on the lake (a second finger while you reel): up lifts the rod, sideways adds side pressure.</dd></div>
       </dl>
@@ -1065,6 +1085,7 @@ kbd {
         <dl class="keys ctl-touch">
           <div><dt>Drag the view</dt><dd>Aim</dd></div>
           <div><dt>Hold the big button</dt><dd>Charge a cast, let go to throw. Hold again to reel in</dd></div>
+          <div><dt><kbd>Slow</kbd></dt><dd>Slow retrieve while reeling (tap again for full speed)</dd></div>
           <div><dt>Tap the lake or button</dt><dd>Set the hook when the float goes under</dd></div>
           <div><dt><kbd>–</kbd> <kbd>+</kbd></dt><dd>Loosen or tighten the drag</dd></div>
           <div><dt>Lure chips</dt><dd>Tie on a lure (with the line reeled in)</dd></div>

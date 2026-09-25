@@ -4,7 +4,7 @@
 import { makeLib } from './lib.mjs';
 
 export default async (h) => {
-  const { page, log, sleep } = h;
+  const { page, log } = h;
   const L = makeLib(h);
   const { dbg, stats, assert, T } = L;
 
@@ -18,13 +18,9 @@ export default async (h) => {
   assert(early.disabled, 'Start disabled while the lake is prepared');
   await h.shot('01-loading');
 
-  // wait until the button says Start
-  let text = '';
-  for (let i = 0; i < 600; i++) {
-    text = await page.evaluate(() => document.getElementById('btn-start').textContent);
-    if (text === 'Start fishing') break;
-    await sleep(250);
-  }
+  // wait until the button says Start (a page-side condition: wall-clock backstop only)
+  await L.waitStartEnabled();
+  const text = await page.evaluate(() => document.getElementById('btn-start').textContent);
   log(T(), 'ready:', text, JSON.stringify(await L.g('window.__game.buildTimes')));
   assert(text === 'Start fishing', 'Start enabled once the lake is ready');
   assert((await L.state()) === 'title', 'state TITLE behind the title card');
@@ -40,7 +36,7 @@ export default async (h) => {
   await h.shot('02-title');
 
   // click the real Start button
-  await page.click('#btn-start');
+  await L.click('#btn-start');
   await L.waitFrames(2);
   const s = await stats();
   const ui = await page.evaluate(() => ({ title: !document.getElementById('title').hidden, hud: !document.getElementById('hud').hidden }));
@@ -86,29 +82,30 @@ export default async (h) => {
   await dbg('setTimeScale(6)');
   await page.mouse.move(vp.width * 0.55, vp.height * 0.45);
   await page.mouse.down();
-  let c = await stats();
-  for (let i = 0; i < 60 && !(c.state === 'charging' && c.input.charge01 > 0.5); i++) {
-    await sleep(200);
-    c = await stats();
-  }
+  // (game time: a full charge takes 1.3 s)
+  let c = await L.waitFor((s) => s.state === 'charging' && s.input.charge01 > 0.5, { gameS: 10, every: 100, label: 'charge > 0.5' });
   assert(c.state === 'charging' && c.input.charge01 > 0.5, `holding the mouse charges the cast (${c.state} ${c.input.charge01})`);
   await page.mouse.up();
   await L.waitFrames(1);
   c = await stats();
   assert(c.state === 'casting' || c.state === 'waiting', `releasing the mouse casts (${c.state})`);
-  c = await L.waitState('waiting', { timeoutS: 200 });
+  c = await L.waitState('waiting', { gameS: 30 });
   log(T(), 'mouse cast landed', JSON.stringify(c.lure));
   assert(c.lure.distanceM > 6, 'the cast went out over the water');
 
-  // ---- hold Space to reel the lure in
+  // ---- hold Space to reel the lure in (the retrieve itself runs at low resolution, 20x game speed)
   await dbg('setTimeScale(12)');
   const line0 = c.lineOutM;
   await page.keyboard.down('Space');
   await L.waitFrames(4);
   const c2 = await stats();
   assert(c2.input.reeling && c2.lineOutM < line0, `holding Space reels (${line0} -> ${c2.lineOutM})`);
-  await L.waitState('ready', { timeoutS: 400 });
+  await dbg('setPixelRatio(0.5)');
+  await dbg('setTimeScale(20)');
+  await L.waitState('ready', { gameS: 240 });
   await page.keyboard.up('Space');
+  await dbg('setTimeScale(1)');
+  await dbg('setPixelRatio(1)');
   log(T(), 'reeled home -> READY');
 
   // ---- lure keys, drag keys, mute, units

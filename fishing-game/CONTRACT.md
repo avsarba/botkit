@@ -31,7 +31,9 @@ every existing signature working, and describe it in your final report.
   fish, lures, the float, sunken timber, dock pilings, rocks, reed stems) must call
   `object.layers.enable(LAYERS.UNDERWATER)`; Water renders that layer in a cheap depth pre-pass to compute
   the true water thickness in front of each pixel (absorption + transparency). `LAYERS.NO_REFLECT` marks
-  objects the planar reflection should skip.
+  objects the planar reflection should skip. `LAYERS.REFLECTION` holds cheap stand-ins (e.g. a coarse
+  terrain / treeline proxy) that ONLY the planar reflection renders (it draws layers 0 | REFLECTION minus
+  NO_REFLECT); the full-detail originals carry NO_REFLECT. The main camera never enables REFLECTION.
 - Do not edit files you do not own. If you believe another module needs a change, put it in your report.
 
 ## Coordinates and the lake
@@ -90,7 +92,7 @@ so do not call e.g. `water.splash()` for a lure landing yourself; Water subscrib
 | `lure:twitch` | tackle | `{ position }` topwater "walk" / pause pops (small splash + sound) |
 | `fish:interest` | fish | `{ fishId, speciesId, position }` a fish is following the lure |
 | `fish:nibble` | fish | `{ fishId, strength01 }` bobber twitch / rod tip tap |
-| `fish:bite` | fish | `{ fishId, biteId, speciesId, weightKg, lengthCm, windowS, position }` hookset window opens |
+| `fish:bite` | fish | `{ fishId, biteId, speciesId, weightKg, lengthCm, windowS, position }` hookset window opens. Core takes it in WAITING (and ESCAPED, when the lure drops back in); in any other state it closes it again with `fish.missBite(biteId, 'ignored')` |
 | `fish:swirl` | fish | `{ position, size01 }` surface boil/blow-up (topwater strikes, missed strikes) |
 | `fish:missed` | fish | `{ fishId, reason }` bite window closed, fish let go |
 | `fish:spooked` | fish | `{ position, count }` |
@@ -130,8 +132,22 @@ terrain (land + lake bed), and time of day. Returns:
                                  //   bounds: { minX, minZ, maxX, maxZ } } for water shading
   sunLight,                      // THREE.DirectionalLight (casts shadows around the dock only)
   hemiLight,
+  // extras (read by water, tackle, the showcase; optional for everyone else)
+  nightFactor, exposure, sunElevationDeg, hours,   // getters, live
+  sunVisibility,                 // 0..1 share of the sun's (by night the moon's) disc above the terrain + treeline
+                                 // skyline seen from the dock; ALREADY folded into sunIntensity / sunLight.intensity,
+                                 // so a key light behind the far forest leaves the lake in shade and makes no glint
+  sunOpenIntensity,              // the key intensity without that skyline occlusion (for tall things above the treeline)
+  sunOccluder,                   // skyline occlusion helper
+  skylineElevationAt(azimuth),   // skyline elevation (rad above the eye's horizontal) at azimuth atan2(x, -z)
+  setSkylineProfile({ bins, elevation, distance? }),  // scenery hands over the treeline it built
+  skyRadiance, horizonRadiance,  // THREE.Color, scene-referred (linear, before exposure)
+  bakeEnvironment(),             // re-bake the PMREM now (time presets)
 }
 ```
+`windStrength` follows the time of day: light airs at night, a midday / afternoon breeze (~0.3), and glassy calm
+(~0.07, gusts scaled down with it) at first and last light (~5-7 h and ~19.5-21 h), when the water goes mirror-like
+and reflects the far treeline.
 Also sets `renderer.toneMappingExposure` from the time of day and owns `scene.fog`.
 Night (after ~21:00, before ~5:00) needs stars and a moon so the game still reads at night.
 
@@ -189,8 +205,15 @@ Each species definition includes at least:
   depthM: [min, max], habitat: { weeds, rocks, wood, open },  // 0..1 preferences
   lures: { bobber, spinner, crankbait, topwater },            // 0..1 how readily it takes each
   activity(hours) -> 0..1,                      // dawn/dusk peaks etc. (walleye low light, catfish night)
-  hookWindowS, rarity }
+  hookWindowS, rarity,
+  tip }                                         // one-line field tip (where / when / what it takes here) for the journal
 ```
+`src/fish/mesh.js` also exports, for core and the fish system (optional to use):
+`prepareFishAssets(species, { detail, quality, renderer }) -> job { key, speciesId, done, step(budgetMs), finishNow(), cancel() }`
+builds a species' high-detail skin / geometry a few ms at a time (LRU cache of the last two species),
+`fishAssetsReady(species, { detail, quality }) -> bool`, `createFishProgramKeeper({ quality, castShadow }) -> { object3d, dispose }`
+(a tiny never-drawn stand-in carrying the high-detail fish materials, so their shader programs compile at load and
+stay alive), `prewarmFishMeshes(ids, opts)`, `disposeFishMeshCache()`.
 
 `createFishMesh(species, lengthCm)` -> `{ object3d, update(dt, swimSpeedMps, turnRate, exhaustion01), dispose() }`:
 procedural, anatomically believable body (species-specific profile: deep-bodied bluegill, torpedo
@@ -231,7 +254,8 @@ A fish that is visible (shallow water, near the dock) should visibly swim to the
   stamina01,         // 1 fresh -> 0 spent
   headShake01,       // live, 0..1 (rod tip shakes; head shakes on slack line can throw the hook)
   isJumping,         // bool
-  object3d,          // the fish mesh in the scene
+  object3d,          // the fish mesh in the scene. It may be REPLACED ONCE mid-fight (the population model is
+                     // swapped for the high-detail fight model when its assets are ready): read it each frame
   step(dt, { tensionN, pullDir, rodTip, lineOutM }),
       // Integrate ONE fixed substep (core calls at 120 Hz). pullDir = unit vector fish -> rod tip.
       // Physics: mass = weightKg (+ added water mass), own swim force (runs / dives / bulldogging /
@@ -242,6 +266,8 @@ A fish that is visible (shallow water, near the dock) should visibly swim to the
   toLanding(targetPos, durationS),   // core calls when netting starts; animate to the surface beside the dock
 }
 ```
+Released / escaped fish drop their high-detail mesh after ~6 s. A kept fish is restocked after 10-20 game minutes;
+rare fish (musky) respawn after 15-30 minutes and never straight onto the lure.
 
 ### Tackle: `src/tackle/index.js` -> `createTackle(ctx)`
 `ctx = { renderer, scene, camera, events, quality, env, water }`. Owns the rod (first-person view model
@@ -269,8 +295,16 @@ casting physics (ballistic flight with air drag, line paying off the spool, lure
   biteDown(),                             // float goes under / rod tip loads
   snap(),                                 // line breaks: lure lost, line flutters; core re-ties later
   resetToHome(),                          // lure back hanging below the rod tip
+  // extra
+  predictLanding(power01, direction?, target?),  // Vector3 | null: where a cast with this power along `direction`
+                                          // (horizontal; default the view direction) comes down, with the same launch
+                                          // calibration, air drag and wind as the real flight
 }
 ```
+While CHARGING, tackle draws a faint hairline ring on the water at `predictLanding(frame.input.charge01)` (fading
+in with the charge, only over water). During CAUGHT the line, float and lure are hidden (the fish is in the
+angler's hands). The line is lit in scene units (sky + key light, a thin glint, distance fade): main line hi-vis
+12 lb mono, a clear leader under the float.
 Tackle must call `water.wake(...)` while the lure/float moves on the surface, and use `water.getHeight`
 so the float rides the waves. The topwater "walk-the-dog" happens when retrieving in pulses; emit
 `lure:twitch` on each pop.
@@ -293,7 +327,8 @@ cue), `ui:click`. Mix carefully: nothing harsh, master compressor, total loudnes
 ### UI: `src/ui/index.js` + `src/index.template.html` -> `createUI(ctx)`
 `ctx = { events, handlers, config }` where `handlers` (from core) are
 `{ onStart, onLure(id), onDrag(01), onTimePreset(hours), onMute(bool), onUnits(u), onPause(bool),
-   onActionDown(), onActionUp(), onQuality(q), onKeep(), onRelease(), onJournal(open) }`.
+   onActionDown(), onActionUp(), onQuality(q /* 'auto'|'high'|'medium'|'low' */), onKeep(), onRelease(),
+   onJournal(open), onSlow(bool) /* touch Slow chip: slow retrieve, like Shift */ }`.
 The template holds `<title>`, the Google Fonts link, all CSS, and the static DOM:
 `#stage` (full-viewport container the core appends the canvas to, behind everything) and `#ui`
 (overlay root, `pointer-events: none` except on real controls). It contains the literal marker
@@ -305,17 +340,29 @@ The template holds `<title>`, the Google Fonts link, all CSS, and the static DOM
   setState(state),
   update(hud),       // every frame; hud = { state, tension01, tensionN, dragN, drag01, lineOutM,
                      //   castPower01, hours, lureId, units, muted, catches, fishOn, fishDistanceM,
-                     //   prompt, promptKind }
-  strikeCue(),       // big, brief "STRIKE" flash when a bite opens the window
+                     //   prompt, promptKind, paused, quality /* incl. 'auto' */, slow, fishStamina01,
+                     //   rodLift01, rodSide, rodStiff01 /* rod meter in the gauge header while fighting */ }
+  strikeCue({ reelSet }),  // big, brief "STRIKE" flash (upper third, above the float) when a bite opens the
+                     //   window; its sub-line says how to set the hook, or "Keep reeling!" for a reel set
   showCatch(record, { isPersonalBest, isNewSpecies }),  // catch card; Keep / Release buttons call handlers
   hideCatch(),
   toast(text, kind /* 'info'|'good'|'bad' */),
   openJournal(records), closeJournal(),
+  // extras
+  setLoading(p01, label), setPaused(bool), isModalOpen(),
+  getCatchRect(),    // the catch card's layout box (DOMRect, viewport CSS px) while it is up, else null
 }
 ```
+The catch card is a bottom sheet when the window is <= 720 px wide (and taller than 520 px) or portrait
+(aspect <= 0.85), otherwise a side panel on the right (landscape phones included). One CSS rule in the
+template decides it; the showcase frames the fish from `getCatchRect()`, so they always agree. The prompt pill
+and cast-power bar sit in a bottom band measured between the lure panel and the gauge, never over the middle
+of the screen where the float and a hooked fish are.
 Controls to surface: cast/reel (hold), drag (-/+ and scroll wheel, shown as lb of drag), lure picker (1-4),
 time presets (Dawn 5:45, Morning 9:00, Noon 12:30, Dusk 19:40, Night 22:30), sound on/off, units (lb/in vs kg/cm),
-journal (J). Touch: a large hold-to-cast/reel button, drag buttons, lure chips; the canvas handles aim drags.
+journal (J), graphics quality (Auto / High / Medium / Low in the pause menu). Touch: a large hold-to-cast/reel
+button with a small Slow toggle beside it (slow retrieve), drag buttons, lure chips; the canvas handles aim drags.
+Lure notes and prompts never name a key that touch screens don't have.
 Catch record shape:
 ```js
 { id, speciesId, speciesName, latin, weightKg, lengthCm, lureId, hours, caughtAt /* ISO */, kept }
@@ -338,12 +385,32 @@ loop: input -> hours -> env.setTimeOfDay/update -> scenery.update -> tackle.upda
       fight substeps -> tackle.setFight/setRodLoad -> water.update -> audio.update -> ui.update -> render
 ```
 
-Fight model (core): `T = k_eff * max(0, |fish - rodTip| - lineOut)` with `k_eff` ~ 40-90 N/m (rod flex softens
-it, less when the rod is pointed straight at the fish), damped. If `T > dragN` the spool slips: line pays out so T
-settles at the drag (and `slipMps` > 0, the drag zings). Reeling shortens `lineOut` by `reelSpeed * dt` only when
-`T < dragN`. `T > TACKLE.lineBreakN` for > 0.12 s snaps the line. Slack (`T < 1 N`) for > ~2.5 s combined with
-head shakes can throw the hook. Side pressure (`input.rodSide` against the fish's direction) and lifting tire the
-fish faster. When `lineOut < ~3 m` and the fish is near the dock and tired, start LANDING (net) -> CAUGHT.
+Fight model (core, `src/game/fight.js`, 120 Hz substeps): `T = k_eff * max(0, |fish - rodTip| - lineOut)` + damping,
+with `k_eff` 40-90 N/m from the angle between the rod (butt -> tip) and the line (soft with the rod bent away from
+the line, stiff when it points straight at the fish). The drag breaks away at 1.08 x the setting after a ~50 ms
+lag, then pays out line so T settles at the drag (`slipMps` > 0, the drag zings); cranking against a slipping drag
+adds 12 % rotor friction. Reeling shortens `lineOut` only while the drag holds (`T < dragN`).
+- Rod cushion: pointed down the line (rod . line > ~0.86..0.97) or held low (`rodLift01` < ~0.24) the rod is stiff
+  (`stiff01` -> 1). Head shakes and jumps on a tight line with a stiff rod wear the hook hold (0.7..1 after the hookset,
+  softer mouths wear faster: trout / walleye 1.25, pike / musky / catfish ~0.3); at 0 the hook PULLS OUT
+  (escape 'headshake', `pulled: true`). Fish under 0.5 kg are exempt.
+- Pump and wind: winding while lowering the rod after a lift gains up to +90 % line; winching a pulling fish with the
+  rod pointed at it gains up to 40 % less.
+- Side pressure (`input.rodSide` against the fish's lateral run, weight x3 of before) and a high rod tire the fish faster.
+- Line twist: every metre the spool gives while the handle turns twists the line; from 8 m to 30 m of it the break
+  strength falls by up to 35 % (it relaxes while the angler stops cranking). `T` over that break strength for > 0.12 s
+  snaps the line; more than the spool's 150 m spools the angler.
+- Slack (`T < 1 N`) for > 2.5 s plus head shakes can throw the hook; slack > 5.5 s and it falls out.
+- When `lineOut < 3.2 m`, the fish is within 4.5 m of the dock and tired (stamina < 0.3, panfish < 0.5), LANDING
+  (net) -> CAUGHT. A lure hit while the angler is holding the reel is a "reel set": it sets itself after 0.12 s of
+  cranking (or when the angler lets go); the float rig always needs a strike, and a strike within 0.6 s of a nibble
+  on the float is too early.
+
+Clock: `DAY.gameMinutesPerSecond` = 0.25 (1 real second = 15 game seconds, an hour of light ~4 real minutes). It
+runs only while fishing (READY, CHARGING, CASTING, WAITING, STRIKE, FIGHTING) and stands still while netting, on
+the catch card, re-tying after a snap, after an escape, while paused / the journal is open and on the title.
+Window blur during STRIKE / FIGHTING / LANDING pauses the game. Quality: `onQuality('auto')` returns to adaptive
+quality (stall-filtered median frame time, steps down and back up); a manual level applies fully and is saved.
 
 Debug hooks for automated tests (must exist):
 ```js
@@ -352,6 +419,7 @@ window.__game = {
   debug: {
     skipTitle(), setTime(h), setQuality(q), look(yawDeg, pitchDeg),
     cast(power01 = 0.8, yawDeg = 0),          // full cast via the real code path; resolves when it lands
+                                              // (false if it has not landed within 20 s of game time)
     setReeling(bool), setDrag(01), setLure(id),
     forceBite(speciesId),                     // fish.debugForceBite
     strike(),                                 // hookset now
@@ -359,6 +427,8 @@ window.__game = {
     landNow(),                                // skip to CAUGHT with the hooked fish
     stats(),                                  // { fps, drawCalls, triangles, geometries, textures, state, hours,
                                               //   lineOutM, tensionN, lure: {...}, hooked: {...} | null }
+    // extras for scenarios: setTimeScale(k), setPixelRatio(p), setAutoQuality(on), setRod(side, lift),
+    // slack(m), pause(p), action(down), keep(), release(), events(since), records(), fight, modules(), render()
   }
 }
 ```
@@ -372,4 +442,6 @@ window.__game = {
   and `node tools/harness.mjs --file dist/sandbox-<module>.html --out out/<module> --size 960x540 --shots 2000,5000`.
 - The harness uses SwiftShader (software WebGL): it is slow, so screenshot small (960x540) and keep runs short.
   It prints console errors and CSP violations and exits 1 on any error. Look at the PNGs with the Read tool.
+- Scenarios (`tools/scenarios/*.mjs`, helpers in `lib.mjs`) wait in GAME time (`frame.time`) or rendered frames,
+  never wall-clock time: a software-rendered frame can take seconds. Wall-clock limits are only a backstop.
 - Scenarios: `--scenario path.mjs` exporting `default async ({ page, shot, sleep, log, game }) => {}`.

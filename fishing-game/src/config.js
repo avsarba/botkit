@@ -52,7 +52,7 @@ export const LURES = [
     castMassG: 7,
     maxCastM: 38,
     depthM: 0.8,
-    note: 'Flashing blade. A steady, medium retrieve (Shift) for trout, perch and bass.',
+    note: 'Flashing blade. A steady, unhurried retrieve for trout, perch and bass.',
   },
   {
     id: 'crankbait',
@@ -72,7 +72,7 @@ export const LURES = [
     castMassG: 12,
     maxCastM: 40,
     depthM: 0,
-    note: 'Walk it slowly (hold Shift) and pause. Explosive strikes at dawn and dusk.',
+    note: 'Walk it on a slow retrieve, with pauses. Explosive strikes at dawn and dusk.',
   },
 ];
 

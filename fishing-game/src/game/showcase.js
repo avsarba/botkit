@@ -14,9 +14,10 @@
 import * as THREE from 'three';
 import { clamp, damp, lerp, smoothstep } from '../config.js';
 
-// Bottom sheet vs side panel: the same rule as the card's CSS (width <= 720 px or aspect <= 0.85). Only
-// used when the UI can't report the card's rect.
+// Bottom sheet vs side panel: the same rule as the card's CSS (width <= 720 px unless <= 520 px tall, or
+// aspect <= 0.85). Only used when the UI can't report the card's rect.
 const SHEET_MAX_W = 720;
+const SHEET_MIN_H = 521;
 const SHEET_MAX_ASPECT = 0.85;
 const RECT_TTL_S = 0.15;
 
@@ -103,7 +104,7 @@ export function createShowcase({ renderer, camera, createFishMesh, getCatchRect 
     let r = cardRect(W, H);
     if (!r) {
       // no rect from the UI: assume the card's CSS rule (bottom sheet on narrow / portrait screens)
-      if (W <= SHEET_MAX_W || W / H <= SHEET_MAX_ASPECT) r = { left: 0, right: W, top: H * 0.42, bottom: H };
+      if ((W <= SHEET_MAX_W && H >= SHEET_MIN_H) || W / H <= SHEET_MAX_ASPECT) r = { left: 0, right: W, top: H * 0.42, bottom: H };
       else {
         const cw = H <= 520 ? Math.min(380, W * 0.46) : Math.min(392, W * 0.42);
         r = { left: W - 28 - cw, right: W - 28, top: 24, bottom: H - 24 };

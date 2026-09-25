@@ -57,15 +57,20 @@ const EXPOSURE = [
   [60, 0.55],
 ];
 
-// breeze against time of day: glassy at dawn and dusk, an afternoon breeze
+// breeze against time of day: an afternoon breeze, light airs at night, and glassy calm at first and
+// last light (~5-7 h and ~19.5-21 h), when the lake mirrors the far treeline
 const WIND = [
   [0, 0.14],
-  [5.5, 0.15],
-  [8, 0.21],
+  [4.3, 0.13],
+  [5.0, 0.07],
+  [7.0, 0.07],
+  [9.0, 0.21],
   [12, 0.3],
   [15.5, 0.34],
   [18.5, 0.24],
-  [20.5, 0.17],
+  [19.5, 0.07],
+  [21.0, 0.07],
+  [22.0, 0.13],
   [24, 0.14],
 ];
 
@@ -550,7 +555,8 @@ export function createEnvironment(ctx) {
     if ((fq === 'high' || fq === 'medium' || fq === 'low') && fq !== runtimeQuality) applyRuntimeQuality(fq);
     if (throttleShadow && (shadowTick++ & 1) === 0) sunLight.shadow.needsUpdate = true;
     // wind: slow gusts and a gently veering direction
-    const gust = 0.06 * Math.sin(time * 0.21) * Math.sin(time * 0.057 + 1.3) + 0.03 * Math.sin(time * 0.73 + 0.4);
+    // (gusts scale with the breeze: light airs stay light, so the calm at dawn and dusk stays glassy)
+    const gust = (0.06 * Math.sin(time * 0.21) * Math.sin(time * 0.057 + 1.3) + 0.03 * Math.sin(time * 0.73 + 0.4)) * clamp(windBase / 0.24, 0.3, 1);
     api.windStrength = clamp(windBase + gust, 0, 1);
     const veer = 0.16 * Math.sin(time * 0.013 + 0.7) + 0.05 * Math.sin(time * 0.071);
     windDirection.set(Math.sin(0.29 + veer), Math.cos(0.29 + veer));

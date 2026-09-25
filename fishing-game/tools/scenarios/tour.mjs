@@ -33,6 +33,16 @@ export default async (h) => {
   for (const [name, hours] of TIMES) {
     if (times && !times.includes(name)) continue;
     await dbg(`setTime(${hours})`);
+    // let the lake settle into this hour's breeze (the wave amplitude eases over a few game seconds): run
+    // ~10 s of game time fast at low resolution
+    await dbg('setQuality("low")');
+    await dbg('setPixelRatio(0.5)');
+    await dbg('setTimeScale(20)');
+    await L.waitFor(() => true, { gameS: 1 });
+    const t0 = (await L.stats()).time;
+    await L.waitFor((s) => s.time - t0 >= 10, { gameS: 30, label: 'waves settle' });
+    await dbg(`setTime(${hours})`);
+    await dbg('setQuality("high")');
     for (const [view, yaw, pitch] of VIEWS) {
       if (views && !views.includes(view)) continue;
       await dbg(`look(${yaw}, ${pitch})`);

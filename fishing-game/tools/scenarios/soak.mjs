@@ -1,6 +1,7 @@
 // Soak: several minutes of scripted play (casts with every lure, retrieves, time presets, pause /
 // resume, the journal, units, bites, fights and catches). Checks that GPU memory (geometries,
-// textures) stays bounded, the frame never carries NaN and nothing logs an error.
+// textures) stays bounded, the frame never carries NaN and nothing logs an error. It runs for at least
+// SOAK_S real seconds, 8 cycles and 200 s of game time; every wait inside a cycle is in game time.
 //   node tools/harness.mjs --scenario tools/scenarios/soak.mjs --out out/soak --size 960x540
 import { makeLib } from './lib.mjs';
 
@@ -23,7 +24,8 @@ export default async (h) => {
   const tStart = Date.now();
   const game0 = (await stats()).time;
 
-  while (Date.now() - tStart < SOAK_S * 1000 || cycle < 8) {
+  let played = 0;
+  while (Date.now() - tStart < SOAK_S * 1000 || cycle < 8 || played < 200) {
     cycle++;
     const lure = lures[cycle % 4];
     await dbg(`setLure("${lure}")`);
@@ -43,8 +45,8 @@ export default async (h) => {
     // retrieve for a while (stop and go), strike if something bites
     await dbg('setTimeScale(4)');
     let s = await stats();
-    for (let k = 0; k < 90; k++) {
-      s = await stats();
+    const tr = s.time;
+    while (s.time - tr < 25) {
       if (s.state === 'strike') {
         bites++;
         await dbg('strike()');
@@ -52,30 +54,31 @@ export default async (h) => {
         break;
       }
       if (s.state !== 'waiting') break;
-      await dbg(`setReeling(${lure === 'bobber' ? k > 30 : s.time % 3 < 2.2})`);
-      await sleep(150);
+      await dbg(`setReeling(${lure === 'bobber' ? s.time - tr > 9 : s.time % 3 < 2.2})`);
+      const t = s.time;
+      s = await L.waitFor((x) => x.time !== t, { gameS: 10, every: 100, label: 'retrieve clock' });
     }
     await dbg('setReeling(false)');
     if (s.state === 'fighting') {
       const tFight = s.time;
-      const res = await L.playFight({ drag: 0.5, scale: 8, timeoutS: 240 });
+      const res = await L.playFight({ drag: 0.5, scale: 8, gameS: 240 });
       const ev = (await dbg(`events(${tFight})`)).filter((e) => /escaped|snap|catch|hooked/.test(e.type) || e.to === 'landing');
       log(T(), `  fight -> ${res.state}: ${ev.map((e) => e.type + (e.reason ? ':' + e.reason : '') + (e.to ? ':' + e.to : '')).join(', ')}`);
       if (res.state === 'fighting') await dbg('landNow()');
-      const c = await L.waitState(['caught', 'ready', 'snapped', 'escaped', 'waiting'], { timeoutS: 200 });
+      const c = await L.waitState(['caught', 'ready', 'snapped', 'escaped', 'waiting'], { gameS: 60 });
       if (c.state === 'caught') {
         catches++;
         await L.waitFrames(2);
-        if (catches % 2) await page.click('#btn-keep');
-        else await page.click('#btn-release');
+        if (catches % 2) await L.click('#btn-keep');
+        else await L.click('#btn-release');
       }
     }
     // bring the lure home if it's still out
     s = await stats();
     if (s.state === 'waiting' || s.state === 'escaped') {
-      await dbg('setTimeScale(12)');
+      await dbg('setTimeScale(20)');
       await dbg('setReeling(true)');
-      await L.waitState(['ready', 'strike', 'fighting'], { timeoutS: 200 }).catch(() => null);
+      await L.waitState(['ready', 'strike', 'fighting'], { gameS: 240 }).catch(() => null);
       await dbg('setReeling(false)');
       s = await stats();
       if (s.state !== 'ready') await dbg('setLure("bobber")'); // forces a re-tie back to READY
@@ -88,7 +91,7 @@ export default async (h) => {
       const t0 = (await stats()).time;
       await sleep(1500);
       assert((await stats()).time === t0, 'simulation frozen while paused');
-      await page.click('#btn-resume');
+      await L.click('#btn-resume');
       await L.waitFrames(1);
       assert(!(await stats()).paused, 'Resume');
     }
@@ -100,6 +103,7 @@ export default async (h) => {
     }
     await expectNoNaN();
     s = await stats();
+    played = s.time - game0;
     mem.push({ cycle, geometries: s.geometries, textures: s.textures, state: s.state });
     if (cycle === 3) base = { geometries: s.geometries, textures: s.textures };
     log(T(), `cycle ${cycle} ${lure} cast ${JSON.stringify(r)} -> ${s.state}; bites ${bites} catches ${catches}; geo ${s.geometries} tex ${s.textures}; hours ${s.hours}`);

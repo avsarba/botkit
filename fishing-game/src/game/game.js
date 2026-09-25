@@ -25,11 +25,12 @@ const REEL_SET_S = 0.12;
 const CLOCK_STATES = new Set([STATES.READY, STATES.CHARGING, STATES.CASTING, STATES.WAITING, STATES.STRIKE, STATES.FIGHTING]);
 // Coaching prompts during the angler's first few fights.
 const HINT_FIGHTS = 3;
-// Retrieve advice per lure while it is in the water: [mouse / keyboard, touch].
+// Retrieve advice per lure while it is in the water: [mouse / keyboard, touch]. The slow retrieve is
+// Shift on a keyboard and the Slow toggle beside the big button on touch screens.
 const LURE_PROMPTS = {
-  spinner: ['Steady, medium retrieve: hold Shift and reel', 'Hold to reel steadily \u00b7 pause now and then'],
+  spinner: ['Steady, medium retrieve: hold Shift and reel', 'Slow on, hold Reel for a steady retrieve'],
   crankbait: ['Hold to crank it down \u00b7 pause now and then', 'Hold to crank it down \u00b7 pause now and then'],
-  topwater: ['Shift + hold for a slow walk \u00b7 pause now and then', 'Short pulls and pauses walk it'],
+  topwater: ['Shift + hold for a slow walk \u00b7 pause now and then', 'Slow on, hold Reel to walk it \u00b7 pause now and then'],
 };
 const LOGGED_EVENTS = [
   'cast', 'lure:landed', 'lure:home', 'fish:interest', 'fish:nibble', 'fish:bite', 'fish:swirl', 'fish:missed',
@@ -156,6 +157,7 @@ export function createGame(opts) {
   let catchRec = null;
   let userPaused = false;
   let journalOpen = false;
+  let slowToggle = false; // touch: the Slow chip (Shift on a keyboard)
   let timeScale = 1;
   let lastNow = 0;
   let fpsAcc = 0;
@@ -360,8 +362,7 @@ export function createGame(opts) {
     setState(STATES.CAUGHT);
     if (ui) ui.showCatch(rec, flags);
     events.emit('catch', { record: rec });
-    if (flags.isPersonalBest) toast(`New personal best ${hf.species.name.toLowerCase()}!`, 'good');
-    else if (flags.isNewSpecies && records.length > 1) toast('A new species for your log', 'good');
+    // (personal best / new species: the catch card stamps them, no toast on top)
   }
 
   function finishCatch(kept) {
@@ -490,6 +491,9 @@ export function createGame(opts) {
     onActionDown: () => actionDown('touch'),
     onActionUp: () => actionUp('touch'),
     onQuality: (q) => setQualityManual(q),
+    onSlow: (on) => {
+      slowToggle = !!on;
+    },
     onKeep: () => finishCatch(true),
     onRelease: () => finishCatch(false),
     onJournal: (open) => {
@@ -559,7 +563,7 @@ export function createGame(opts) {
   // ---------------------------------------------------------------- events from the modules
   events.on('lure:landed', (e) => {
     if (state === STATES.CASTING) setState(STATES.WAITING);
-    while (pendingCasts.length) pendingCasts.shift()({ onWater: !!(e && e.onWater), x: e && e.position ? +e.position.x.toFixed(2) : null, z: e && e.position ? +e.position.z.toFixed(2) : null });
+    while (pendingCasts.length) pendingCasts.shift().resolve({ onWater: !!(e && e.onWater), x: e && e.position ? +e.position.x.toFixed(2) : null, z: e && e.position ? +e.position.z.toFixed(2) : null });
   });
   events.on('lure:home', () => {
     if (state === STATES.WAITING || state === STATES.ESCAPED) setState(STATES.READY);
@@ -585,7 +589,7 @@ export function createGame(opts) {
     const reelSet = held.size > 0 && !!def && def.kind === 'lure';
     bite = { biteId: e.biteId, windowS: e.windowS || 1, t: 0, reelSet };
     setState(STATES.STRIKE);
-    if (ui) ui.strikeCue();
+    if (ui) ui.strikeCue({ reelSet });
   });
   events.on('fish:jump', () => {
     if (state === STATES.FIGHTING) lastJumpT = frame.time;
@@ -681,7 +685,7 @@ export function createGame(opts) {
     // (a lure hit mid-retrieve keeps coming while the angler reels through the strike)
     const canReel = state === STATES.WAITING || state === STATES.FIGHTING || state === STATES.ESCAPED || (state === STATES.STRIKE && !!bite && bite.reelSet);
     const wantReel = canReel && (held.size > 0 || debugReel);
-    const target = wantReel ? (input.shift && state !== STATES.FIGHTING ? 0.5 : 1) : 0;
+    const target = wantReel ? ((input.shift || slowToggle) && state !== STATES.FIGHTING ? 0.5 : 1) : 0;
     reel01 = damp(reel01, target, 10, dt);
     if (!wantReel && reel01 < 0.03) reel01 = 0;
     inp.reeling = wantReel;
@@ -775,6 +779,7 @@ export function createGame(opts) {
     frame.tension01 = frame.tensionN / TACKLE.lineBreakN;
 
     // timers
+    while (pendingCasts.length && (frame.time - pendingCasts[0].t0 > 20 || (state !== STATES.CASTING && state !== STATES.CHARGING))) pendingCasts.shift().resolve(false);
     const L = lure();
     switch (state) {
       case STATES.CASTING:
@@ -843,6 +848,7 @@ export function createGame(opts) {
     prompt: null,
     promptKind: 'info',
     paused: false,
+    slow: false, // touch Slow toggle (slow retrieve)
     quality: 'high',
     fishStamina01: NaN,
     // rod handling during a fight (for an optional rod-angle indicator): lift / side as the angler holds
@@ -873,6 +879,7 @@ export function createGame(opts) {
     hud.rodSide = frame.input.rodSide;
     hud.rodStiff01 = state === STATES.FIGHTING ? fight.state.stiff01 : 0;
     hud.paused = userPaused;
+    hud.slow = slowToggle;
     hud.quality = qm.auto ? 'auto' : qm.quality; // the pause menu shows the setting
     // prompts the UI can't derive on its own (null = let the UI derive them)
     const touch = input.lastType === 'touch';
@@ -1076,16 +1083,9 @@ export function createGame(opts) {
       setState(STATES.CHARGING);
       chargeT = 1;
       charge = clamp(Number(power01), 0, 1);
-      const p = new Promise((resolve) => {
-        pendingCasts.push(resolve);
-        setTimeout(() => {
-          const i = pendingCasts.indexOf(resolve);
-          if (i >= 0) {
-            pendingCasts.splice(i, 1);
-            resolve(false);
-          }
-        }, 60000);
-      });
+      // resolves when the lure lands, or false if it has not landed within 20 s of GAME time (real time
+      // would be wrong under a slow software renderer, where a single frame can take seconds)
+      const p = new Promise((resolve) => pendingCasts.push({ resolve, t0: frame.time }));
       doCast(charge);
       return p;
     },

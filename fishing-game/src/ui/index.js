@@ -56,7 +56,7 @@ function forceValue(n, units) {
 const ACTIONS = {
   [STATES.TITLE]: ['idle', 'Cast', '', 'Cast'],
   [STATES.READY]: ['ready', 'Cast', 'Hold', 'Hold to cast'],
-  [STATES.CHARGING]: ['ready', 'Release', 'to cast', 'Release to cast'],
+  [STATES.CHARGING]: ['ready', 'Let go', 'to cast', 'Let go to cast'],
   [STATES.CASTING]: ['idle', 'Cast', '', 'Casting'],
   [STATES.WAITING]: ['ready', 'Reel', 'Hold', 'Hold to reel'],
   [STATES.STRIKE]: ['strike', 'Strike', 'Tap', 'Tap to set the hook'],
@@ -127,6 +127,7 @@ export function createUI(ctx = {}) {
   const dialValue = $('dial-value');
   const dialUnit = $('dial-unit');
   const action = $('action');
+  const btnSlow = $('btn-slow');
   const actionMain = $('action-main');
   const actionSub = $('action-sub');
   const roLine = $('ro-line');
@@ -196,6 +197,7 @@ export function createUI(ctx = {}) {
     journalOpen: false,
     pauseOpen: false,
     striking: false,
+    slow: false, // touch Slow chip (slow retrieve; Shift on a keyboard)
   };
   // Last values written to the DOM (per-frame change detection; numbers are quantized keys).
   const last = {
@@ -250,11 +252,8 @@ export function createUI(ctx = {}) {
   const lureButtons = Array.from(lures.querySelectorAll('.lure'));
   const presetButtons = Array.from(presets.querySelectorAll('.chip'));
   const segButtons = Array.from(pauseEl.querySelectorAll('.seg button'));
-  // A lure's note for the current input: touch has no Shift key, so drop "(hold Shift)" hints there.
-  const noteFor = (l) => {
-    const n = (l && l.note) || '';
-    return cur.input === 'touch' ? n.replace(/\s*\((?:hold\s+)?shift\)/gi, '').replace(/\s+([.,])/g, '$1') : n;
-  };
+  // A lure's note (the notes are input-neutral: the slow retrieve is Shift or the touch Slow chip).
+  const noteFor = (l) => (l && l.note) || '';
   // What each lure is for, in the pause menu (the chip tooltips are hover-only).
   const lureNoteDDs = [];
   lureNotes.textContent = '';
@@ -282,8 +281,14 @@ export function createUI(ctx = {}) {
     cur.input = mode;
     root.dataset.input = mode;
     last.prompt = null; // derived prompts depend on the input mode
-    strikeSub.textContent = mode === 'touch' ? 'Tap anywhere to set the hook' : 'Click to set the hook';
+    setStrikeSub();
     renderLureNotes();
+  }
+  // The STRIKE cue's sub-line: how to set the hook with this input, or, when a lure is hit while the
+  // angler is already reeling (a reel set, core's bite.reelSet), to keep cranking.
+  let strikeReelSet = false;
+  function setStrikeSub() {
+    strikeSub.textContent = strikeReelSet ? 'Keep reeling!' : cur.input === 'touch' ? 'Tap anywhere to set the hook' : 'Click to set the hook';
   }
   setInput(config.touch === true || (config.touch !== false && coarseMq && coarseMq.matches) ? 'touch' : 'mouse');
   const onAnyPointer = (e) => {
@@ -729,6 +734,16 @@ export function createUI(ctx = {}) {
       call('onLure', id);
     });
   }
+
+  // Touch: the Slow chip beside the big button toggles the slow retrieve (Shift on a keyboard).
+  function applySlow(on) {
+    cur.slow = !!on;
+    btnSlow.setAttribute('aria-pressed', cur.slow ? 'true' : 'false');
+  }
+  btnSlow.addEventListener('click', () => {
+    applySlow(!cur.slow);
+    call('onSlow', cur.slow);
+  });
 
   function stepDrag(dir) {
     const next = Math.round(clamp(cur.drag01 + dir * DRAG_STEP, 0, 1) * 1000) / 1000;
@@ -1198,6 +1213,7 @@ export function createUI(ctx = {}) {
     if (typeof h.muted === 'boolean' && h.muted !== cur.muted) applyMuted(h.muted);
     if (typeof h.quality === 'string' && h.quality !== cur.quality) applyQuality(h.quality);
     if (typeof h.paused === 'boolean' && h.paused !== cur.pauseOpen) setPaused(h.paused);
+    if (typeof h.slow === 'boolean' && h.slow !== cur.slow) applySlow(h.slow);
     if (h.lureId && h.lureId !== last.lureId) applyLure(h.lureId);
     if (h.lureId && h.lureId !== noteLure) {
       const had = noteLure;
@@ -1286,7 +1302,9 @@ export function createUI(ctx = {}) {
       strikeTimer = setTimeout(endStrike, 260);
     } else endStrike();
   }
-  function strikeCue() {
+  function strikeCue(opts = {}) {
+    strikeReelSet = !!(opts && opts.reelSet);
+    setStrikeSub();
     cur.striking = true;
     strike.hidden = false;
     announce('Strike!');
@@ -1367,7 +1385,8 @@ export function createUI(ctx = {}) {
     setPaused,
     isModalOpen: () => cur.pauseOpen || cur.journalOpen || cur.catchOpen,
     // The catch card's layout box (DOMRect, viewport CSS px) while it is up, else null. A bottom sheet
-    // when the window is <= 720 px wide or its aspect is <= 0.85, else a side panel on the right.
+    // when the window is <= 720 px wide (and taller than 520 px) or its aspect is <= 0.85, else a side
+    // panel on the right.
     getCatchRect,
     dispose,
   };

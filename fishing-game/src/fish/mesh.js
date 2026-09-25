@@ -2407,7 +2407,7 @@ function makeTexture(canvas, color) {
 
 // Build the geometry + textures for one species / detail / quality. A generator that yields between steps of a
 // few milliseconds each (skin phases, relief, roughness, each fin, each geometry) so hooked-fish assets can be
-// prepared over several frames (prepareFishAssets); buildAssets() runs it synchronously.
+// prepared over several frames (prepareFishAssets); acquireAssets() drains it synchronously.
 function* buildAssetsGen(appId, detail, quality) {
   const app = APPEARANCE[appId];
   const cfg = DETAIL_CFG[detail][quality];

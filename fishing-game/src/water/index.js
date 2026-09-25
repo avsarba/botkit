@@ -429,8 +429,8 @@ export function createWater(ctx) {
   function plip(position, strength01) {
     if (!position || !Number.isFinite(position.x) || !Number.isFinite(position.z)) return;
     const s = clamp(Number.isFinite(strength01) ? strength01 : 0.4, 0, 1);
-    ripples.add(position.x, position.z, 0.003 + 0.0025 * s, 0.1, 0.3, 0.55 + 0.45 * s, 0);
-    ripples.add(position.x, position.z, 0.0018 + 0.0015 * s, 0.065, 0.24, 0.4 + 0.3 * s, 0, 0.2);
+    ripples.add(position.x, position.z, 0.003 + 0.0025 * s, 0.1, 0.3, 0.6 + 0.4 * s, 0);
+    ripples.add(position.x, position.z, 0.0018 + 0.0015 * s, 0.065, 0.24, 0.45 + 0.3 * s, 0, 0.2);
   }
 
   let lastDt = 1 / 60;

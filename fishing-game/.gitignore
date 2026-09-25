@@ -1,3 +1,4 @@
 node_modules/
 out/
-dist/sandbox-*.html
+dist/*
+!dist/index.html

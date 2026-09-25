@@ -193,8 +193,7 @@ export function createGame(opts) {
   let needsRender = false;
   let xrCharge = false; // CHARGING was entered with the rod-hand trigger (VR)
   let xrReelWas = false; // the reel hand was reeling last frame (VR reel-set release)
-  let lastShow = null; // the showcase args of the catch on the card (re-shown when VR starts / ends)
-  let lastFlags = null;
+  let lastFlags = null; // the catch card's flags (the VR card is shown again when a session starts on it)
   const pendingCasts = [];
   const eventLog = [];
   const _tip = new THREE.Vector3();
@@ -387,10 +386,9 @@ export function createGame(opts) {
     if (hf.object3d) hf.object3d.visible = false; // in the angler's hands now
     tackle.setFight(false);
     const girth = hf.weightKg > 0 ? clamp(Math.sqrt(hf.weightKg / Math.max(1e-4, (hf.species.lw.a * Math.pow(hf.lengthCm, hf.species.lw.b)) / 1000)), 0.85, 1.2) : 1;
-    lastShow = { species: hf.species, lengthCm: hf.lengthCm, opts: { quality: frame.quality, seed: hf.id * 7919, girth } };
     lastFlags = flags;
     try {
-      showcase.show(lastShow.species, lastShow.lengthCm, lastShow.opts);
+      showcase.show(hf.species, hf.lengthCm, { quality: frame.quality, seed: hf.id * 7919, girth });
     } catch (err) {
       console.warn('[core] showcase failed', err);
     }
@@ -420,7 +418,6 @@ export function createGame(opts) {
     xr.hudCall('hideCatch');
     tackle.resetToHome();
     catchRec = null;
-    lastShow = null;
     input.disarm();
     setState(STATES.READY);
   }
@@ -681,16 +678,6 @@ export function createGame(opts) {
     return xr.enter({ level: manualQuality || defaultXRLevel() });
   }
 
-  function reShowCatch() {
-    if (!lastShow || !showcase) return;
-    try {
-      showcase.hide();
-      showcase.show(lastShow.species, lastShow.lengthCm, lastShow.opts);
-    } catch (err) {
-      console.warn('[core] showcase failed', err);
-    }
-  }
-
   // The rig, camera and grips are in place (src/xr did that); now the game side.
   function onXRStart({ level }) {
     input.suspend(true);
@@ -704,10 +691,8 @@ export function createGame(opts) {
     if (userPaused) setUserPause(false);
     if (state === STATES.TITLE) startGame();
     else if (state === STATES.CHARGING) setState(STATES.READY);
-    if (state === STATES.CAUGHT && catchRec) {
-      reShowCatch(); // into the reel hand now
-      xr.hudCall('showCatch', catchRec, lastFlags || {});
-    }
+    // (a fish on the card moves into the reel hand by itself: showcase.setXR re-shows it in the new mode)
+    if (state === STATES.CAUGHT && catchRec) xr.hudCall('showCatch', catchRec, lastFlags || {});
     lastNow = 0;
     needsRender = true;
   }
@@ -722,7 +707,6 @@ export function createGame(opts) {
     qm.exitXR();
     frame.quality = qm.quality;
     restoreDesktopView();
-    if (state === STATES.CAUGHT && catchRec) reShowCatch(); // back in front of the camera
     resize();
     lastNow = 0;
     needsRender = true;

@@ -1,7 +1,10 @@
 // Line break and a thrown hook:
 //  1) a 6 kg northern pike on a locked-down drag (setDrag(1)) with continuous cranking through its
 //     runs: the drag lag + cranking push the tension past 12 lb -> SNAPPED -> re-tie -> READY.
-//  2) a largemouth given slack line: slack + head shakes throw the hook -> ESCAPED -> reel in -> READY.
+//  2) a largemouth given slack line (metres of it hanging loose): slack + head shakes throw the hook ->
+//     ESCAPED -> reel in -> READY.
+//  3) a fish played with the rod low and pointed down the line (no cushion): head shakes and jumps on the
+//     tight line wear the hook hold until it pulls out (escaped 'headshake', pulled).
 //   node tools/harness.mjs --scenario tools/scenarios/snap.mjs --out out/snap --size 960x540
 import { makeLib } from './lib.mjs';
 
@@ -41,7 +44,18 @@ export default async (h) => {
     maxT = Math.max(maxT, s.tensionN);
     if (!shot && s.tensionN > 38) {
       shot = true;
-      await pretty('pike-heavy');
+      // freeze the fight on this heavy moment (a software-rendered frame can take seconds: without the
+      // freeze the line may part before the screenshot), render it at high quality, then carry on
+      await dbg('pause(true)');
+      await h.page.evaluate(() => (document.getElementById('pause-modal').style.display = 'none'));
+      await dbg('setQuality("high")');
+      await dbg('setPixelRatio(1)');
+      await dbg('render()');
+      await L.waitFrames(2);
+      await h.shot('pike-heavy');
+      await h.page.evaluate(() => (document.getElementById('pause-modal').style.display = ''));
+      await dbg('pause(false)');
+      await fast();
       await dbg('setTimeScale(4)');
     }
     const t = s.time;
@@ -69,8 +83,10 @@ export default async (h) => {
   s = await stats();
   const g1 = s.time;
   while (s.state === 'fighting' && s.time - g1 < 300) {
-    // the angler drops the rod and feeds line whenever it comes tight: the line stays slack
-    if (s.tensionN > 0.3) await dbg('slack(2)');
+    // the angler drops the rod and keeps feeding line (an open bail): a few metres always hang loose, so
+    // the line is really slack (a bundle the fish takes straight up again would not be)
+    const f = await dbg('fight');
+    if (f.lineOut - f.distM < 3) await dbg('slack(5)');
     const t = s.time;
     s = await L.waitFor((x) => x.time !== t || x.state !== 'fighting', { gameS: 60, every: 150, label: 'fight clock' });
   }
@@ -87,12 +103,15 @@ export default async (h) => {
   assert(r2.state === 'ready', 'lure reeled home -> READY');
 
   // ---- 3) rod pointed down the line: head shakes and jumps on a tight line tear the hook out
+  // (whether a given fish shakes free before it is netted is chance: soft-mouthed, head-shaking walleye and
+  // jumping trout, big enough for a long fight, make it likely within a few tries)
+  const PULL_FISH = [['walleye', 2.6], ['rainbow_trout', 2.4], ['walleye', 3.2], ['largemouth_bass', 2.6]];
   let pulled = null;
-  for (let attempt = 0; attempt < 3 && !pulled; attempt++) {
+  for (let attempt = 0; attempt < PULL_FISH.length && !pulled; attempt++) {
     await dbg('setLure("crankbait")');
     await dbg('setTimeScale(8)');
     await dbg('cast(0.8, 10)');
-    const hk3 = await dbg(`hookFish("${attempt % 2 ? 'smallmouth_bass' : 'largemouth_bass'}", 2.2)`);
+    const hk3 = await dbg(`hookFish("${PULL_FISH[attempt][0]}", ${PULL_FISH[attempt][1]})`);
     assert(hk3 && (await L.state()) === 'fighting', `fish on for the pull-out test (${hk3 && hk3.speciesId})`);
     await dbg('setDrag(0.7)');
     await dbg('setRod(0, 0)'); // rod low, pointed at the fish: no cushion

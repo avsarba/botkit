@@ -25,12 +25,12 @@ const REEL_SET_S = 0.12;
 const CLOCK_STATES = new Set([STATES.READY, STATES.CHARGING, STATES.CASTING, STATES.WAITING, STATES.STRIKE, STATES.FIGHTING]);
 // Coaching prompts during the angler's first few fights.
 const HINT_FIGHTS = 3;
-// Retrieve advice per lure while it is in the water: [mouse / keyboard, touch]. The slow retrieve is
-// Shift on a keyboard and the Slow toggle beside the big button on touch screens.
+// Retrieve advice per lure while it is in the water: [mouse / keyboard, touch with Slow off, touch with
+// Slow on]. The slow retrieve is Shift on a keyboard and the Slow toggle beside the big button on touch.
 const LURE_PROMPTS = {
-  spinner: ['Steady, medium retrieve: hold Shift and reel', 'Slow on, hold Reel for a steady retrieve'],
-  crankbait: ['Hold to crank it down \u00b7 pause now and then', 'Hold to crank it down \u00b7 pause now and then'],
-  topwater: ['Shift + hold for a slow walk \u00b7 pause now and then', 'Slow on, hold Reel to walk it \u00b7 pause now and then'],
+  spinner: ['Steady, medium retrieve: hold Shift and reel', 'Tap Slow, then hold Reel for a steady retrieve', 'Hold Reel for a steady retrieve \u00b7 pause now and then'],
+  crankbait: ['Hold to crank it down \u00b7 pause now and then', 'Hold to crank it down \u00b7 pause now and then', 'Hold to crank it down \u00b7 pause now and then'],
+  topwater: ['Shift + hold for a slow walk \u00b7 pause now and then', 'Tap Slow, then hold Reel to walk it \u00b7 pause now and then', 'Hold Reel to walk it \u00b7 pause now and then'],
 };
 const LOGGED_EVENTS = [
   'cast', 'lure:landed', 'lure:home', 'fish:interest', 'fish:nibble', 'fish:bite', 'fish:swirl', 'fish:missed',
@@ -856,6 +856,7 @@ export function createGame(opts) {
     rodLift01: 0.4,
     rodSide: 0,
     rodStiff01: 0,
+    slackLine: false, // a fish on and the line hanging slack (the fight model's judgement)
   };
   function updateHud() {
     const L = lure();
@@ -878,6 +879,7 @@ export function createGame(opts) {
     hud.rodLift01 = frame.input.rodLift01;
     hud.rodSide = frame.input.rodSide;
     hud.rodStiff01 = state === STATES.FIGHTING ? fight.state.stiff01 : 0;
+    hud.slackLine = state === STATES.FIGHTING && fight.state.slackT > 0.3;
     hud.paused = userPaused;
     hud.slow = slowToggle;
     hud.quality = qm.auto ? 'auto' : qm.quality; // the pause menu shows the setting
@@ -893,7 +895,7 @@ export function createGame(opts) {
           if (frame.time - lastNibbleT < 1.2) prompt = 'Nibble\u2026 wait for it';
           else prompt = touch ? 'Watch the float \u00b7 tap when it goes under \u00b7 hold to reel in' : 'Watch the float \u00b7 click when it goes under \u00b7 hold to reel in';
         }
-      } else if (def && def.kind === 'lure') prompt = LURE_PROMPTS[def.id] ? LURE_PROMPTS[def.id][touch ? 1 : 0] : touch ? 'Hold to reel. Pause now and then' : 'Hold to reel \u00b7 Shift for a slow retrieve';
+      } else if (def && def.kind === 'lure') prompt = LURE_PROMPTS[def.id] ? LURE_PROMPTS[def.id][touch ? (slowToggle ? 2 : 1) : 0] : touch ? 'Hold to reel. Pause now and then' : 'Hold to reel \u00b7 Shift for a slow retrieve';
     } else if (state === STATES.STRIKE && bite && bite.reelSet) {
       prompt = 'Keep reeling!';
       kind = 'danger';
@@ -982,11 +984,14 @@ export function createGame(opts) {
       }
       return;
     }
+    // Adaptive quality samples BEFORE this frame renders: a pixel-ratio step resizes (and so clears) the
+    // drawing buffer, which has to happen before the draw, not after it, or the browser would present a
+    // blank frame (a black flash) each time auto quality adjusts.
+    if (state !== STATES.TITLE || qm.auto) qm.sample(realDt);
     const dt = Math.min(0.05, realDt);
     for (let i = 0; i < timeScale; i++) simulate(dt);
     renderFrame(dt);
     needsRender = false;
-    if (state !== STATES.TITLE || qm.auto) qm.sample(realDt);
   }
 
   // ---------------------------------------------------------------- resize / visibility

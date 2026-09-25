@@ -1082,7 +1082,9 @@ export function createUI(ctx = {}) {
   let slackSince = 0;
   let slackOn = false;
   function updateSlack() {
-    const slack = cur.state === STATES.FIGHTING && num.fishOn && num.tension01 < 0.02;
+    // (core says when the line really hangs slack; without it, a dial sitting at zero)
+    const h = last.hud;
+    const slack = cur.state === STATES.FIGHTING && num.fishOn && (h && typeof h.slackLine === 'boolean' ? h.slackLine : num.tension01 < 0.02);
     const now = performance.now();
     if (!slack) slackSince = 0;
     else if (!slackSince) slackSince = now;

@@ -341,7 +341,8 @@ The template holds `<title>`, the Google Fonts link, all CSS, and the static DOM
   update(hud),       // every frame; hud = { state, tension01, tensionN, dragN, drag01, lineOutM,
                      //   castPower01, hours, lureId, units, muted, catches, fishOn, fishDistanceM,
                      //   prompt, promptKind, paused, quality /* incl. 'auto' */, slow, fishStamina01,
-                     //   rodLift01, rodSide, rodStiff01 /* rod meter in the gauge header while fighting */ }
+                     //   rodLift01, rodSide, rodStiff01 /* rod meter in the gauge header while fighting */,
+                     //   slackLine /* a fish on and the line really hanging slack: the dial pulses */ }
   strikeCue({ reelSet }),  // big, brief "STRIKE" flash (upper third, above the float) when a bite opens the
                      //   window; its sub-line says how to set the hook, or "Keep reeling!" for a reel set
   showCatch(record, { isPersonalBest, isNewSpecies }),  // catch card; Keep / Release buttons call handlers
@@ -400,7 +401,9 @@ adds 12 % rotor friction. Reeling shortens `lineOut` only while the drag holds (
 - Line twist: every metre the spool gives while the handle turns twists the line; from 8 m to 30 m of it the break
   strength falls by up to 35 % (it relaxes while the angler stops cranking). `T` over that break strength for > 0.12 s
   snaps the line; more than the spool's 150 m spools the angler.
-- Slack (`T < 1 N`) for > 2.5 s plus head shakes can throw the hook; slack > 5.5 s and it falls out.
+- Slack (`T` under min(1 N, 0.1 m g) AND the line hanging loose by more than 0.25 m + 2 % of the line out) for
+  > 2.5 s plus head shakes can throw the hook; slack > 5.5 s and it falls out. A small fish towed in on a steady
+  retrieve (brief tugs on a nearly taut line) is not slack.
 - When `lineOut < 3.2 m`, the fish is within 4.5 m of the dock and tired (stamina < 0.3, panfish < 0.5), LANDING
   (net) -> CAUGHT. A lure hit while the angler is holding the reel is a "reel set": it sets itself after 0.12 s of
   cranking (or when the angler lets go); the float rig always needs a strike, and a strike within 0.6 s of a nibble
@@ -445,3 +448,7 @@ window.__game = {
 - Scenarios (`tools/scenarios/*.mjs`, helpers in `lib.mjs`) wait in GAME time (`frame.time`) or rendered frames,
   never wall-clock time: a software-rendered frame can take seconds. Wall-clock limits are only a backstop.
 - Scenarios: `--scenario path.mjs` exporting `default async ({ page, shot, sleep, log, game }) => {}`.
+  The regression set: `boot`, `catch`, `snap`, `tour`, `soak` and `spot` (review-fix spot checks; `SPOT=water,glint`
+  runs a subset) at `--size 960x540`, and `mobile` with `--mobile` (390x844) plus `--size 667x375` / `640x360`
+  (short landscape phones: side-panel catch card). A transient moment (a heavy fight, the STRIKE cue) is frozen
+  with `debug.pause(true)` before its screenshot, since one software-rendered frame can outlast it.

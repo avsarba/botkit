@@ -25,7 +25,8 @@ export default async (h) => {
   const game0 = (await stats()).time;
 
   let played = 0;
-  while (Date.now() - tStart < SOAK_S * 1000 || cycle < 8 || played < 200) {
+  // (a hooked fish can still throw the hook or snap the line: keep cycling, within reason, until one is landed)
+  while (Date.now() - tStart < SOAK_S * 1000 || cycle < 8 || played < 200 || (catches < 1 && cycle < 20)) {
     cycle++;
     const lure = lures[cycle % 4];
     await dbg(`setLure("${lure}")`);

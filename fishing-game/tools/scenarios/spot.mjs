@@ -209,11 +209,28 @@ export default async (h) => {
     // strike cue above the float
     await dbg('forceBite("yellow_perch")');
     await L.waitState('strike', { gameS: 60, every: 100 });
-    // the cue lasts ~1.2 real seconds, less than one software-rendered frame: freeze, then show it again
+    // the cue lasts ~1.2 real seconds, less than one software-rendered frame (and less than a screenshot
+    // takes): freeze the game, show the cue again and hold it on screen (its fade paused, its end timer
+    // not scheduled), exactly as the angler sees it, prompt pill hidden and all
     await frozen(true);
-    await g('window.__game.debug.modules().ui.strikeCue({ reelSet: false })');
-    const sr = await rectOf('#strike');
+    const sr = await page.evaluate(() => {
+      const st = window.setTimeout;
+      window.setTimeout = (fn, ms, ...a) => (ms >= 1000 ? 0 : st(fn, ms, ...a));
+      try {
+        window.__game.debug.modules().ui.strikeCue({ reelSet: false });
+      } finally {
+        window.setTimeout = st;
+      }
+      const s = document.getElementById('strike');
+      for (const a of s.getAnimations()) {
+        a.pause();
+        a.currentTime = 300;
+      }
+      const r = s.getBoundingClientRect();
+      return r.width > 0 ? { l: r.left, t: r.top, r: r.right, b: r.bottom } : null;
+    });
     const fp2 = await project(floatExpr);
+    const prDuringCue = await rectOf('#prompt');
     await h.shot('float-strike');
     log(T(), 'strike cue', JSON.stringify(sr), 'float px', JSON.stringify(fp2), 'sub-line', await page.evaluate(() => document.getElementById('strike-sub').textContent));
     await g('window.__game.debug.modules().ui.strikeCue({ reelSet: true })');
@@ -221,7 +238,7 @@ export default async (h) => {
     assert(sub === 'Keep reeling!', `reel set: the STRIKE sub-line says "${sub}"`);
     await frozen(false);
     assert(sr && fp2 && sr.b < fp2.y - 8, 'the STRIKE cue sits above the float');
-    assert(!inside(fp2, await rectOf('#prompt')), 'no prompt over the float on a bite');
+    assert(!inside(fp2, prDuringCue) && !inside(fp2, await rectOf('#prompt')), `no prompt over the float on a bite (pill ${prDuringCue ? 'shown' : 'hidden'} under the cue)`);
     await dbg('strike()');
     // a hooked fish: the prompt stays clear of it
     let fishCovered = 0;

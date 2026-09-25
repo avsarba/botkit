@@ -32,6 +32,8 @@ export const FIGHT = Object.freeze({
   slackN: 1, // below this the line is slack
   slackThrowS: 2.5, // slack this long + a head shake can throw the hook
   slackLongS: 5.5, // slack this long and the hook just falls out
+  slackLooseM: 0.25, // ... where slack means the line also hangs this much (+ slackLooseFrac of the line out)
+  slackLooseFrac: 0.02, //     longer than the rod tip -> fish distance, not just carries nothing
   minLineM: 1.0, // the fish can be reeled up to about a metre below the tip-top
   landLineM: 3.2,
   landDistM: 4.5,
@@ -257,8 +259,10 @@ export function createFightModel(opts = {}) {
       if (s.hookHold <= 0) return { type: 'escape', reason: 'headshake', pulled: true };
     }
 
-    // slack: the line carries (almost) nothing; a small panfish is towed in on a fraction of a newton
-    if (T < Math.min(FIGHT.slackN, 0.1 * mg)) s.slackT += h;
+    // slack: the line carries (almost) nothing AND hangs loose. A small panfish towed in on a steady
+    // retrieve bounces along a nearly taut line (a tug, then a few cm of give, on a fraction of a newton):
+    // that is not slack and must not throw the hook or call for "reel!" while the angler is reeling.
+    if (T < Math.min(FIGHT.slackN, 0.1 * mg) && stretch < -(FIGHT.slackLooseM + FIGHT.slackLooseFrac * s.lineOut)) s.slackT += h;
     else s.slackT = Math.max(0, s.slackT - 3 * h);
     if (s.slackT > FIGHT.slackThrowS) {
       const loose = (f.headShake01 || 0) + (f.isJumping ? 0.6 : 0);

@@ -51,7 +51,7 @@ Desktop and phone play must keep working exactly as before. Read CONTRACT.md fir
 | Drag | Rod-hand thumbstick up/down: one 0.05 step per flick (repeats every 0.25 s while held). |
 | Snap turn | Rod-hand thumbstick left/right. |
 | Lures | READY only: reel-hand **X/Y** (or A/B on a left-handed setup) cycles to the next/previous lure. |
-| Menu / pause | Reel-hand **menu** button (or thumbstick click): opens the VR menu panel and pauses. |
+| Menu / pause | Reel-hand **thumbstick click** (Quest does not expose its menu button to WebXR): opens the VR menu panel and pauses. |
 | Keep / Release | On the catch card: rod-hand **A** = Keep, **B** = Release, or point a ray at the card buttons and pull a trigger. |
 
 Rod-tip cast mapping: `v` = tip velocity (world, smoothed over ~60 ms) at trigger release. `speed = |v|`,
@@ -129,7 +129,7 @@ fonts as the DOM UI (wait for `document.fonts.ready` before the first draw).
 - Harness: `node tools/harness.mjs --xr ...` installs IWER (Meta's WebXR emulator, dev dependency only, never shipped) as
   `navigator.xr` before page scripts, emulating a Quest 3; scenarios move the headset/controllers and press buttons through
   `window.__xrDevice` (`__xrDevice.position/quaternion`, `__xrDevice.controllers.right|left.position/quaternion`,
-  `.updateButtonValue('trigger'|'squeeze'|'a-button'|'b-button'|'x-button'|'y-button'|'thumbstick', v)`,
+  `.updateButtonValue('trigger'|'squeeze'|'a-button'|'b-button'|'x-button'|'y-button'|'thumbstick'|'thumbrest', v)`,
   `.updateAxes('thumbstick', x, y)`; set `__xrDevice.stereoEnabled = true` for side-by-side eye screenshots). Check the
   exact button ids in node_modules/iwer (gamepad config for metaQuest3). The emulator is not a GPU headset: judge
   correctness and framing, not frame rate.

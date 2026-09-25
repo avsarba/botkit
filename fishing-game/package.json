@@ -5,8 +5,11 @@
   "description": "Loon Lake Angler: a realistic 3D fishing game that runs in the browser (three.js, WebGL).",
   "type": "module",
   "scripts": {
-    "build": "node build.mjs",
-    "shoot": "node tools/harness.mjs"
+    "build": "node build.mjs && node build.mjs --standalone",
+    "build:artifact": "node build.mjs",
+    "build:standalone": "node build.mjs --standalone",
+    "shoot": "node tools/harness.mjs",
+    "shoot:xr": "node tools/harness.mjs --xr"
   },
   "devDependencies": {
     "esbuild": "0.28.2",

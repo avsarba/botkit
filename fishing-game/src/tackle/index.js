@@ -1,6 +1,10 @@
 // Tackle: first-person rod + spinning reel view model, verlet fishing line, terminal tackle models
 // and their physics (casting flight, retrieve behaviour per lure, float rig, fight, line break).
 // See CONTRACT.md "Tackle". World units are meters; the lake surface is y = 0.
+// VR (XR.md): setXRMode(true, { rodGrip, reelGrip, rodHand }) moves the rod from the camera-attached half-scale
+// view model onto the rod-hand controller grip at full scale (gloves without forearms on both hands); the bend,
+// guides, line, tip, bail and handle then run from the grip pose, the swing itself loads the blank, the reel
+// hand can turn the handle, and cast(power01, direction, { pitchRad }) takes the swing's launch elevation.
 import * as THREE from 'three';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { Line2 } from 'three/addons/lines/Line2.js';
@@ -30,6 +34,14 @@ const FLOAT_RIDE = 0.003; // float center above the surface at rest (m)
 const SEG_GROW = 3;
 const TIP_SEGS = 6; // in flight the first few segments off the tip-top stay short ...
 const TIP_REST = 0.1; // ... at most this long (m), so paid-out line cannot fold up under the tip
+// VR (WebXR, see XR.md): the real rod rides the rod-hand controller grip at full scale
+const XR_TILT = THREE.MathUtils.degToRad(20); // blank tilted this far above the grip's forward (-Z) axis
+const XR_SEAT = new THREE.Vector3(0, 0, 0.006); // reel seat from the grip origin (rod-local: axis through the palm)
+const XR_LINE_PX = 1.5; // line width per eye in the headset (device px)
+const XR_TIP_MASS = 0.055; // kg: tip section + tackle lagging a swung rod (inertial bend)
+const XR_ACC_DEAD = 6; // m/s^2 of tip acceleration ignored (tracking jitter)
+const PITCH_MIN = THREE.MathUtils.degToRad(8); // cast({ pitchRad }) launch elevation range
+const PITCH_MAX = THREE.MathUtils.degToRad(55);
 
 const PHYS = {
   // pxSize: characteristic silhouette size used for the screen-space minimum size (m)
@@ -121,6 +133,30 @@ export function createTackle(ctx) {
   const hand = createHand({ quality });
   rod.object.add(hand.object);
 
+  // VR: mounts that ride the controller grips (children of the grips while presenting). Rod-local +Y (the
+  // blank) -> the grip's forward axis tilted XR_TILT up; rod-local -Z (reel side) hangs below the hand.
+  const xrRodMount = new THREE.Group();
+  xrRodMount.name = 'tackle-xr-rod';
+  xrRodMount.quaternion.setFromAxisAngle(AX_X, XR_TILT - Math.PI / 2);
+  const xrReelMount = new THREE.Group(); // reel-hand glove, closed round the controller handle (grip -Z)
+  xrReelMount.name = 'tackle-xr-reel-hand';
+  xrReelMount.quaternion.setFromAxisAngle(AX_X, -Math.PI / 2);
+  let xrHands = null; // gloves without the forearm, built on first use (share the desktop glove materials)
+  let xrOn = false;
+  let xrRodGrip = null;
+  let xrReelGrip = null;
+  let xrRodHand = 'right';
+  let xrTracked = false; // rod grip pose valid this frame
+  let xrHadPose = false; // ... at least once since entering VR
+  let xrJump = false; // the tip jumps (mode switch): treat as a teleport
+  // rigid (unbent) tip kinematics of the swung rod, smoothed: velocity ~20 ms, acceleration ~30 ms
+  const xrTipP = new THREE.Vector3();
+  const xrTipV = new THREE.Vector3();
+  const xrTipA = new THREE.Vector3();
+  let xrKinInit = false;
+  const _xm = new THREE.Vector3();
+  const _xs = new THREE.Vector3();
+
   // ------------------------------------------------------------------ line
   // Colours are per point (rope tints, linear RGB); the material only carries the lighting.
   const LINE_COLOR = new THREE.Color('#cce366'); // hi-vis yellow-green 12 lb mono
@@ -155,6 +191,24 @@ export function createTackle(ctx) {
   rope.setTint(0, nPts - 1, LINE_COLOR, LINE_ALPHA);
   tail.setTint(0, tail.n - 1, LINE_COLOR, LINE_ALPHA);
   inRod.setTint(0, inRod.n - 1, LINE_COLOR, 1);
+  // Line2 sizes its width against renderer.getViewport(), which spans BOTH eyes while presenting (twice the
+  // eye's aspect: the line would come out skewed and too thin). Each eye's sub-camera carries its own
+  // viewport; size the line per eye from it. Off the headset this is the stock behaviour.
+  function perEyeLine(line) {
+    const stock = line.onBeforeRender;
+    line.onBeforeRender = function (r, s, cam, geo, mat, grp) {
+      const vp = cam && cam.viewport;
+      if (vp && vp.z > 0 && vp.w > 0 && r && r.xr && r.xr.isPresenting) {
+        const u = this.material && this.material.uniforms;
+        if (u && u.resolution) u.resolution.value.set(vp.z, vp.w);
+        return;
+      }
+      stock.call(this, r, s, cam, geo, mat, grp);
+    };
+  }
+  perEyeLine(rope.line);
+  perEyeLine(tail.line);
+  perEyeLine(inRod.line);
 
   vmRoot.traverse((o) => {
     o.layers.enable(LAYERS.NO_REFLECT);
@@ -215,6 +269,7 @@ export function createTackle(ctx) {
   let fightLineOut = 5;
   let castT = 99;
   let castPower = 0.5;
+  let castPitch = LAUNCH_ELEV; // launch elevation of the current cast (cast({ pitchRad }) in VR)
   const castDir = new THREE.Vector3(0, 0, -1);
   let flightT = 0;
   let landT = 0;
@@ -509,27 +564,86 @@ export function createTackle(ctx) {
     vmRoot.updateMatrixWorld(true);
   }
 
+  // VR: no view model. The head pose (camera, kept in sync with the headset by three) still feeds the
+  // screen-space sizes and line lighting; the rod rides the grip, whose pose three set for this frame.
+  function followGrip(dt) {
+    xrTracked = !!xrRodGrip && xrRodGrip.visible !== false && xrRodMount.parent === xrRodGrip;
+    xrRodMount.updateWorldMatrix(true, true); // rig -> grip -> mount -> rod, as posed for this frame
+    if (xrReelMount.parent) xrReelMount.updateWorldMatrix(true, true);
+    camera.updateWorldMatrix(true, false); // (after a snap turn the rig moved this frame)
+    camera.matrixWorld.decompose(camPos, camQuat, camScale);
+    if (xrTracked) xrHadPose = true;
+    // rigid tip kinematics (the bend is driven by them, so they must not see it)
+    _xm.set(0, ROD.tipY, 0).applyMatrix4(rod.object.matrixWorld);
+    const jump = !xrTracked || xrJump || !xrKinInit || !(dt > 1e-5) || _xm.distanceTo(xrTipP) > Math.max(0.45, 30 * dt);
+    if (jump) {
+      xrTipP.copy(_xm);
+      xrTipV.set(0, 0, 0);
+      xrTipA.set(0, 0, 0);
+      xrKinInit = xrTracked;
+      return;
+    }
+    _xs.subVectors(_xm, xrTipP).multiplyScalar(1 / dt); // raw velocity
+    xrTipP.copy(_xm);
+    _v2.copy(xrTipV);
+    xrTipV.lerp(_xs, 1 - Math.exp(-dt / 0.02));
+    _xs.subVectors(xrTipV, _v2).multiplyScalar(1 / dt); // acceleration of the smoothed velocity
+    xrTipA.lerp(_xs, 1 - Math.exp(-dt / 0.03));
+    if (!vfinite(xrTipV) || !vfinite(xrTipA)) {
+      xrTipV.set(0, 0, 0);
+      xrTipA.set(0, 0, 0);
+    }
+  }
+
+  // World rotation of the rod frame (rod-local <-> world for loads and taps).
+  function rodWorldQuat(out) {
+    if (xrOn) {
+      rod.object.matrixWorld.decompose(_xm, out, _xs);
+      return out;
+    }
+    return out.copy(vmQuat).multiply(rod.object.quaternion);
+  }
+
+  // Bring a point from the half-scale view model to true scale about the eye (the view model is drawn at
+  // VM_SCALE around the camera); identity in VR, where the rod is the real size in the hand.
+  function trueScale(p) {
+    if (!xrOn) p.sub(camPos).multiplyScalar(1 / VM_SCALE).add(camPos);
+    return p;
+  }
+
   function computeTip(dt) {
-    _v.copy(rod.tipLocal).applyMatrix4(rod.object.matrixWorld);
-    tip.copy(_v).sub(camPos).multiplyScalar(1 / VM_SCALE).add(camPos);
+    if (xrOn) {
+      if (xrTracked) tip.copy(rod.tipLocal).applyMatrix4(rod.object.matrixWorld);
+      else if (!xrHadPose) tip.copy(restTipLocal).applyQuaternion(camQuat).add(camPos); // not tracked yet
+      // (tracking lost: the tip stays where it was)
+    } else {
+      _v.copy(rod.tipLocal).applyMatrix4(rod.object.matrixWorld);
+      tip.copy(_v).sub(camPos).multiplyScalar(1 / VM_SCALE).add(camPos);
+    }
     if (!tipInit) {
       tipPrev.copy(tip);
       tipInit = true;
     }
-    teleported = tip.distanceToSquared(tipPrev) > 1.5 * 1.5;
+    // a hand-held tip moves fast but never 30 m/s: a snap turn or a mode switch is a teleport
+    if (xrOn) teleported = xrJump || tip.distanceTo(tipPrev) > Math.max(0.45, 30 * dt);
+    else teleported = xrJump || tip.distanceToSquared(tipPrev) > 1.5 * 1.5;
+    xrJump = false;
+    if (teleported) tipJump.subVectors(tip, tipPrev);
     if (dt > 1e-5) tipVel.subVectors(tip, tipPrev).multiplyScalar(1 / dt);
     tipPrev.copy(tip);
   }
   let teleported = false;
+  const tipJump = new THREE.Vector3();
 
   // ------------------------------------------------------------------ reel
   function animateReel(dt, input, frame) {
     const sp01 = input.reeling ? clamp(finite(input.reelSpeed01, 1), 0, 1) : 0;
     const cmd = reelT < 0.12 ? clamp(reelSpeed / TACKLE.reelRetrieveMps, 0, 1.5) : 0;
     const rate = Math.max(sp01, cmd) * TURNS_PER_S * Math.PI * 2;
-    handleOmega = damp(handleOmega, rate, 14, dt);
+    const handTurn = xrOn && crankByHand(dt, rate);
+    if (!handTurn) handleOmega = damp(handleOmega, rate, 14, dt);
     if (handleOmega > 1 && bailTarget > 0.5 && mode !== 'flying' && mode !== 'launch' && frameState !== STATES.CHARGING) bailTarget = 0;
-    handleAngle = (handleAngle + handleOmega * dt) % (Math.PI * 2000);
+    if (!handTurn) handleAngle = (handleAngle + handleOmega * dt) % (Math.PI * 2000);
     const bailRate = bailTarget > bail01 ? 9 : 6;
     bail01 = bail01 < bailTarget ? Math.min(bailTarget, bail01 + bailRate * dt) : Math.max(bailTarget, bail01 - bailRate * dt);
     const slip = Math.max(0, finite(frame && frame.slipMps, 0));
@@ -537,6 +651,70 @@ export function createTackle(ctx) {
     if (mode === 'flying') lineSpin += dt * 70;
     const fill01 = 1 - clamp(lineOut / TACKLE.spoolCapacityM, 0, 1);
     rod.animateReel(handleAngle, handleAngle * GEAR, bail01, 0.0026 * Math.sin(handleAngle * 0.5), spoolSpin, fill01);
+  }
+
+  // VR: the reel hand circling the handle knob turns it. The handle follows the hand's angle about the crank
+  // axis, forward only (anti-reverse: turning back just lets go), and never slower than the retrieve the
+  // game commands (trigger reeling spins it too). Returns true while the hand drives the handle.
+  let crankLock = false;
+  let crankHandInit = false;
+  let crankHandPrev = 0; // hand angle about the crank axis last frame (wrapped)
+  let crankHandU = 0; // ... unwrapped
+  let crankHandW = 0; // smoothed hand angular speed (rad/s, + = reeling direction)
+  let crankOffset = 0; // handleAngle - hand angle while locked
+  let crankSlowT = 0;
+  const KNOB_R = 0.0465; // crank arm (knob circle radius)
+  function crankByHand(dt, rate) {
+    if (!xrReelGrip || xrReelGrip.visible === false || !xrReelMount.parent || !xrTracked || !(dt > 1e-5)) {
+      crankLock = false;
+      crankHandInit = false;
+      return false;
+    }
+    // reel hand in the reel's frame, relative to the crank pivot (the knob sits at (0, R sin h, R cos h))
+    _xs.setFromMatrixPosition(xrReelGrip.matrixWorld);
+    rod.reel.worldToLocal(_xs).sub(rod.crank.position);
+    const th = Math.atan2(_xs.y, _xs.z);
+    const r = Math.hypot(_xs.y, _xs.z);
+    const kx = rod.crank.scale.x * rod.knobLocal.x;
+    const dKnob = Math.hypot(_xs.x - kx, _xs.y - KNOB_R * Math.sin(handleAngle), _xs.z - KNOB_R * Math.cos(handleAngle));
+    const inZone = r > 0.012 && r < 0.2 && Math.abs(_xs.x - kx) < 0.16;
+    if (!crankHandInit) {
+      crankHandInit = true;
+      crankHandPrev = th;
+      crankHandU = th;
+      crankHandW = 0;
+    }
+    let d = th - crankHandPrev;
+    if (d > Math.PI) d -= Math.PI * 2;
+    else if (d < -Math.PI) d += Math.PI * 2;
+    crankHandPrev = th;
+    crankHandU += d;
+    crankHandW = damp(crankHandW, clamp(d / dt, -60, 60), 12, dt);
+    if (!crankLock) {
+      if (!(inZone && dKnob < 0.16 && crankHandW > 2)) return false;
+      crankLock = true;
+      crankSlowT = 0;
+      crankOffset = handleAngle - crankHandU;
+    } else {
+      crankSlowT = crankHandW < 0.5 ? crankSlowT + dt : 0;
+      if (!inZone || dKnob > 0.25 || crankSlowT > 0.35) {
+        crankLock = false;
+        return false;
+      }
+    }
+    const target = crankHandU + crankOffset;
+    const byRate = handleAngle + rate * dt;
+    let next = Math.min(Math.max(byRate, target), handleAngle + 7 * Math.PI * 2 * dt); // cap at 7 turns/s
+    if (next < handleAngle) next = handleAngle;
+    if (target < next) crankOffset = next - crankHandU; // anti-reverse / the retrieve got ahead: re-anchor
+    handleOmega = damp(handleOmega, (next - handleAngle) / dt, 20, dt);
+    handleAngle = next;
+    const wrap = Math.PI * 2000;
+    if (handleAngle >= wrap) {
+      handleAngle -= wrap;
+      crankOffset -= wrap;
+    }
+    return true;
   }
 
   // ------------------------------------------------------------------ rod load / bend
@@ -557,7 +735,7 @@ export function createTackle(ctx) {
       const len = Math.max(0.05, _v.length());
       _v.multiplyScalar(1 / len);
       Ftarget.addScaledVector(_v, clamp(m * G * 1.3, 0, 3));
-      if (state === STATES.CHARGING) Ftarget.addScaledVector(_v, clamp(finite(frame.input && frame.input.charge01, 0), 0, 1) * 1.4);
+      if (state === STATES.CHARGING && !xrOn) Ftarget.addScaledVector(_v, clamp(finite(frame.input && frame.input.charge01, 0), 0, 1) * 1.4);
     } else if (mode === 'flying') {
       Ftarget.addScaledVector(_v3, 0.12);
     } else if (mode === 'water' || mode === 'land') {
@@ -570,14 +748,18 @@ export function createTackle(ctx) {
     if (extAge > 0.3) extN = damp(extN, 0, 5, dt);
     if (extN > 0 && mode !== 'lost') Ftarget.addScaledVector(extDir, extN);
     else if (mode === 'fish' && extAge > 0.3) Ftarget.addScaledVector(_v3, fightTension);
-    // scripted inertial load during the forward cast stroke: tip lags behind the stroke
-    if (castT < 0.2) {
+    if (xrOn) {
+      // the real swing: the tip section and the tackle lag behind the stroke (d'Alembert load -m a)
+      const a = xrTipA.length();
+      if (a > XR_ACC_DEAD && Number.isFinite(a)) Ftarget.addScaledVector(xrTipA, (-XR_TIP_MASS * Math.min(a - XR_ACC_DEAD, 300)) / a);
+    } else if (castT < 0.2) {
+      // scripted inertial load during the forward cast stroke: tip lags behind the stroke
       const pulse = Math.sin(clamp(castT / 0.2, 0, 1) * Math.PI);
       _v.set(0, 0.35, 1).normalize().applyQuaternion(vmQuat);
       Ftarget.addScaledVector(_v, pulse * (2 + castPower * 6));
     }
     // world -> rod-local
-    _q.copy(vmQuat).multiply(rod.object.quaternion).invert();
+    rodWorldQuat(_q).invert();
     _f.copy(Ftarget).applyQuaternion(_q);
     // head shakes: random taps on the tip
     if (state === STATES.FIGHTING && headShake > 0.05 && rng() < headShake * dt * 12) {
@@ -607,7 +789,7 @@ export function createTackle(ctx) {
   // rod-local impulse along the current line direction (tip tap)
   function tapTip(strength) {
     lineDirAtTip(_v);
-    _q.copy(vmQuat).multiply(rod.object.quaternion).invert();
+    rodWorldQuat(_q).invert();
     _v.applyQuaternion(_q);
     FeffV.addScaledVector(_v, strength);
   }
@@ -679,8 +861,8 @@ export function createTackle(ctx) {
     const head = isBobber ? F : L;
     head.copy(tip).addScaledVector(castDir, 0.06);
     head.y -= 0.05;
-    LV.copy(castDir).multiplyScalar(v0 * Math.cos(LAUNCH_ELEV));
-    LV.y = v0 * Math.sin(LAUNCH_ELEV);
+    LV.copy(castDir).multiplyScalar(v0 * Math.cos(castPitch));
+    LV.y = v0 * Math.sin(castPitch);
     if (isBobber) {
       Fprev.copy(F);
       // bait trails a little behind the float with the same velocity
@@ -1026,7 +1208,8 @@ export function createTackle(ctx) {
         break;
       case 'launch':
         updateHome(dt);
-        if (pose[3] < base[3] + 0.3 || castT > 0.2) launch();
+        // desktop: the scripted forward stroke releases the lure; VR: the real swing already happened
+        if (xrOn || pose[3] < base[3] + 0.3 || castT > 0.2) launch();
         break;
       case 'flying':
         updateFlight(dt);
@@ -1228,8 +1411,22 @@ export function createTackle(ctx) {
   }
 
   // ------------------------------------------------------------------ models
+  // The first eye's sub-camera while presenting (projection + viewport in framebuffer px), or null.
+  function xrEye() {
+    const xc = renderer.xr.getCamera ? renderer.xr.getCamera() : null;
+    const c = xc && xc.cameras && xc.cameras[0];
+    if (!c || !c.viewport || !(c.viewport.w > 0)) return null;
+    const p5 = c.projectionMatrix.elements[5];
+    return Number.isFinite(p5) && p5 > 0.05 ? c : null;
+  }
   function minSizeScale(p, sizeM, minPx) {
     const D = Math.max(0.05, camPos.distanceTo(p));
+    // headset: one eye's projection and viewport (renderer.getSize spans both eyes, camera.fov is the union)
+    const eye = renderer.xr && renderer.xr.isPresenting ? xrEye() : null;
+    if (eye) {
+      const pxXR = (sizeM * eye.viewport.w * eye.projectionMatrix.elements[5]) / (2 * D);
+      return clamp(minPx / Math.max(pxXR, 1e-4), 1, 30);
+    }
     renderer.getSize(_size);
     const H = _size.y || 540;
     const tanHalf = Math.tan(THREE.MathUtils.degToRad(camera.fov || 60) * 0.5);
@@ -1477,7 +1674,9 @@ export function createTackle(ctx) {
     u.uLnFade.value.set(4.5, fightish ? 0.35 : 0.22);
     // ~1.2 CSS px, never under ~1 device pixel (thinner lines break up into dots)
     const dpr = renderer.getPixelRatio ? finite(renderer.getPixelRatio(), 1) : 1;
-    lineMat.linewidth = Math.max(1.2, 1.05 / Math.max(0.25, dpr));
+    // in the headset: per-eye device px (perEyeLine), a touch wider for the denser, moving view
+    if (renderer.xr && renderer.xr.isPresenting) lineMat.linewidth = XR_LINE_PX;
+    else lineMat.linewidth = Math.max(1.2, 1.05 / Math.max(0.25, dpr));
     if (lineLook.patched) lineMat.color.setRGB(1, 1, 1);
     else {
       // unpatched fallback: average lighting through the material colour
@@ -1500,7 +1699,7 @@ export function createTackle(ctx) {
   // Where the tip-top sits in the READY pose, in camera space (the forward stroke releases about there).
   const restTipLocal = new THREE.Vector3(0.28, 0.72, -1.75);
   function updateRestTip(state) {
-    if (mode !== 'home' || castT < 1.5 || !(state === STATES.READY || state === STATES.TITLE)) return;
+    if (xrOn || mode !== 'home' || castT < 1.5 || !(state === STATES.READY || state === STATES.TITLE)) return;
     _v.subVectors(tip, camPos).applyQuaternion(_q.copy(camQuat).invert());
     if (vfinite(_v) && _v.lengthSq() < 16) restTipLocal.lerp(_v, 0.2);
   }
@@ -1511,19 +1710,24 @@ export function createTackle(ctx) {
   const _pp = new THREE.Vector3();
   const _pv = new THREE.Vector3();
   const _pd = new THREE.Vector3();
-  function predictLanding(power01, direction, target) {
+  // opts.pitchRad: launch elevation as in cast() (default the desktop calibration angle). In VR the
+  // flight starts at the real tip and the default direction is where the rod points.
+  function predictLanding(power01, direction, target, opts) {
     const out = target || new THREE.Vector3();
     const cfg = LURES[lureIdx];
     const R = lerp(2.4, finite(cfg.maxCastM, TACKLE.maxCastM), clamp(finite(power01, 0.5), 0, 1));
     const v0 = speedForRange(ph.drag, R);
     if (direction && Number.isFinite(direction.x) && Number.isFinite(direction.z)) _pd.set(direction.x, 0, direction.z);
+    else if (xrOn) rodHeading(_pd);
     else _pd.set(0, 0, -1).applyQuaternion(camQuat).setY(0);
     if (_pd.lengthSq() < 1e-8) return null;
     _pd.normalize();
-    _pp.copy(restTipLocal).applyQuaternion(camQuat).add(camPos).addScaledVector(_pd, 0.06);
+    if (xrOn) _pp.copy(tip).addScaledVector(_pd, 0.06);
+    else _pp.copy(restTipLocal).applyQuaternion(camQuat).add(camPos).addScaledVector(_pd, 0.06);
     _pp.y -= 0.05;
-    _pv.copy(_pd).multiplyScalar(v0 * Math.cos(LAUNCH_ELEV));
-    _pv.y = v0 * Math.sin(LAUNCH_ELEV);
+    const pitch = launchPitch(opts);
+    _pv.copy(_pd).multiplyScalar(v0 * Math.cos(pitch));
+    _pv.y = v0 * Math.sin(pitch);
     const h = 1 / 240;
     const k = ph.drag;
     for (let i = 0; i < 2400; i++) {
@@ -1547,6 +1751,18 @@ export function createTackle(ctx) {
     return vfinite(_pp) ? out.copy(_pp) : null;
   }
 
+  function launchPitch(opts) {
+    return opts && Number.isFinite(opts.pitchRad) ? clamp(opts.pitchRad, PITCH_MIN, PITCH_MAX) : LAUNCH_ELEV;
+  }
+
+  // Horizontal pointing direction of the rod (VR; falls back to the view direction when it points straight up).
+  function rodHeading(out) {
+    out.set(0, 1, 0).transformDirection(rod.object.matrixWorld).setY(0);
+    if (out.lengthSq() < 1e-4) out.set(0, 0, -1).applyQuaternion(camQuat).setY(0);
+    if (out.lengthSq() < 1e-8) out.set(0, 0, -1);
+    return out.normalize();
+  }
+
   // ------------------------------------------------------------------ casting aid
   // While the cast charges: a faint hairline ring on the water where it would come down (predictLanding),
   // fading in with the charge. Screen-space width (Line2), so it reads as a thin ring at any distance;
@@ -1567,12 +1783,14 @@ export function createTackle(ctx) {
   aimRing.frustumCulled = false;
   aimRing.visible = false;
   aimRing.layers.enable(LAYERS.NO_REFLECT);
+  perEyeLine(aimRing);
   scene.add(aimRing);
   const AIM_TINT = new THREE.Color(0.95, 0.93, 0.86);
   const _aimP = new THREE.Vector3();
   let aimA = 0;
   function updateAimRing(dt, state, input) {
-    const charging = state === STATES.CHARGING && mode === 'home' && !lost;
+    // desktop only: in VR the cast comes from the real swing, which a charge-based preview cannot follow
+    const charging = !xrOn && state === STATES.CHARGING && mode === 'home' && !lost;
     let want = 0;
     if (charging) {
       const c = clamp(finite(input.charge01, 0), 0, 1);
@@ -1614,13 +1832,22 @@ export function createTackle(ctx) {
     lastState = state;
     syncEnvMap();
     updateWind();
-    updatePose(dt, state, input);
-    applyPose(state);
-    followCamera(dt);
+    if (xrOn) followGrip(dt);
+    else {
+      updatePose(dt, state, input);
+      applyPose(state);
+      followCamera(dt);
+    }
     animateReel(dt, input, frame);
     updateRodLoad(dt, state, frame || {});
     computeTip(dt);
-    if (teleported && mode === 'home') resetToHome();
+    if (teleported && mode === 'home') {
+      resetToHome();
+      if (xrOn && state === STATES.CHARGING) bailTarget = 1; // a snap turn with the trigger held: bail stays open
+    } else if (teleported && xrOn && mode !== 'lost' && !ropeNeedsLay && vfinite(tipJump)) {
+      // VR snap turn with line out: the stretch near the tip moves with it instead of being flung
+      rope.shiftNearStart(tipJump.x, tipJump.y, tipJump.z, 3);
+    }
     updateTerminal(dt, state);
     updateModels(dt);
     updateLine(dt, state);
@@ -1660,9 +1887,12 @@ export function createTackle(ctx) {
     dipT = 99;
     lineOut = homeLine();
     if (!tipInit) {
-      updatePose(0, STATES.READY, EMPTY_INPUT);
-      applyPose(STATES.READY);
-      followCamera(0);
+      if (xrOn) followGrip(0);
+      else {
+        updatePose(0, STATES.READY, EMPTY_INPUT);
+        applyPose(STATES.READY);
+        followCamera(0);
+      }
       rod.setLoad(Feff);
       computeTip(0);
     }
@@ -1712,10 +1942,14 @@ export function createTackle(ctx) {
     else writeSnapshot();
   }
 
-  function cast(power01, direction) {
+  // opts.pitchRad (optional, VR): launch elevation, clamped to 8..55 deg; the launch speed for a given power is
+  // the same as on desktop (calibrated at ~30 deg), so a flatter or steeper swing lands shorter / higher.
+  function cast(power01, direction, opts) {
     if (mode !== 'home' || lost) resetToHome();
     castPower = clamp(finite(power01, 0.5), 0, 1);
+    castPitch = launchPitch(opts);
     if (direction && Number.isFinite(direction.x) && Number.isFinite(direction.z)) castDir.set(direction.x, 0, direction.z);
+    else if (xrOn) rodHeading(castDir);
     else castDir.set(0, 0, -1).applyQuaternion(camQuat).setY(0);
     if (castDir.lengthSq() < 1e-8) castDir.set(0, 0, -1).applyQuaternion(camQuat).setY(0);
     if (castDir.lengthSq() < 1e-8) castDir.set(0, 0, -1);
@@ -1896,6 +2130,115 @@ export function createTackle(ctx) {
     writeSnapshot();
   }
 
+  // ------------------------------------------------------------------ VR mode
+  function ensureXRHands() {
+    if (xrHands) return xrHands;
+    const h = createHand({ quality, arm: false, materials: hand.materials });
+    const rodGlove = h.object;
+    rodGlove.name = 'hand-xr-rod';
+    rodGlove.visible = false;
+    rod.object.add(rodGlove);
+    const reelGlove = new THREE.Mesh(h.object.geometry, h.object.material);
+    reelGlove.name = 'hand-xr-reel';
+    reelGlove.position.copy(XR_SEAT);
+    xrReelMount.add(reelGlove);
+    for (const o of [rodGlove, reelGlove]) {
+      o.layers.enable(LAYERS.NO_REFLECT);
+      o.castShadow = false;
+      o.receiveShadow = false;
+      o.frustumCulled = false;
+    }
+    xrHands = { h, rodGlove, reelGlove };
+    return xrHands;
+  }
+
+  // setXRMode(true, { rodGrip, reelGrip, rodHand }) puts the rod (full scale) in the rod-hand controller grip:
+  // the reel seat in the palm, the blank along the grip's forward (-Z) axis tilted XR_TILT up, the gloved hand
+  // on it, and a second glove in the reel-hand grip. rodHand: 'right' (default) | 'left' (mirrors the gloves,
+  // the reel handle moves to the right side); also read from rodGrip.userData.handedness. Call again to switch
+  // grips or hands. setXRMode(false) restores the camera-attached half-scale desktop view model.
+  // Returns whether VR mode is on.
+  function setXRMode(on, opts) {
+    const o = opts || {};
+    if (on) {
+      const rodGrip = o.rodGrip && o.rodGrip.isObject3D ? o.rodGrip : null;
+      if (!rodGrip) return xrOn; // nothing to hold the rod: stay as we are
+      const reelGrip = o.reelGrip && o.reelGrip.isObject3D && o.reelGrip !== rodGrip ? o.reelGrip : null;
+      const side = o.rodHand || o.hand || (rodGrip.userData && rodGrip.userData.handedness) || (/(^|[^a-z])left([^a-z]|$)/i.test(rodGrip.name || '') ? 'left' : 'right');
+      const left = side === 'left';
+      // idempotent: calling it again with the same grips and hand changes nothing (no teleport, no re-hang)
+      const same = xrOn && rodGrip === xrRodGrip && reelGrip === xrReelGrip && (left ? 'left' : 'right') === xrRodHand;
+      if (same && xrRodMount.parent === rodGrip && rod.object.parent === xrRodMount && (!reelGrip || xrReelMount.parent === reelGrip)) return true;
+      const hs = ensureXRHands();
+      if (xrRodMount.parent !== rodGrip) rodGrip.add(xrRodMount);
+      if (reelGrip) {
+        if (xrReelMount.parent !== reelGrip) reelGrip.add(xrReelMount);
+      } else if (xrReelMount.parent) xrReelMount.parent.remove(xrReelMount);
+      if (rod.object.parent !== xrRodMount) xrRodMount.add(rod.object);
+      rod.object.position.copy(XR_SEAT);
+      rod.object.quaternion.identity();
+      rod.object.scale.setScalar(1);
+      hand.object.visible = false;
+      hs.rodGlove.visible = true;
+      hs.rodGlove.scale.set(left ? -1 : 1, 1, 1); // the model is a right hand
+      hs.reelGlove.scale.set(left ? 1 : -1, 1, 1);
+      rod.setCrankSide(left ? 'right' : 'left');
+      vmRoot.visible = false;
+      aimA = 0;
+      aimRing.visible = false;
+      if (!xrOn) xrHadPose = false;
+      xrKinInit = false;
+      crankLock = false;
+      crankHandInit = false;
+      xrOn = true;
+      xrRodGrip = rodGrip;
+      xrReelGrip = reelGrip;
+      xrRodHand = left ? 'left' : 'right';
+      xrJump = true;
+      return true;
+    }
+    if (xrRodMount.parent) xrRodMount.parent.remove(xrRodMount);
+    if (xrReelMount.parent) xrReelMount.parent.remove(xrReelMount);
+    if (!xrOn) return false;
+    xrOn = false;
+    xrRodGrip = null;
+    xrReelGrip = null;
+    crankLock = false;
+    vmRoot.add(rod.object);
+    rod.object.scale.setScalar(1);
+    hand.object.visible = true;
+    if (xrHands) xrHands.rodGlove.visible = false;
+    rod.setCrankSide('left');
+    vmRoot.visible = true;
+    // back to the camera-space pose, snapped there (no swing-in from where the hand was)
+    poseInit = false;
+    vmInit = false;
+    poseV.fill(0);
+    computeBasePose();
+    updatePose(0, frameState, EMPTY_INPUT);
+    applyPose(frameState);
+    followCamera(0);
+    xrJump = true;
+    return false;
+  }
+
+  // World position of the reel seat (rod butt end of the fore grip), true scale.
+  function getRodBase(target) {
+    const out = target || new THREE.Vector3();
+    rod.object.updateWorldMatrix(true, false);
+    out.setFromMatrixPosition(rod.object.matrixWorld);
+    return trueScale(out);
+  }
+
+  // World position of the reel handle knob (moves as the handle turns), true scale.
+  function getReelHandle(target) {
+    const out = target || new THREE.Vector3();
+    rod.crank.updateWorldMatrix(true, false);
+    out.copy(rod.knobLocal);
+    rod.crank.localToWorld(out);
+    return trueScale(out);
+  }
+
   // hookset sweep on every strike attempt
   const offs = [];
   if (events && events.on) {
@@ -1936,9 +2279,19 @@ export function createTackle(ctx) {
     snap,
     resetToHome,
     predictLanding, // extra (not in the contract): cast preview for an aim ring
+    // VR (XR.md)
+    setXRMode,
+    getRodBase,
+    getReelHandle,
+    get xrMode() {
+      return xrOn;
+    },
     object: vmRoot,
     dispose() {
       for (const off of offs) if (typeof off === 'function') off();
+      if (xrRodMount.parent) xrRodMount.parent.remove(xrRodMount);
+      if (xrReelMount.parent) xrReelMount.parent.remove(xrReelMount);
+      if (xrHands) xrHands.h.dispose();
       scene.remove(vmRoot, rope.line, tail.line, aimRing);
       aimGeom.dispose();
       aimMat.dispose();
@@ -1952,6 +2305,16 @@ export function createTackle(ctx) {
       lureSet.dispose();
     },
     // for sandboxes / debugging (not part of the contract)
-    debug: { rod, rope, models, pose, base, Feff, Ftarget, get extN() { return extN; }, get mode() { return mode; }, get tip() { return tip; }, get camPos() { return camPos; } },
+    debug: {
+      rod, rope, models, pose, base, Feff, Ftarget,
+      get extN() { return extN; }, get mode() { return mode; }, get tip() { return tip; }, get camPos() { return camPos; },
+      get handleAngle() { return handleAngle; }, get bail01() { return bail01; },
+      xr: {
+        rodMount: xrRodMount, reelMount: xrReelMount,
+        get on() { return xrOn; }, get hands() { return xrHands; }, get tracked() { return xrTracked; },
+        get rodHand() { return xrRodHand; }, get tipVel() { return xrTipV; }, get tipAcc() { return xrTipA; },
+        get crankLock() { return crankLock; }, get castPitch() { return castPitch; },
+      },
+    },
   };
 }

@@ -1,6 +1,8 @@
 // First-person view: the camera sits at the angler's eye on the dock end. Yaw/pitch are smoothed toward
 // targets set by the pointer, keys, touch drags or the game (title drift, following a hooked fish).
 // Yaw uses three.js' convention (camera.rotation.y; + turns left); yaw 0 looks down -Z over the lake.
+// While a VR session presents, the headset owns the camera: setBypass(true) keeps the targets and state updating
+// but never writes the camera (no title drift, no follow camera, no fight camera in the headset).
 import * as THREE from 'three';
 import { PLAYER, clamp, damp } from '../config.js';
 
@@ -13,6 +15,7 @@ export function createView(camera) {
   const pMin = PLAYER.pitchMinDeg * DEG;
   const pMax = PLAYER.pitchMaxDeg * DEG;
   const v = { yaw: 0, pitch: DEFAULT_PITCH, tYaw: 0, tPitch: DEFAULT_PITCH, rateX: 0, rateY: 0, follow: false };
+  let bypass = false;
   camera.rotation.order = 'YXZ';
 
   function clampTargets() {
@@ -86,6 +89,7 @@ export function createView(camera) {
   }
 
   function apply() {
+    if (bypass) return;
     camera.position.copy(eye);
     camera.rotation.set(v.pitch, v.yaw, 0, 'YXZ');
     camera.updateMatrixWorld();
@@ -96,6 +100,28 @@ export function createView(camera) {
     return out.set(-Math.sin(v.yaw), 0, -Math.cos(v.yaw));
   }
 
+  function setBypass(on) {
+    bypass = !!on;
+    if (!bypass) apply();
+  }
+
   apply();
-  return { v, eye, steer, nudge, set, aimAt, update, apply, aimDir, yawLim, pMin, pMax };
+  return {
+    v,
+    eye,
+    steer,
+    nudge,
+    set,
+    aimAt,
+    update,
+    apply,
+    aimDir,
+    yawLim,
+    pMin,
+    pMax,
+    setBypass,
+    get bypass() {
+      return bypass;
+    },
+  };
 }

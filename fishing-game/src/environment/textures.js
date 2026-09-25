@@ -193,11 +193,18 @@ function bake(renderer, fragmentShader, size, anisotropy, target) {
   scene.add(mesh);
   const prev = renderer.getRenderTarget();
   const prevAutoClear = renderer.autoClear;
+  // off-screen: never through the headset's stereo camera (a re-bake can run while VR presents)
+  const prevXr = renderer.xr.enabled;
+  renderer.xr.enabled = false;
   renderer.autoClear = true;
-  renderer.setRenderTarget(rt);
-  renderer.render(scene, camera);
-  renderer.setRenderTarget(prev);
-  renderer.autoClear = prevAutoClear;
+  try {
+    renderer.setRenderTarget(rt);
+    renderer.render(scene, camera);
+  } finally {
+    renderer.setRenderTarget(prev);
+    renderer.autoClear = prevAutoClear;
+    renderer.xr.enabled = prevXr;
+  }
   geometry.dispose();
   material.dispose();
   return rt;

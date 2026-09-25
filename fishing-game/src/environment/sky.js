@@ -375,10 +375,14 @@ void main() {
 }
 `;
 
+// Centre on the eye from camera.matrixWorld, not camera.position: in VR three draws each eye with its
+// own camera whose .position is in the reference space (rig-local), and the user camera is a child of
+// the player rig. onBeforeRender runs per eye, so each eye gets a dome centred on itself (no parallax).
+const _eye = new THREE.Vector3();
 function followCamera(obj) {
   obj.frustumCulled = false;
   obj.onBeforeRender = (renderer, scene, camera) => {
-    obj.position.copy(camera.position);
+    obj.position.copy(_eye.setFromMatrixPosition(camera.matrixWorld));
     obj.updateMatrixWorld();
   };
 }
@@ -508,7 +512,7 @@ export function createSkySystem({ quality, cloudNoise }) {
   stars.frustumCulled = false;
   const starQuat = new THREE.Quaternion();
   stars.onBeforeRender = (renderer, scene, camera) => {
-    stars.position.copy(camera.position);
+    stars.position.setFromMatrixPosition(camera.matrixWorld); // per eye in VR (see followCamera)
     stars.quaternion.copy(starQuat);
     stars.updateMatrixWorld();
   };

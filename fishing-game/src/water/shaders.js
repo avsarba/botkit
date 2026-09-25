@@ -152,6 +152,10 @@ uniform float uReflPxPerRad; // reflection-target pixels per radian
 uniform vec2 uReflTexel;
 uniform vec3 uShoreColor;
 uniform float uShoreElev;
+// VR: the band follows the real skyline. tSkyline per azimuth atan2(x, -z): R = occluder top (world y),
+// G = its distance from the dock
+uniform float uShoreProfile;
+uniform sampler2D tSkyline;
 
 varying vec3 vWorld;
 varying vec2 vX0;
@@ -255,6 +259,21 @@ vec3 skyFallback(vec3 R) {
   #endif
   // the dark band of the forested far shore just above the horizon
   float band = 1.0 - smoothstep(uShoreElev * 0.3, uShoreElev, R.y);
+  if (uShoreProfile > 0.5) {
+    // the treeline / hills that form the skyline along this azimuth, seen from this point of the
+    // surface (the occluder sits at a known distance from the dock): the mirror image of the real
+    // skyline instead of a fixed height
+    float lxz = length(R.xz);
+    if (lxz > 1e-4) {
+      vec2 dir = R.xz / lxz;
+      float az = atan(dir.x, -dir.y);
+      vec2 sk = texture2D(tSkyline, vec2(az * 0.1591549 + 0.5, 0.5)).rg;
+      float dp = max(sk.y - dot(vWorld.xz, dir), 2.0);
+      float tS = (sk.x - vWorld.y) / dp; // tangent of the skyline's elevation from here
+      float tR = R.y / lxz;
+      band = 1.0 - smoothstep(tS - 0.012, tS + 0.004, tR);
+    }
+  }
   return mix(c, uShoreColor, band * 0.92);
 }
 

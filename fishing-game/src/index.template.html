@@ -536,6 +536,19 @@ kbd {
   font-variant-numeric: tabular-nums;
 }
 #ui .btn-primary:focus-visible { outline-color: var(--text); }
+/* Enter VR: the secondary action beside Start (and in the pause menu); src/ui/index.js shows it only when
+   navigator.xr supports immersive-vr (ui.setXRAvailable) */
+.btn-secondary {
+  display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+  min-height: 56px; padding: 0 24px; box-sizing: border-box;
+  font: 700 17px/1 var(--f-ui); letter-spacing: 0.16em; text-transform: uppercase;
+  color: var(--text); background: var(--glass-strong);
+  border: 1px solid var(--hair-strong); border-radius: 6px;
+  -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+}
+.btn-secondary:hover { background: var(--glass-press); border-color: var(--text); }
+.btn-secondary:disabled { color: var(--muted); border-color: var(--hair); background: var(--glass); }
+.btn-secondary svg { width: 24px; height: 16px; flex: none; }
 .best { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .best-main { font: 500 15px/1.3 var(--f-ui); color: var(--text); }
 .best-sub { font: 500 12px/1.3 var(--f-mono); color: var(--muted); }
@@ -718,6 +731,7 @@ kbd {
 .seg button:hover { color: var(--text); background: var(--glass-hi); }
 .seg button[aria-pressed="true"] { color: var(--text); background: var(--glass-press); }
 .pause .btn-primary { width: 100%; margin-top: 6px; }
+.pause .btn-secondary { width: 100%; min-height: 48px; }
 .pause-note { margin: 0; font: 500 12px/1.4 var(--f-mono); color: var(--muted); text-align: center; }
 #ui[data-input="touch"] .pause-note { display: none; }
 
@@ -844,6 +858,7 @@ kbd {
   .controls dt, .controls dd { color: var(--text); }
   .title-actions { grid-area: actions; flex-direction: row; align-items: center; }
   .btn-primary { width: auto; min-height: 50px; }
+  .btn-secondary { min-height: 50px; }
   /* journal: two columns and a one-line header, so recent catches are not 700 px down */
   .journal { width: min(1000px, 100%); }
   .journal-body { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 0 24px; }
@@ -870,6 +885,14 @@ kbd {
   }
   .catch-actions { padding-bottom: calc(14px + var(--safe-b)); }
 }
+
+/* With Enter VR beside Start, the best-catch line wraps below the buttons; if that makes the title taller
+   than the window, keep its top reachable (it scrolls) instead of clipping it. Mirrors the title's
+   alignment rules above, only while the button is shown, so the layout without WebXR is unchanged. */
+.title:has(#btn-vr:not([hidden])) { align-items: safe center; }
+@media (max-width: 720px) { .title:has(#btn-vr:not([hidden])) { align-items: safe flex-end; } }
+@media (max-height: 520px) { .title:has(#btn-vr:not([hidden])) { align-items: flex-start; } }
+@media (max-height: 520px) and (min-width: 600px) { .title:has(#btn-vr:not([hidden])) { align-items: safe center; } }
 
 @media (prefers-reduced-motion: reduce) {
   .toast, .catch, .stamp, .stamp + .stamp { animation: none; }
@@ -999,6 +1022,7 @@ kbd {
       </dl>
       <div class="title-actions">
         <button class="btn-primary" id="btn-start" type="button" disabled>Loading the lake…</button>
+        <button class="btn-secondary" id="btn-vr" type="button" aria-label="Enter VR: play with a headset and controllers" hidden disabled><svg viewBox="0 0 24 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M3.6 2.2h16.8a2.1 2.1 0 0 1 2.1 2.1v7.2a2.1 2.1 0 0 1-2.1 2.1h-4.1l-2.5-3a2.3 2.3 0 0 0-3.6 0l-2.5 3H3.6a2.1 2.1 0 0 1-2.1-2.1V4.3a2.1 2.1 0 0 1 2.1-2.1z"></path></svg><span>Enter VR</span></button>
         <div class="best" id="title-best" hidden>
           <span class="label">Best catch</span>
           <span class="best-main" id="title-best-main"></span>
@@ -1067,6 +1091,7 @@ kbd {
         </div>
         <button class="btn-primary" id="btn-resume" type="button">Resume</button>
         <p class="pause-note">Esc to resume</p>
+        <button class="btn-secondary" id="btn-vr-pause" type="button" aria-label="Enter VR: play with a headset and controllers" hidden><svg viewBox="0 0 24 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M3.6 2.2h16.8a2.1 2.1 0 0 1 2.1 2.1v7.2a2.1 2.1 0 0 1-2.1 2.1h-4.1l-2.5-3a2.3 2.3 0 0 0-3.6 0l-2.5 3H3.6a2.1 2.1 0 0 1-2.1-2.1V4.3a2.1 2.1 0 0 1 2.1-2.1z"></path></svg><span>Enter VR</span></button>
       </div>
       <div class="pause-help" id="pause-help" role="region" aria-labelledby="help-h" tabindex="0">
         <h3 class="label help-h" id="help-h">Controls</h3>

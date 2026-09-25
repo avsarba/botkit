@@ -149,7 +149,12 @@ export function createQualityManager({ renderer, initial = 'high', auto = true, 
     }
   };
 
+  // While a VR session presents, three.js owns the drawing buffer (framebuffer scale, not pixel ratio): the manager
+  // never resizes it then, and its level only follows the XR profile / XR adaptive quality (see enterXR).
+  let xrSaved = null;
+
   function applyPR(next) {
+    if (xrSaved) return false;
     next = Math.round(next * 1000) / 1000;
     if (Math.abs(next - pr) < 0.005) return false;
     pr = next;
@@ -343,7 +348,7 @@ export function createQualityManager({ renderer, initial = 'high', auto = true, 
 
   // Call once per rendered frame with the real (unclamped) frame time in seconds.
   function sample(realDt) {
-    if (!(realDt > 0)) return;
+    if (!(realDt > 0) || xrSaved) return;
     clock += Math.min(realDt, 5);
     if (autoMode && pending) applyPending();
     if (clock < skipUntil) return;
@@ -380,6 +385,14 @@ export function createQualityManager({ renderer, initial = 'high', auto = true, 
     // UI / debug choice: that level with its full pixel ratio; automatic mode off.
     setManual(q) {
       if (!LEVELS.includes(q)) return;
+      if (xrSaved) {
+        // in VR: takes effect now for the scene; the desktop gets it (with its pixel ratio) after the session
+        xrSaved.quality = q;
+        xrSaved.auto = false;
+        autoMode = false;
+        setLevel(q);
+        return;
+      }
       if (probe && (probe.kind === 'probe' || probe.kind === 'headroom')) applyPR(probe.prBefore);
       autoMode = false;
       pending = null;
@@ -390,6 +403,11 @@ export function createQualityManager({ renderer, initial = 'high', auto = true, 
       reset();
     },
     setAuto(on) {
+      if (xrSaved) {
+        xrSaved.auto = !!on;
+        autoMode = !!on;
+        return;
+      }
       const was = autoMode;
       autoMode = !!on;
       if (autoMode && !was) {
@@ -408,6 +426,33 @@ export function createQualityManager({ renderer, initial = 'high', auto = true, 
     },
     setPixelRatio(p) {
       applyPR(Math.max(0.5, Math.min(p, 2)));
+    },
+    // ---- VR: the scene level follows the XR profile while presenting; the desktop level, mode and pixel ratio
+    // come back afterwards (three.js restores the drawing buffer size itself when the session ends).
+    enterXR(level) {
+      if (xrSaved) return;
+      if (probe && (probe.kind === 'probe' || probe.kind === 'headroom')) applyPR(probe.prBefore);
+      probe = null;
+      pending = null;
+      xrSaved = { quality, auto: autoMode };
+      setLevel(LEVELS.includes(level) ? level : quality);
+    },
+    setXRLevel(q) {
+      return !!xrSaved && setLevel(q);
+    },
+    exitXR() {
+      if (!xrSaved) return;
+      const s = xrSaved;
+      xrSaved = null;
+      autoMode = s.auto;
+      setLevel(s.quality);
+      const cap = Math.min(dpr(), PR_CAP[quality]);
+      if (!autoMode) applyPR(cap); // a level picked meanwhile comes with its full pixel ratio
+      else if (pr > cap + 0.005) applyPR(cap);
+      reset();
+    },
+    get inXR() {
+      return !!xrSaved;
     },
     get quality() {
       return quality;
@@ -439,4 +484,185 @@ export function createQualityManager({ renderer, initial = 'high', auto = true, 
     },
   };
   return mgr;
+}
+
+// ---------------------------------------------------------------- WebXR (VR) quality (XR.md "Rendering while presenting")
+// A profile is a scene level plus the XR layer's framebuffer scale and fixed foveation. The framebuffer scale is fixed
+// for a session (it sizes the layer); foveation and the scene level adapt to the XR frame time.
+export const XR_PROFILES = Object.freeze({
+  high: Object.freeze({ framebufferScale: 1.0, foveation: 0.5 }),
+  medium: Object.freeze({ framebufferScale: 0.9, foveation: 0.8 }),
+  low: Object.freeze({ framebufferScale: 0.75, foveation: 1.0 }),
+});
+
+// Standalone headsets (Quest, Pico and other mobile-GPU VR browsers) render on a phone-class GPU.
+export function isStandaloneHeadset(ua) {
+  let s = ua;
+  if (typeof s !== 'string') {
+    try {
+      s = navigator.userAgent || '';
+    } catch {
+      s = '';
+    }
+  }
+  return /OculusBrowser|Quest|Pico|Mobile VR/i.test(s);
+}
+
+// The XR profile when the player hasn't picked a level: 'low' on standalone headsets, 'medium' otherwise.
+export function defaultXRLevel(ua) {
+  return isStandaloneHeadset(ua) ? 'low' : 'medium';
+}
+
+const XR_WINDOW_S = 2;
+const XR_STALL_S = 0.25; // longer frames are hitches (compiles, uploads, the system menu), not the frame rate
+const XR_SLOW_X = 1.2; // median frame time above this many display periods: slow window
+const XR_FAST_X = 1.06; // ...below this: fast window
+const XR_SLOW_WINDOWS = 2;
+const XR_FAST_WINDOWS = 6;
+const XR_UP_COOLDOWN_S = 15;
+const XR_FLAP_S = 20; // a level-up that is slow this soon is undone and not retried for XR_LOCK_S
+const XR_LOCK_S = 120;
+
+// Adaptive quality inside a VR session: slow frames first raise fixed foveation to 1, then step the scene level down
+// (at a calm moment, like the desktop manager); sustained headroom climbs back up to the profile, never above it.
+export function createXRAdaptive({ qm, renderer, getFrameRate }) {
+  let profile = 'medium';
+  let foveation = XR_PROFILES.medium.foveation;
+  let framebufferScale = XR_PROFILES.medium.framebufferScale;
+  let on = false;
+  const times = new Float32Array(2048);
+  let n = 0;
+  let winT = 0;
+  let clock = 0;
+  let slow = 0;
+  let fast = 0;
+  let fps = 0;
+  let lastDownAt = -1e9;
+  let lastUpAt = -1e9;
+  let lockUntil = -1;
+  let pending = null; // level waiting for a calm moment
+  const calm = () => {
+    try {
+      return !qm.canChangeLevel || !!qm.canChangeLevel();
+    } catch {
+      return true;
+    }
+  };
+  const setFov = (f) => {
+    foveation = Math.max(0, Math.min(1, f));
+    try {
+      renderer.xr.setFoveation(foveation);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  function start(level) {
+    profile = XR_PROFILES[level] ? level : 'medium';
+    foveation = XR_PROFILES[profile].foveation;
+    framebufferScale = XR_PROFILES[profile].framebufferScale;
+    on = true;
+    n = 0;
+    winT = 0;
+    slow = fast = 0;
+    pending = null;
+    lastDownAt = lastUpAt = -1e9;
+    lockUntil = -1;
+    return { level: profile, framebufferScale, foveation };
+  }
+  function stop() {
+    on = false;
+    pending = null;
+  }
+
+  const LV = ['high', 'medium', 'low'];
+  function stepDown() {
+    if (foveation < 1 - 1e-3) {
+      setFov(1);
+      return true;
+    }
+    const i = LV.indexOf(qm.quality);
+    if (i < LV.length - 1) {
+      pending = LV[i + 1];
+      return true;
+    }
+    return false;
+  }
+  function stepUp() {
+    const i = LV.indexOf(qm.quality);
+    const pi = LV.indexOf(profile);
+    if (i > pi && !(lockUntil > clock)) {
+      pending = LV[i - 1];
+      return true;
+    }
+    if (i <= pi && foveation > XR_PROFILES[profile].foveation + 1e-3) {
+      setFov(XR_PROFILES[profile].foveation);
+      return true;
+    }
+    return false;
+  }
+
+  function closeWindow() {
+    if (n < 8) {
+      n = 0;
+      winT = 0;
+      return;
+    }
+    const med = times.subarray(0, n).sort()[n >> 1];
+    n = 0;
+    winT = 0;
+    fps = 1 / med;
+    const period = 1 / Math.max(30, getFrameRate() || 72);
+    if (med > period * XR_SLOW_X) {
+      fast = 0;
+      if (pending && LV.indexOf(pending) < LV.indexOf(qm.quality)) pending = null;
+      if (clock - lastUpAt < XR_FLAP_S) lockUntil = clock + XR_LOCK_S;
+      if (++slow >= XR_SLOW_WINDOWS) {
+        slow = 0;
+        if (stepDown()) lastDownAt = clock;
+      }
+    } else {
+      slow = 0;
+      fast = med < period * XR_FAST_X ? fast + 1 : 0;
+      if (fast >= XR_FAST_WINDOWS && clock - lastDownAt > XR_UP_COOLDOWN_S) {
+        fast = 0;
+        if (stepUp()) lastUpAt = clock;
+      }
+    }
+  }
+
+  // once per XR frame, with the real frame time (s)
+  function sample(realDt) {
+    if (!on || !(realDt > 0)) return;
+    clock += Math.min(realDt, 5);
+    if (pending && calm()) {
+      qm.setXRLevel(pending);
+      pending = null;
+      n = 0;
+      winT = 0;
+    }
+    if (!qm.auto) return; // a level picked by hand stays put
+    if (realDt > XR_STALL_S) return;
+    if (n < times.length) times[n++] = realDt;
+    winT += realDt;
+    if (winT >= XR_WINDOW_S) closeWindow();
+  }
+
+  return {
+    start,
+    stop,
+    sample,
+    get status() {
+      return { profile, level: qm.quality, framebufferScale, foveation, fps: Math.round(fps * 10) / 10, targetFps: getFrameRate(), pending, auto: qm.auto };
+    },
+    get profile() {
+      return profile;
+    },
+    get foveation() {
+      return foveation;
+    },
+    get framebufferScale() {
+      return framebufferScale;
+    },
+  };
 }

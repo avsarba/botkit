@@ -11,8 +11,22 @@
 // They are compiled without blocking before the fish appears (compileAsync), and kept alive between
 // catches by tiny never-drawn stand-ins (the fish's materials are disposed on hide(), which would
 // otherwise delete the programs and make every catch compile them again).
+//
+// VR (setXR(true, { holdGrip })): show() puts the high-detail fish in the hold grip (the reel hand) at
+// real size, held by the lower jaw, the body hanging under its own weight (a damped pendulum from the
+// jaw that swings when the hand moves, twisting with the wrist so the flank faces the eyes), gently
+// flexing and breathing. It is part of the lake scene, lit by its sun, sky and environment map (the
+// same programs as the hooked fish), so render() draws nothing: no overlay pass, no depth clear.
 import * as THREE from 'three';
-import { clamp, damp, lerp, smoothstep } from '../config.js';
+import { DOCK, clamp, damp, lerp, smoothstep } from '../config.js';
+
+// VR hold
+const XR_JAW_GRIP = new THREE.Vector3(0, 0.012, -0.075); // grip space: thumb / index pinch just ahead of the fist
+const XR_JAW_CAMERA = new THREE.Vector3(-0.17, -0.32, -0.42); // camera space: when no grip was given
+const XR_EXHAUSTION = 0.35; // tired, not spent: slow fins, gills working, a slight roll
+const XR_JAW_STIFF = 18; // 1/s^2: the gripped jaw's resistance to swinging, on top of gravity
+const XR_DAMP = 0.32; // share of critical damping of the swing
+const XR_FLOOR_CLEAR = 0.05; // m: the tail stays this far above the deck (long fish lean out instead)
 
 // Bottom sheet vs side panel: the same rule as the card's CSS (width <= 720 px unless <= 520 px tall, or
 // aspect <= 0.85). Only used when the UI can't report the card's rect.
@@ -272,8 +286,218 @@ export function createShowcase({ renderer, camera, createFishMesh, getCatchRect 
     }
   }
 
+  // ---- VR: the fish held in the hand ------------------------------------------------------------
+  let xrOn = false;
+  let xrAuto = false; // switched on by update() because a session presents and nobody called setXR
+  let xrGrip = null;
+  let lastShow = null; // { species, lengthCm, opts } of the fish up now (re-shown on a mode switch)
+  const xrHang = new THREE.Group(); // the jaw pinch point; its world axes are the fish's
+  xrHang.name = 'showcase-xr-hold';
+  const xrJaw = new THREE.Vector3(); // pinch point on the fish (fish space)
+  const X = {
+    init: false,
+    a: new THREE.Vector3(), // jaw (world)
+    aPrev: new THREE.Vector3(),
+    c: new THREE.Vector3(), // body point one lever arm down the body (world)
+    vc: new THREE.Vector3(),
+    d: new THREE.Vector3(0, -1, 0), // jaw -> tail (world, unit)
+    dPrev: new THREE.Vector3(0, -1, 0),
+    side: new THREE.Vector3(0, 0, 1), // the fish's +X (left flank normal), world
+    wrigT: 0,
+    wrigNext: 2.5,
+    wrigSign: 1,
+  };
+  const _xp = new THREE.Vector3();
+  const _xq = new THREE.Quaternion();
+  const _xs = new THREE.Vector3();
+  const _xq2 = new THREE.Quaternion();
+  const _xm = new THREE.Matrix4();
+  const _t = new THREE.Vector3();
+  const _f = new THREE.Vector3();
+  const _u = new THREE.Vector3();
+  const _y = new THREE.Vector3();
+  const _z = new THREE.Vector3();
+  const _va = new THREE.Vector3();
+  const _ai = new THREE.Vector3();
+  const _co = new THREE.Vector3();
+  const _w = new THREE.Vector3();
+  const _cam = new THREE.Vector3();
+
+  function holdParent() {
+    return xrGrip || camera;
+  }
+
+  function showXR(species, lengthCm, opts) {
+    const q = opts.quality || 'high';
+    // the hooked fish's settings: same programs as the fight model that was just in the lake
+    const handle = createFishMesh(species, lengthCm, { detail: 'high', quality: q, seed: opts.seed, girth: opts.girth, castShadow: q !== 'low' });
+    fish = handle;
+    const o = handle.object3d;
+    lengthM = (o.userData && o.userData.lengthM) || lengthCm / 100;
+    // lower lip, just behind the snout tip and below the snout axis
+    xrJaw.set(0, -0.03 * lengthM, -0.025 * lengthM);
+    o.position.copy(xrJaw).negate();
+    xrHang.add(o);
+    xrHang.position.copy(xrGrip ? XR_JAW_GRIP : XR_JAW_CAMERA);
+    holdParent().add(xrHang);
+    X.init = false;
+    X.wrigT = 0;
+    X.wrigNext = 1.5 + Math.random() * 2;
+    t = 0;
+    appear = 1;
+    ready = true;
+    showToken++;
+  }
+
+  // One frame of the hold: jaw from the grip pose (three updated it for this XR frame before the
+  // loop), body direction from a damped pendulum, twist from the wrist, then the fish's own flex.
+  function updateXR(dt) {
+    const parent = xrHang.parent;
+    if (!parent || !fish) return;
+    parent.updateWorldMatrix(true, false);
+    parent.matrixWorld.decompose(_xp, _xq, _xs);
+    const a = X.a.copy(xrHang.position).applyMatrix4(parent.matrixWorld);
+    _f.set(0, 0, -1).applyQuaternion(_xq); // grip forward (along the fist)
+    _u.set(0, 1, 0).applyQuaternion(_xq); // grip up
+    const L = Math.max(0.05, lengthM);
+    const lc = 0.45 * L; // lever arm: jaw -> centre of mass
+
+    // where the body wants to hang: gravity, a little of the gripped jaw's own direction, and never
+    // through the deck (a long fish held low leans out, away from the angler)
+    _t.set(0, -1, 0).addScaledVector(_u, -0.35).normalize();
+    let floorY = DOCK.deckY;
+    const rig = xrGrip && xrGrip.parent;
+    if (rig && !rig.isScene) floorY = _co.setFromMatrixPosition(rig.matrixWorld).y;
+    const hmax = clamp((a.y - floorY - XR_FLOOR_CLEAR) / L, 0, 1);
+    if (-_t.y > hmax) {
+      _w.set(_t.x, 0, _t.z);
+      if (_w.lengthSq() < 1e-6) {
+        _cam.setFromMatrixPosition(camera.matrixWorld);
+        _w.set(a.x - _cam.x, 0, a.z - _cam.z);
+        if (_w.lengthSq() < 1e-6) _w.set(-_f.x, 0, -_f.z);
+        if (_w.lengthSq() < 1e-6) _w.set(0, 0, -1);
+      }
+      _w.normalize().multiplyScalar(Math.sqrt(1 - hmax * hmax));
+      _t.set(_w.x, -hmax, _w.z);
+    }
+
+    if (!X.init || a.distanceToSquared(X.aPrev) > 0.36) {
+      // first frame (or a jump: snap turn, tracking loss): hang straight, no swing
+      X.init = true;
+      X.c.copy(a).addScaledVector(_t, lc);
+      X.vc.set(0, 0, 0);
+      X.aPrev.copy(a);
+      X.d.copy(_t);
+      X.dPrev.copy(_t);
+      _co.set(-_f.x, -_f.y, -_f.z);
+      X.side.copy(_co).addScaledVector(X.d, -_co.dot(X.d));
+      if (X.side.lengthSq() < 1e-6) X.side.crossVectors(X.d, Math.abs(X.d.y) < 0.9 ? _w.set(0, 1, 0) : _w.set(1, 0, 0));
+      X.side.normalize();
+    }
+    X.dPrev.copy(X.d);
+    if (dt > 0) {
+      // pendulum: gravity (g / lever) plus the jaw's stiffness toward _t; the hand's motion drags the
+      // jaw and the body lags behind it (position-based constraint keeps the lever length)
+      const K = 9.81 / lc + XR_JAW_STIFF;
+      const C = XR_DAMP * 2 * Math.sqrt(K);
+      const n = Math.min(4, Math.max(1, Math.ceil(dt / 0.017)));
+      const h = dt / n;
+      _va.subVectors(a, X.aPrev).divideScalar(dt);
+      for (let i = 1; i <= n; i++) {
+        _ai.lerpVectors(X.aPrev, a, i / n);
+        _co.copy(X.c);
+        _w.copy(_ai).addScaledVector(_t, lc).sub(X.c).multiplyScalar(K); // spring
+        _w.addScaledVector(_va, C).addScaledVector(X.vc, -C); // damping of the relative motion
+        X.vc.addScaledVector(_w, h);
+        X.c.addScaledVector(X.vc, h);
+        _w.subVectors(X.c, _ai);
+        const len = _w.length();
+        if (len > 1e-6) X.c.copy(_ai).addScaledVector(_w, lc / len);
+        else X.c.copy(_ai).addScaledVector(_t, lc);
+        X.vc.subVectors(X.c, _co).divideScalar(h);
+      }
+      X.aPrev.copy(a);
+      X.d.subVectors(X.c, a);
+      if (X.d.lengthSq() > 1e-10) X.d.normalize();
+      else X.d.copy(_t);
+    }
+    const d = X.d;
+
+    // twist: the left flank toward the angler, turning with the wrist (the gripped jaw can't spin);
+    // a bit of the last frame's side keeps it steady when the fist points along the body
+    _co.set(-_f.x, -_f.y, -_f.z);
+    _co.addScaledVector(d, -_co.dot(d));
+    _w.copy(X.side).addScaledVector(d, -X.side.dot(d));
+    _co.addScaledVector(_w, 0.15);
+    if (_co.lengthSq() > 1e-8) {
+      _co.normalize();
+      const k = dt > 0 ? 1 - Math.exp(-14 * dt) : 1;
+      X.side.lerp(_co, k);
+    }
+    X.side.addScaledVector(d, -X.side.dot(d));
+    if (X.side.lengthSq() < 1e-8) X.side.crossVectors(d, Math.abs(d.y) < 0.9 ? _w.set(0, 1, 0) : _w.set(1, 0, 0)); // any perpendicular
+    X.side.normalize();
+
+    // fish axes (world): +Z snout (up the body), +X left flank, +Y dorsal
+    _z.copy(d).negate();
+    _y.crossVectors(_z, X.side).normalize();
+    _xm.makeBasis(X.side, _y, _z);
+    _xq2.setFromRotationMatrix(_xm);
+    xrHang.quaternion.copy(_xq).invert().multiply(_xq2);
+
+    // flex: the tail lags a swing (bend against the swing's rate about the dorsal axis), and now and
+    // then the fish wriggles in the hand
+    let speed = 0.05;
+    let turn = 0;
+    if (dt > 0) {
+      _w.crossVectors(X.dPrev, d).divideScalar(dt);
+      turn = clamp(-_w.dot(_y) * 0.9, -3, 3);
+      X.wrigNext -= dt;
+      if (X.wrigNext <= 0) {
+        X.wrigT = 0.9;
+        X.wrigNext = 3.5 + Math.random() * 5;
+        X.wrigSign = Math.random() < 0.5 ? -1 : 1;
+      }
+      if (X.wrigT > 0) {
+        X.wrigT = Math.max(0, X.wrigT - dt);
+        const k = Math.sin(Math.PI * (1 - X.wrigT / 0.9));
+        speed += 0.85 * k;
+        turn += X.wrigSign * 2.2 * k * Math.sin(t * 13);
+      }
+    }
+    t += dt;
+    fish.update(dt, speed, turn, XR_EXHAUSTION);
+  }
+
+  // on: VR presents. holdGrip: the controller grip (an Object3D in the scene, e.g. the reel hand's
+  // renderer.xr.getControllerGrip(i), a child of the player rig) the fish is held in; without one it
+  // hangs from a point low in front of the camera. A fish that is up is shown again in the new mode.
+  function setXR(on, opts = {}) {
+    setXRMode(!!on, on && opts && opts.holdGrip && opts.holdGrip.isObject3D ? opts.holdGrip : null);
+    xrAuto = false;
+  }
+  function setXRMode(on, grip) {
+    if (on === xrOn && grip === xrGrip) return;
+    const again = lastShow;
+    if (fish) hide();
+    xrOn = on;
+    xrGrip = on ? grip : null;
+    xrHang.removeFromParent();
+    if (!again) return;
+    try {
+      show(again.species, again.lengthCm, again.opts);
+    } catch (err) {
+      console.warn('[showcase] re-show after a VR switch failed', err);
+    }
+  }
+
   function show(species, lengthCm, opts = {}) {
     hide();
+    lastShow = { species, lengthCm, opts: opts || {} };
+    if (xrOn) {
+      showXR(species, lengthCm, opts || {});
+      return;
+    }
     const handle = createFishMesh(species, lengthCm, { detail: 'high', quality: opts.quality || 'high', seed: opts.seed, girth: opts.girth });
     fish = handle;
     const o = handle.object3d;
@@ -318,16 +542,21 @@ export function createShowcase({ renderer, camera, createFishMesh, getCatchRect 
   }
 
   function hide() {
+    lastShow = null;
     if (!fish) return;
     showToken++;
-    try {
-      keepPrograms(fish.object3d);
-    } catch (err) {
-      console.warn('[showcase] keeping programs failed', err);
+    // (VR: the fish drew with the lake's programs, which the fish system keeps alive)
+    if (!xrOn) {
+      try {
+        keepPrograms(fish.object3d);
+      } catch (err) {
+        console.warn('[showcase] keeping programs failed', err);
+      }
     }
     fish.dispose();
     fish = null;
     ready = true;
+    xrHang.removeFromParent();
   }
 
   function syncEnvironment(env, scene0) {
@@ -374,6 +603,20 @@ export function createShowcase({ renderer, camera, createFishMesh, getCatchRect 
   // env: the Environment module (sun, sky light, environment map, exposure).
   function update(dt, env, scene0) {
     syncEnvironment(env, scene0); // every frame, so a compile at show() uses the same environment
+    // safety net: a session presents but nobody called setXR -> hold the fish in front of the camera
+    // rather than drawing the desktop overlay into the headset
+    const presenting = !!(renderer.xr && renderer.xr.isPresenting);
+    if (presenting && !xrOn) {
+      setXRMode(true, null);
+      xrAuto = true;
+    } else if (!presenting && xrOn && xrAuto) {
+      setXRMode(false, null);
+      xrAuto = false;
+    }
+    if (xrOn) {
+      if (fish) updateXR(Number.isFinite(dt) ? Math.min(Math.max(dt, 0), 0.1) : 0);
+      return;
+    }
     if (!fish) {
       if (!prewarmTried && standInFactory && scene.environment) prewarm();
       return;
@@ -395,7 +638,7 @@ export function createShowcase({ renderer, camera, createFishMesh, getCatchRect 
   }
 
   function render() {
-    if (!fish || !ready) return;
+    if (xrOn || !fish || !ready) return; // VR: the fish is part of the lake scene, drawn with it
     const auto = renderer.autoClear;
     renderer.autoClear = false;
     renderer.clearDepth();
@@ -409,14 +652,23 @@ export function createShowcase({ renderer, camera, createFishMesh, getCatchRect 
     update,
     render,
     prewarm,
+    setXR,
+    get xr() {
+      return xrOn;
+    },
     get active() {
       return !!fish;
     },
     get object() {
       return fish ? fish.object3d : null;
     },
-    // debugging / tests: where and how big the fish is framed (CSS px)
+    // debugging / tests: where and how big the fish is framed (CSS px); in VR where it hangs (world)
     get framing() {
+      if (xrOn) {
+        const o = fish ? fish.object3d : null;
+        const p = o ? o.getWorldPosition(new THREE.Vector3()) : null;
+        return { mode: 'xr', lengthM, ready, jaw: X.a.toArray(), snout: p ? p.toArray() : null, bodyDir: X.d.toArray(), grip: !!xrGrip };
+      }
       return { ...frameInfo, lengthM, ready };
     },
     scene,

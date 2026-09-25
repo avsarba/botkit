@@ -256,6 +256,24 @@ export function createRope(n, material, { renderOrder = 12, subdiv = 1 } = {}) {
         prev[o + 2] += dz * w;
       }
     },
+    // Carry the free points near the start (the rod tip) along with a jump of the start by d, fading out
+    // over `span` meters of line (velocity kept): a VR snap turn moves the tip ~1 m in one frame.
+    shiftNearStart(dx, dy, dz, span) {
+      refreshCum();
+      for (let i = 1; i < n; i++) {
+        const f = cum[i] / Math.max(1e-6, span);
+        if (f >= 1) break;
+        if (pinned[i]) continue;
+        const w = (1 - f) * (1 - f);
+        const o = i * 3;
+        pos[o] += dx * w;
+        pos[o + 1] += dy * w;
+        pos[o + 2] += dz * w;
+        prev[o] += dx * w;
+        prev[o + 1] += dy * w;
+        prev[o + 2] += dz * w;
+      }
+    },
     // opts: { wind: Vector3 (m/s), water, env, iterations, airDrag, waterSurfaceOffset }
     step(dt, opts) {
       if (!(dt > 0)) return;

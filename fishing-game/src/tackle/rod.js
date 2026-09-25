@@ -783,6 +783,19 @@ export function createRod({ quality = 'high' } = {}) {
     knob.translate(-0.0158, 0, 0.0465);
     crank.add(new THREE.Mesh(knob, M.knob));
   }
+  // handle knob center in crank space (the knob spans x -0.0158 .. -0.034 at z 0.0465)
+  const knobLocal = V(-0.025, 0, 0.0465);
+  const CRANK_X = crank.position.x;
+  // Spinning reels take the handle on either side: 'left' (default, rod in the right hand) or 'right'
+  // (rod in the left hand, the handle turned by the right hand). The handle is mirrored across the reel.
+  let crankSide = 'left';
+  function setCrankSide(side) {
+    const s = side === 'right' ? 'right' : 'left';
+    if (s === crankSide) return;
+    crankSide = s;
+    crank.position.x = s === 'right' ? -CRANK_X : CRANK_X;
+    crank.scale.x = s === 'right' ? -1 : 1;
+  }
 
   // in-rod line path helpers (rod-local)
   const _r = new THREE.Vector3();
@@ -845,6 +858,14 @@ export function createRod({ quality = 'high' } = {}) {
     guideLocal, // 6 guides + tip-top ring centers, deformed, rod-local
     lineExitLocal,
     animateReel,
+    // reel handle (rotates about its local X axis; crank.rotation.x = -handleAngle), knob center in crank space
+    reel,
+    crank,
+    knobLocal,
+    setCrankSide,
+    get crankSide() {
+      return crankSide;
+    },
     setEnvMap,
     setEnvIntensity,
     dispose() {

@@ -7,6 +7,7 @@
 import * as THREE from 'three';
 
 const TWO_PI = Math.PI * 2;
+const XR_MARGIN = 0.12; // rad: a fast head turn (~500 deg/s at 72 Hz) between an XR frame's update and render
 const _dir = new THREE.Vector3();
 const _pos = new THREE.Vector3();
 
@@ -63,7 +64,11 @@ export function createSectorCuller() {
       const a0 = -Math.PI + (s / S) * TWO_PI;
       items.push({ obj, a0, a1: a0 + TWO_PI / S, b: elevationRange(obj) });
     },
-    update(camera) {
+    // xr: an XR session is presenting. `camera` is then the user camera three keeps on the head pose
+    // (updated at render time, so one frame old here) with the stereo union projection, while its
+    // .aspect is still the desktop canvas's. The cone comes from the projection instead, as a circle
+    // of the half-diagonal (the head can roll) plus a margin for head turns between frames.
+    update(camera, xr = false) {
       if (!camera || !items.length) return;
       camera.getWorldPosition(_pos);
       const all = Math.hypot(_pos.x, _pos.z) > 6;
@@ -75,14 +80,26 @@ export function createSectorCuller() {
         camera.getWorldDirection(_dir);
         azC = Math.atan2(_dir.x, -_dir.z);
         const pitch = Math.asin(Math.max(-1, Math.min(1, _dir.y)));
-        const vHalf = THREE.MathUtils.degToRad((camera.fov || 60) * 0.5);
-        const hHalf = Math.atan(Math.tan(vHalf) * (camera.aspect || 1.78));
-        const e = Math.abs(pitch) + vHalf;
-        // horizontal half-angle, widened toward the top/bottom rows (+ margin: crowns overhang
-        // sector edges); steep views can see every azimuth near the feet
-        if (e < 1.4) half = Math.atan(Math.tan(hHalf) / Math.cos(e)) + 0.2;
-        elTop = pitch + vHalf + 0.08;
-        elBot = pitch - vHalf - 0.08;
+        if (xr) {
+          // circular cone of radius r around the view direction: its exact azimuth extent
+          const pm = camera.projectionMatrix.elements;
+          const tH = pm[0] > 1e-6 ? (1 + Math.abs(pm[8])) / pm[0] : 3;
+          const tV = pm[5] > 1e-6 ? (1 + Math.abs(pm[9])) / pm[5] : 3;
+          const r = Math.min(1.45, Math.atan(Math.hypot(tH, tV)) + XR_MARGIN);
+          const cp = Math.cos(pitch);
+          if (cp > Math.sin(r) + 0.02) half = Math.asin(Math.sin(r) / cp) + 0.2;
+          elTop = pitch + r + 0.08;
+          elBot = pitch - r - 0.08;
+        } else {
+          const vHalf = THREE.MathUtils.degToRad((camera.fov || 60) * 0.5);
+          const hHalf = Math.atan(Math.tan(vHalf) * (camera.aspect || 1.78));
+          const e = Math.abs(pitch) + vHalf;
+          // horizontal half-angle, widened toward the top/bottom rows (+ margin: crowns overhang
+          // sector edges); steep views can see every azimuth near the feet
+          if (e < 1.4) half = Math.atan(Math.tan(hHalf) / Math.cos(e)) + 0.2;
+          elTop = pitch + vHalf + 0.08;
+          elBot = pitch - vHalf - 0.08;
+        }
       }
       for (let i = 0; i < items.length; i++) {
         const it = items[i];

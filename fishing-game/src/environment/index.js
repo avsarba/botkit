@@ -22,6 +22,7 @@ const MOON_COLOR = new THREE.Color(0.6, 0.71, 1.0);
 const SHADOW_HALF = 25; // meters around the dock
 const SHADOW_TARGET = new THREE.Vector3(0, 0, 7);
 const SHADOW_SIZE = { high: 2048, medium: 1024, low: 512 };
+const XR_SHADOW_MAX = 1024; // XR.md "Rendering while presenting"
 // skyline (terrain + treeline elevation seen from the dock) for sun / moon occlusion
 const SKY_BINS = 1440; // 0.25 deg azimuth bins; azimuth = atan2(x, -z) (0 = out over the lake)
 const EYE_Y = DOCK.deckY + PLAYER.eyeHeight;
@@ -89,10 +90,12 @@ export function createEnvironment(ctx) {
   const tuLift = terrain.uniforms;
   // cull the main-view terrain tiles against the main camera just before three builds its render
   // list (scene.onBeforeRender runs after the matrices update, before projection); other passes
-  // (reflection, depth pre-pass) draw their own proxy / wet tiles with three's culling
+  // (reflection, depth pre-pass) draw their own proxy / wet tiles with three's culling. While an XR
+  // session presents, three swaps the main camera for its stereo ArrayCamera (world pose + a frustum
+  // that contains both eyes) before this hook: cull against that one, with this frame's head pose.
   const prevSceneBeforeRender = scene.onBeforeRender;
   scene.onBeforeRender = function (r, s, cam, rt) {
-    if (cam === camera) terrain.cull(cam);
+    if (cam === camera || (cam && cam.isArrayCamera && renderer.xr && renderer.xr.isPresenting && cam === renderer.xr.getCamera())) terrain.cull(cam);
     if (typeof prevSceneBeforeRender === 'function') prevSceneBeforeRender.call(this, r, s, cam, rt);
   };
 
@@ -127,9 +130,10 @@ export function createEnvironment(ctx) {
   // lit program's cache key and recompiles ~two dozen programs mid-play. 'low' instead uses a
   // small map that is re-rendered every other frame (the casters are the static dock plus fish).
   let throttleShadow = false;
+  let xrActive = false; // an XR session is presenting: shadow maps are capped at XR_SHADOW_MAX
   function applyShadowQuality(q) {
     sunLight.castShadow = true;
-    const size = SHADOW_SIZE[q] || SHADOW_SIZE.high;
+    const size = Math.min(SHADOW_SIZE[q] || SHADOW_SIZE.high, xrActive ? XR_SHADOW_MAX : Infinity);
     if (sunLight.shadow.mapSize.x !== size) {
       sunLight.shadow.mapSize.set(size, size);
       if (sunLight.shadow.map) {
@@ -318,10 +322,21 @@ export function createEnvironment(ctx) {
     const glow = su.uMoonGlow.value;
     glowBackup.copy(glow);
     glow.setRGB(0, 0, 0);
-    cubeCamera.update(renderer, envScene);
-    su.uSunDisk.value = 1;
-    glow.copy(glowBackup);
-    envRT = pmrem.fromCubemap(cubeRT.texture, envRT);
+    // Off-screen: with XR on, renderer.render() would draw through the headset's stereo camera into
+    // the headset's framebuffer. CubeCamera and PMREMGenerator switch it off themselves in three
+    // 0.170; this guard keeps the bake safe whatever three does, and restores the render target.
+    const prevXr = renderer.xr.enabled;
+    const prevRT = renderer.getRenderTarget();
+    renderer.xr.enabled = false;
+    try {
+      cubeCamera.update(renderer, envScene);
+      envRT = pmrem.fromCubemap(cubeRT.texture, envRT);
+    } finally {
+      renderer.xr.enabled = prevXr;
+      renderer.setRenderTarget(prevRT);
+      su.uSunDisk.value = 1;
+      glow.copy(glowBackup);
+    }
     api.envMap = envRT.texture;
     scene.environment = envRT.texture;
     bakedHours = currentHours;
@@ -553,6 +568,12 @@ export function createEnvironment(ctx) {
     maybeBake();
     const fq = frame && frame.quality;
     if ((fq === 'high' || fq === 'medium' || fq === 'low') && fq !== runtimeQuality) applyRuntimeQuality(fq);
+    // entering / leaving VR: cap (or restore) the shadow map size
+    const xrNow = !!(renderer.xr && renderer.xr.isPresenting);
+    if (xrNow !== xrActive) {
+      xrActive = xrNow;
+      applyShadowQuality(runtimeQuality);
+    }
     if (throttleShadow && (shadowTick++ & 1) === 0) sunLight.shadow.needsUpdate = true;
     // wind: slow gusts and a gently veering direction
     // (gusts scale with the breeze: light airs stay light, so the calm at dawn and dusk stays glassy)
@@ -675,6 +696,15 @@ export function createEnvironment(ctx) {
     sunOccluder,
     // skyline elevation (radians above the eye's horizontal) at azimuth atan2(x, -z)
     skylineElevationAt: (az) => (Number.isFinite(az) ? skylineAt(az) : 0),
+    // what forms that skyline: out.height = its top (world y, m), out.distance = its distance from the
+    // dock (m). The water's no-reflection path (VR) mirrors the treeline from it.
+    skylineOccluderAt(az, out = {}) {
+      const a = Number.isFinite(az) ? az : 0;
+      const d = skyDistAt(a);
+      out.distance = d;
+      out.height = EYE_Y + d * Math.tan(clamp(skylineAt(a), -1.4, 1.4));
+      return out;
+    },
     // Scenery hands over the skyline of what it built: { bins, elevation: Float32Array } with
     // bin k covering azimuths [-pi + 2 pi k / bins, ...). Resampled to SKY_BINS if needed.
     setSkylineProfile(p) {

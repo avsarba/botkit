@@ -112,37 +112,43 @@ function captureImpostors(renderer, templates, atlas) {
   const prevRT = renderer.getRenderTarget();
   const prevAuto = renderer.autoClear;
   const prevShadow = renderer.shadowMap.autoUpdate;
+  const prevXr = renderer.xr.enabled; // off-screen bake: never through the headset's stereo camera
+  renderer.xr.enabled = false;
   renderer.shadowMap.autoUpdate = false;
-  const cols = CAP.size / CAP.cw;
-  templates.forEach((t, i) => {
-    const cx = (i % cols) * CAP.cw;
-    const cy = Math.floor(i / cols) * CAP.ch;
-    const span = Math.max(t.height + 0.7, t.halfWidth * 4.1);
-    t.span = span;
-    t.w = span / 2;
-    t.h = span;
-    t.y0 = t.height + 0.1 - span;
-    t.cell = [cx / CAP.size, cy / CAP.size, CAP.cw / CAP.size, CAP.ch / CAP.size];
-    cam.left = -span / 4;
-    cam.right = span / 4;
-    cam.top = t.height + 0.1;
-    cam.bottom = t.height + 0.1 - span;
-    cam.updateProjectionMatrix();
-    rt.viewport.set(cx, cy, CAP.cw, CAP.ch);
-    rt.scissor.set(cx, cy, CAP.cw, CAP.ch);
-    rt.scissorTest = true;
-    renderer.setRenderTarget(rt);
-    renderer.autoClear = false;
-    renderer.clearDepth();
-    clearMat.uniforms.uAvg.value.set(t.avg[0], t.avg[1], t.avg[2]);
-    renderer.render(clearScene, cam);
-    mesh.geometry = t.geometry;
-    renderer.render(scene, cam);
-  });
-  rt.scissorTest = false;
-  renderer.setRenderTarget(prevRT);
-  renderer.autoClear = prevAuto;
-  renderer.shadowMap.autoUpdate = prevShadow;
+  try {
+    const cols = CAP.size / CAP.cw;
+    templates.forEach((t, i) => {
+      const cx = (i % cols) * CAP.cw;
+      const cy = Math.floor(i / cols) * CAP.ch;
+      const span = Math.max(t.height + 0.7, t.halfWidth * 4.1);
+      t.span = span;
+      t.w = span / 2;
+      t.h = span;
+      t.y0 = t.height + 0.1 - span;
+      t.cell = [cx / CAP.size, cy / CAP.size, CAP.cw / CAP.size, CAP.ch / CAP.size];
+      cam.left = -span / 4;
+      cam.right = span / 4;
+      cam.top = t.height + 0.1;
+      cam.bottom = t.height + 0.1 - span;
+      cam.updateProjectionMatrix();
+      rt.viewport.set(cx, cy, CAP.cw, CAP.ch);
+      rt.scissor.set(cx, cy, CAP.cw, CAP.ch);
+      rt.scissorTest = true;
+      renderer.setRenderTarget(rt);
+      renderer.autoClear = false;
+      renderer.clearDepth();
+      clearMat.uniforms.uAvg.value.set(t.avg[0], t.avg[1], t.avg[2]);
+      renderer.render(clearScene, cam);
+      mesh.geometry = t.geometry;
+      renderer.render(scene, cam);
+    });
+  } finally {
+    rt.scissorTest = false;
+    renderer.setRenderTarget(prevRT);
+    renderer.autoClear = prevAuto;
+    renderer.shadowMap.autoUpdate = prevShadow;
+    renderer.xr.enabled = prevXr;
+  }
   mat.dispose();
   clearMat.dispose();
   clearQuad.geometry.dispose();

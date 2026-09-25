@@ -121,7 +121,8 @@ export function createScenery(ctx) {
       if (frame && (frame.quality === 'low' || frame.quality === 'medium' || frame.quality === 'high')) applyRuntimeQuality(frame.quality);
       syncShared(frame);
       syncEnvMap();
-      culler.update((frame && frame.camera) || ctx.camera);
+      const xr = !!(ctx.renderer && ctx.renderer.xr && ctx.renderer.xr.isPresenting);
+      culler.update((frame && frame.camera) || ctx.camera, xr);
       for (let i = 0; i < parts.length; i++) parts[i].update(frame);
     },
     dockTopAt: dock.dockTopAt,

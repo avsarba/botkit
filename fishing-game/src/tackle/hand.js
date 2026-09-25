@@ -37,12 +37,18 @@ function fabricBump() {
 const P = (phi, r, y) => new THREE.Vector3(Math.cos(phi) * r, y, -Math.sin(phi) * r);
 const D = Math.PI / 180;
 
-export function createHand({ quality = 'high' } = {}) {
+// arm: true (desktop view model) runs the forearm and jacket cuff back along the rear grip; arm: false
+// (VR, where the player's own arm is tracked by the controller) ends the glove in a short cuff at the wrist,
+// pointing roughly the way a real forearm leaves a hand that holds a controller (grip +Y/+Z between).
+// materials: another hand's `materials` array to share (same look and shader programs; this hand's
+// dispose() then leaves them alone).
+export function createHand({ quality = 'high', arm = true, materials = null } = {}) {
   const radial = quality === 'low' ? 7 : 10;
-  const bump = fabricBump();
-  const glove = new THREE.MeshStandardMaterial({ color: 0x3d423b, roughness: 0.78, metalness: 0, bumpMap: bump, bumpScale: 1.2 });
-  const palmPatch = new THREE.MeshStandardMaterial({ color: 0x252825, roughness: 0.7, bumpMap: bump, bumpScale: 0.8 });
-  const sleeve = new THREE.MeshStandardMaterial({ color: 0x263240, roughness: 0.9, bumpMap: bump, bumpScale: 1.6 });
+  const shared = Array.isArray(materials) && materials.length >= 3;
+  const bump = shared ? null : fabricBump();
+  const glove = shared ? materials[0] : new THREE.MeshStandardMaterial({ color: 0x3d423b, roughness: 0.78, metalness: 0, bumpMap: bump, bumpScale: 1.2 });
+  const palmPatch = shared ? materials[1] : new THREE.MeshStandardMaterial({ color: 0x252825, roughness: 0.7, bumpMap: bump, bumpScale: 0.8 });
+  const sleeve = shared ? materials[2] : new THREE.MeshStandardMaterial({ color: 0x263240, roughness: 0.9, bumpMap: bump, bumpScale: 1.6 });
   const parts = [];
   const RH = 0.0108; // handle radius under the fingers
 
@@ -118,8 +124,27 @@ export function createHand({ quality = 'high' } = {}) {
     });
   }
 
-  // wrist and forearm running back along the rear grip, then the jacket cuff
-  {
+  if (!arm) {
+    // gloved wrist + cuff (rod-local direction toward the elbow when the rod sits in a VR controller grip)
+    // (between a forearm in line with the controller's ray and one held level at the nominal rod pose)
+    const d = new THREE.Vector3(0.12, -0.75, 0.65).normalize();
+    const p0 = new THREE.Vector3(0.024, -0.034, 0.005);
+    const pts = [];
+    for (let i = 0; i <= 6; i++) pts.push(p0.clone().addScaledVector(d, 0.072 * (i / 6)));
+    parts.push({
+      geometry: sweepTube(
+        pts,
+        (i, t) => {
+          const cuff = smoothstep(0.6, 0.8, t);
+          return 0.0228 + 0.003 * t + 0.0035 * cuff;
+        },
+        radial + 2,
+        { capStart: true, capEnd: true }
+      ),
+      group: 0,
+    });
+  } else {
+    // wrist and forearm running back along the rear grip, then the jacket cuff
     const pts = [];
     for (let i = 0; i <= 10; i++) {
       const t = i / 10;
@@ -148,6 +173,7 @@ export function createHand({ quality = 'high' } = {}) {
     materials: [glove, palmPatch, sleeve],
     dispose() {
       merged.dispose();
+      if (shared) return;
       bump.dispose();
       glove.dispose();
       palmPatch.dispose();

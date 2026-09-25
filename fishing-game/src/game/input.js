@@ -13,6 +13,9 @@
 //  - when the pointer leaves the canvas for good (out of the page), it moves to NEUTRAL, which maps to
 //    a neutral rod-up pose, instead of freezing wherever the pointer crossed the edge.
 // `pointer.inside` is true whenever those values are meaningful for mouse play.
+//
+// suspend(true) (a VR session is presenting: the controllers are the input) releases every hold and ignores
+// canvas presses, Space and the steering keys until suspend(false); other key shortcuts (M, J, Esc...) still work.
 import { clamp } from '../config.js';
 
 const DEAD_X = 0.34; // fraction of the half-width around the centre where the view holds still
@@ -37,6 +40,7 @@ export function createInput({ canvas, handlers }) {
   let spaceHeld = false;
   let shift = false;
   let lastType = 'mouse';
+  let suspended = false;
   let guard = false; // pointer over / near a HUD control
   const anchor = { nx: 0, ny: 0 };
   let edgeSince = -1;
@@ -165,6 +169,7 @@ export function createInput({ canvas, handlers }) {
   }
 
   function onPointerDown(e) {
+    if (suspended) return;
     if (mouseLike(e)) {
       lastType = 'mouse';
       if (e.button !== 0) return;
@@ -261,6 +266,7 @@ export function createInput({ canvas, handlers }) {
   let wheelAcc = 0;
   function onWheel(e) {
     e.preventDefault();
+    if (suspended) return;
     wheelAcc += e.deltaMode === 1 ? e.deltaY * 40 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
     while (Math.abs(wheelAcc) >= 60) {
       const s = Math.sign(wheelAcc);
@@ -285,6 +291,7 @@ export function createInput({ canvas, handlers }) {
     if (isTyping(e.target)) return;
     shift = e.shiftKey;
     if (isSpace(e)) {
+      if (suspended) return;
       if (spaceOwnedByControl(e.target)) return;
       if (handlers.isModalOpen && handlers.isModalOpen()) return;
       e.preventDefault(); // also keeps a focused HUD button from being pressed
@@ -297,7 +304,7 @@ export function createInput({ canvas, handlers }) {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     const code = e.code || '';
     if (/^(KeyA|KeyD|KeyW|KeyS|ArrowLeft|ArrowRight|ArrowUp|ArrowDown)$/.test(code)) {
-      if (handlers.isModalOpen && handlers.isModalOpen()) return;
+      if (suspended || (handlers.isModalOpen && handlers.isModalOpen())) return;
       keys.add(code);
       if (code.startsWith('Arrow')) e.preventDefault();
       return;
@@ -424,6 +431,19 @@ export function createInput({ canvas, handlers }) {
       invalidateRects();
     },
     releaseAll,
+    // VR: the controllers take over (see the header)
+    suspend(on) {
+      on = !!on;
+      if (on === suspended) return;
+      if (on) releaseAll();
+      suspended = on;
+      pointer.armed = false;
+      edgeSince = -1;
+      invalidateRects();
+    },
+    get suspended() {
+      return suspended;
+    },
     get touchActive() {
       return touch.id !== null;
     },

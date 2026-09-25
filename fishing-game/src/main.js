@@ -139,6 +139,8 @@ async function boot(data = {}) {
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.info.autoReset = false; // water renders extra passes; core resets once per frame
+  // WebXR (XR.md): always on (cheap when not presenting); sessions start from the Enter VR button
+  renderer.xr.enabled = true;
   const canvas = renderer.domElement;
   canvas.style.opacity = '0';
   canvas.style.transition = 'opacity 1.6s ease';
@@ -156,7 +158,7 @@ async function boot(data = {}) {
   // ---- game core + UI first, so the title is interactive-looking and shows progress
   const save = loadSave();
   const quality = pickInitialQuality(save);
-  const game = createGame({ renderer, scene, camera, events, save, hotData: data || {}, quality });
+  const game = createGame({ renderer, scene, camera, events, save, hotData: data || {}, quality, species: SPECIES });
   const ui = createUI({
     events,
     handlers: game.handlers,

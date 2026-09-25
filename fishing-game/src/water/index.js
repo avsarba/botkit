@@ -121,6 +121,8 @@ export function createWater(ctx) {
     uReflTexel: { value: new THREE.Vector2(1 / 512, 1 / 256) },
     uShoreColor: { value: new THREE.Vector3(0.02, 0.03, 0.02) },
     uShoreElev: { value: 0.06 },
+    uShoreProfile: { value: 0 }, // 1: far-shore band from the real skyline (tSkyline), VR only
+    tSkyline: { value: null },
     tEnv: { value: null },
     uEnvIntensity: { value: 1 },
   };
@@ -238,14 +240,75 @@ export function createWater(ctx) {
     addMat.needsUpdate = true;
   }
 
+  // While an XR session presents, neither off-screen pass runs (XR.md "Rendering while presenting"):
+  // a mirror / depth image from one camera cannot serve two eyes, and the headset has no time for
+  // them. The water then shades like 'low': env-map sky + analytic far-shore band (here shaped by the
+  // real skyline, see setXRActive), and thickness from the environment's depth map. Only uniforms
+  // flip: no recompile on enter / exit.
+  let xrActive = false;
+  const reflOn = () => cfg.refl > 0 && !xrActive;
+  const depthOn = () => cfg.depth > 0 && !xrActive;
   function syncPassSwitches() {
-    uniforms.uUseRefl.value = cfg.refl > 0 ? 1 : 0;
-    uniforms.uUseDepth.value = cfg.depth > 0 ? 1 : 0;
-    if (!cfg.refl) {
+    uniforms.uUseRefl.value = reflOn() ? 1 : 0;
+    uniforms.uUseDepth.value = depthOn() ? 1 : 0;
+    if (!reflOn()) {
       uniforms.tRefl.value = null;
       uniforms.tReflDepth.value = null;
     }
-    if (!cfg.depth) uniforms.tSceneDepth.value = null;
+    if (!depthOn()) uniforms.tSceneDepth.value = null;
+  }
+  function setXRActive(on) {
+    xrActive = on;
+    // free the targets while presenting (headset memory); they are re-made at the next pass
+    if (on) {
+      passes.releaseReflection();
+      passes.releaseDepth();
+      if (!skylineTex) skylineTex = buildSkylineTexture();
+    }
+    // Without the mirror the far-shore band stands in for the treeline's reflection. The fixed band
+    // (3.4 deg) is far below the real skyline seen from the dock (treeline 5-8 deg, hills to ~20 deg),
+    // which left the far water pale in VR where the desktop mirror shows the dark treeline: in VR the
+    // band follows the environment's skyline profile instead. (Desktop 'low' keeps the fixed band.)
+    uniforms.tSkyline.value = skylineTex;
+    uniforms.uShoreProfile.value = on && skylineTex ? 1 : 0;
+    syncPassSwitches();
+  }
+
+  // Skyline occluder per azimuth atan2(x, -z) (bin k at -pi + 2 pi (k + 0.5) / N): R = its top (world y,
+  // m), G = its distance from the dock (m). From env.skylineOccluderAt, else the elevation profile at an
+  // assumed 300 m; null without either (the fixed band stays).
+  let skylineTex = null;
+  function buildSkylineTexture() {
+    const occ = typeof env.skylineOccluderAt === 'function' ? env.skylineOccluderAt : null;
+    const elev = typeof env.skylineElevationAt === 'function' ? env.skylineElevationAt : null;
+    if (!occ && !elev) return null;
+    const N = 720;
+    const data = new Float32Array(N * 4);
+    const o = {};
+    for (let k = 0; k < N; k++) {
+      const az = -Math.PI + ((k + 0.5) / N) * Math.PI * 2;
+      let hgt = 20;
+      let dist = 300;
+      if (occ) {
+        occ(az, o);
+        hgt = o.height;
+        dist = o.distance;
+      } else {
+        dist = 300;
+        hgt = 2.2 + dist * Math.tan(clamp(elev(az), -1.4, 1.4));
+      }
+      data[k * 4] = Number.isFinite(hgt) ? clamp(hgt, -50, 2000) : 20;
+      data[k * 4 + 1] = Number.isFinite(dist) ? clamp(dist, 1, 5000) : 300;
+    }
+    const tex = new THREE.DataTexture(data, N, 1, THREE.RGBAFormat, THREE.FloatType);
+    tex.minFilter = THREE.NearestFilter;
+    tex.magFilter = THREE.NearestFilter;
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.generateMipmaps = false;
+    tex.name = 'water-skyline';
+    tex.needsUpdate = true;
+    return tex;
   }
 
   // Cheap at run time: uniforms, a cached grid, render-target sizes. No shader
@@ -487,6 +550,8 @@ export function createWater(ctx) {
     lastFrame = frame;
     const q = normQ(frame.quality || quality);
     if (q !== quality) applyQuality(q);
+    const xrNow = !!(renderer.xr && renderer.xr.isPresenting);
+    if (xrNow !== xrActive) setXRActive(xrNow);
     const cam = frame.camera || ctx.camera;
 
     readEnv();
@@ -524,11 +589,11 @@ export function createWater(ctx) {
     );
     splashSys.update(dt, projScale, time);
 
-    if (!cfg.depth && !cfg.refl) return;
+    if (!depthOn() && !reflOn()) return;
     hiddenRefl.length = 0;
     hiddenDepth.length = 0;
     collect(scene);
-    if (cfg.depth) {
+    if (depthOn()) {
       const scale = Math.min(cfg.depth, cfg.depthMaxW / bw);
       const w = Math.max(16, Math.round(bw * scale));
       const h = Math.max(16, Math.round(bh * scale));
@@ -538,7 +603,7 @@ export function createWater(ctx) {
       uniforms.uCamNear.value = range.near;
       uniforms.uCamFar.value = range.far;
     }
-    if (cfg.refl) {
+    if (reflOn()) {
       const scale = Math.min(cfg.refl, cfg.reflMaxW / bw);
       const w = Math.max(16, Math.round(bw * scale));
       const h = Math.max(16, Math.round(bh * scale));
@@ -558,6 +623,7 @@ export function createWater(ctx) {
     addMat.dispose();
     detailTex.dispose();
     if (fallbackDepthTex) fallbackDepthTex.dispose();
+    if (skylineTex) skylineTex.dispose();
     splashSys.dispose();
     passes.dispose();
   }

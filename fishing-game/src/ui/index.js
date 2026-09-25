@@ -72,7 +72,7 @@ function nullUI() {
   return {
     showTitle: noop, hideTitle: noop, setState: noop, update: noop, strikeCue: noop,
     showCatch: noop, hideCatch: noop, toast: noop, openJournal: noop, closeJournal: noop,
-    setLoading: noop, setPaused: noop, isModalOpen: () => false, getCatchRect: () => null, dispose: noop,
+    setLoading: noop, setPaused: noop, isModalOpen: () => false, getCatchRect: () => null, setXRAvailable: noop, dispose: noop,
   };
 }
 
@@ -93,6 +93,8 @@ export function createUI(ctx = {}) {
   const live = $('ui-live');
   const title = $('title');
   const startBtn = $('btn-start');
+  const vrBtn = $('btn-vr'); // Enter VR (title), shown only when a headset is available
+  const vrPauseBtn = $('btn-vr-pause'); // Enter VR (pause menu)
   const titleBest = $('title-best');
   const titleBestMain = $('title-best-main');
   const titleBestSub = $('title-best-sub');
@@ -423,6 +425,7 @@ export function createUI(ctx = {}) {
     const p = clamp(fin(p01, 1), 0, 1);
     loading = p < 1;
     startBtn.disabled = loading;
+    vrBtn.disabled = loading; // entering VR starts the game: same gate as Start
     startBtn.setAttribute('aria-busy', loading ? 'true' : 'false');
     startBtn.style.setProperty('--p', p.toFixed(3));
     startBtn.textContent = loading ? `${label || 'Preparing the lake'}… ${Math.round(p * 100)}%` : 'Start fishing';
@@ -433,6 +436,18 @@ export function createUI(ctx = {}) {
     call('onStart'); // from the click itself so audio can start
     hideTitle();
   });
+  // Enter VR (XR.md): shown only after setXRAvailable(true). The handler runs inside the click, which the
+  // WebXR session request and the audio start both need; core hides the title / pause once presenting.
+  function setXRAvailable(on) {
+    on = !!on;
+    vrBtn.hidden = !on;
+    vrPauseBtn.hidden = !on;
+  }
+  vrBtn.addEventListener('click', () => {
+    if (!cur.titleOpen || loading) return;
+    call('onEnterVR');
+  });
+  vrPauseBtn.addEventListener('click', () => call('onEnterVR'));
 
   // ---------- dialogs: focus in, Tab trap, Esc ----------
   const dialogStack = []; // { el, onEsc, restore }
@@ -1390,6 +1405,7 @@ export function createUI(ctx = {}) {
     // when the window is <= 720 px wide (and taller than 520 px) or its aspect is <= 0.85, else a side
     // panel on the right.
     getCatchRect,
+    setXRAvailable, // show / hide the Enter VR buttons (title + pause menu)
     dispose,
   };
 }

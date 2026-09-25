@@ -2,9 +2,16 @@
 //  - planar reflection: the scene seen from the camera mirrored in y = 0 with an
 //    oblique near plane on the water plane (everything below the surface is
 //    clipped and culled), rendered at reduced resolution into a half-float target.
+//    It draws layer 0 plus LAYERS.REFLECTION (cheap stand-ins such as a coarse
+//    terrain proxy that only the mirror sees); the caller hides NO_REFLECT objects.
+//    The raw image is then copied into the mipmapped target through a sanitising
+//    pass (NaN -> neighbours, Inf -> a large finite value) BEFORE the mip chain is
+//    built: a single broken texel otherwise spreads into a block at every mip level
+//    (NaN on most GPUs, zero/black on some), which no lookup-side test can undo.
 //  - depth pre-pass: only LAYERS.UNDERWATER objects (lake bed, fish, lures,
-//    pilings, timber), untextured, depth only, at reduced resolution. The water
-//    shader turns it into the true water thickness in front of each pixel.
+//    pilings, timber), untextured, depth only, at reduced resolution, and only
+//    out to a limited range (its far plane culls distant lake-bed chunks). The
+//    water shader turns it into the true water thickness in front of each pixel.
 import * as THREE from 'three';
 import { LAYERS, WATER_LEVEL } from '../config.js';
 
@@ -13,7 +20,12 @@ export function createPasses(renderer) {
   const reflCam = new THREE.PerspectiveCamera();
   reflCam.name = 'water-reflection-camera';
   const textureMatrix = new THREE.Matrix4();
-  let reflRT = null;
+  // x / y terms of the mirror projection (e0, e5, e8, e9; the oblique clip only
+  // changes the z row): with reflCam.matrixWorld the water shader turns a mirror
+  // texel back into its world ray.
+  const reflProjXY = new THREE.Vector4(1, 1, 0, 0);
+  let reflRT = null; // sanitised, mipmapped: what the water samples
+  let rawRT = null; // the mirror render itself (+ its depth texture)
 
   const normal = new THREE.Vector3(0, 1, 0);
   const planePos = new THREE.Vector3();
@@ -25,33 +37,104 @@ export function createPasses(renderer) {
   const plane = new THREE.Plane();
   const clip = new THREE.Vector4();
   const q = new THREE.Vector4();
+  const REFLECTION_LAYER = 1 << LAYERS.REFLECTION;
 
   function ensureReflection(w, h) {
     if (!reflRT) {
-      // Mipmapped so rough water can sample a blurred mirror image; the depth
-      // texture gives the distance to the reflected object (distortion scale).
+      // The raw mirror render; its depth texture gives the distance to the
+      // reflected object (distortion scale) and marks texels where nothing was drawn.
       const dt = new THREE.DepthTexture(w, h, THREE.UnsignedIntType);
       dt.minFilter = THREE.NearestFilter;
       dt.magFilter = THREE.NearestFilter;
       dt.name = 'water-reflection-depth';
+      rawRT = new THREE.WebGLRenderTarget(w, h, {
+        type: THREE.HalfFloatType,
+        minFilter: THREE.NearestFilter,
+        magFilter: THREE.NearestFilter,
+        generateMipmaps: false,
+        depthBuffer: true,
+        depthTexture: dt,
+        samples: 0,
+      });
+      rawRT.texture.name = 'water-reflection-raw';
+      // Mipmapped so rough water can sample a blurred mirror image.
       reflRT = new THREE.WebGLRenderTarget(w, h, {
         type: THREE.HalfFloatType,
         minFilter: THREE.LinearMipmapLinearFilter,
         magFilter: THREE.LinearFilter,
         generateMipmaps: true,
-        depthBuffer: true,
-        depthTexture: dt,
+        depthBuffer: false,
         samples: 0,
       });
       reflRT.texture.name = 'water-reflection';
     } else if (reflRT.width !== w || reflRT.height !== h) {
+      rawRT.setSize(w, h);
       reflRT.setSize(w, h);
     }
     return reflRT;
   }
 
+  // Full-screen copy raw -> reflRT that replaces non-finite texels (bit tests: a
+  // fast-math compiler may fold isnan() away). NaN takes the mean of its finite
+  // neighbours (else the horizon colour), +Inf a large finite value, negatives 0.
+  const sanitizeMat = new THREE.ShaderMaterial({
+    name: 'WaterReflSanitize',
+    uniforms: { tSrc: { value: null }, uFallback: { value: new THREE.Vector3(0.5, 0.55, 0.6) } },
+    vertexShader: /* glsl */ `
+      void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D tSrc;
+      uniform vec3 uFallback;
+      bool nanBits(float x) {
+        uint u = floatBitsToUint(x);
+        return (u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0u;
+      }
+      bool anyNaN(vec3 c) { return nanBits(c.r) || nanBits(c.g) || nanBits(c.b); }
+      float fin(float x) {
+        uint u = floatBitsToUint(x);
+        if ((u & 0x7f800000u) == 0x7f800000u) return (u >> 31u) != 0u ? 0.0 : 60000.0;
+        return clamp(x, 0.0, 60000.0);
+      }
+      vec3 fin(vec3 c) { return vec3(fin(c.r), fin(c.g), fin(c.b)); }
+      void main() {
+        ivec2 size = textureSize(tSrc, 0);
+        ivec2 p = ivec2(gl_FragCoord.xy);
+        vec3 c = texelFetch(tSrc, p, 0).rgb;
+        if (anyNaN(c)) {
+          vec3 acc = vec3(0.0);
+          float n = 0.0;
+          for (int j = -1; j <= 1; j++) {
+            for (int i = -1; i <= 1; i++) {
+              vec3 q = texelFetch(tSrc, clamp(p + ivec2(i, j), ivec2(0), size - 1), 0).rgb;
+              if (!anyNaN(q)) { acc += fin(q); n += 1.0; }
+            }
+          }
+          c = n > 0.0 ? acc / n : uFallback;
+        }
+        gl_FragColor = vec4(fin(c), 1.0);
+      }`,
+    depthTest: false,
+    depthWrite: false,
+    blending: THREE.NoBlending,
+    toneMapped: false,
+    fog: false,
+  });
+  const sanitizeGeo = new THREE.BufferGeometry();
+  sanitizeGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3));
+  const sanitizeQuad = new THREE.Mesh(sanitizeGeo, sanitizeMat);
+  sanitizeQuad.frustumCulled = false;
+  const sanitizeScene = new THREE.Scene();
+  sanitizeScene.add(sanitizeQuad);
+  const sanitizeCam = new THREE.Camera();
+  // compile it up front so a runtime switch to a reflecting quality level adds no program
+  try {
+    renderer.compile(sanitizeScene, sanitizeCam);
+  } catch (e) {
+    /* compiled on first use instead */
+  }
+
   // Returns false (and leaves the previous image) when the camera is under water.
-  function renderReflection(scene, camera, hidden, w, h) {
+  function renderReflection(scene, camera, hidden, w, h, fallback = null) {
     camPos.setFromMatrixPosition(camera.matrixWorld);
     planePos.set(camPos.x, WATER_LEVEL, camPos.z);
     view.subVectors(planePos, camPos);
@@ -70,8 +153,10 @@ export function createPasses(renderer) {
     reflCam.far = camera.far;
     reflCam.updateMatrixWorld();
     reflCam.projectionMatrix.copy(camera.projectionMatrix);
-    reflCam.layers.mask = camera.layers.mask;
+    reflCam.layers.mask = camera.layers.mask | REFLECTION_LAYER;
 
+    const pe = reflCam.projectionMatrix.elements;
+    reflProjXY.set(pe[0], pe[5], pe[8], pe[9]);
     textureMatrix.set(0.5, 0.0, 0.0, 0.5, 0.0, 0.5, 0.0, 0.5, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 1.0);
     textureMatrix.multiply(reflCam.projectionMatrix);
     textureMatrix.multiply(reflCam.matrixWorldInverse);
@@ -94,10 +179,13 @@ export function createPasses(renderer) {
 
     for (let i = 0; i < hidden.length; i++) hidden[i].visible = false;
     try {
-      renderInto(rt, scene, reflCam);
+      renderInto(rawRT, scene, reflCam);
     } finally {
       for (let i = 0; i < hidden.length; i++) hidden[i].visible = true;
     }
+    sanitizeMat.uniforms.tSrc.value = rawRT.texture;
+    if (fallback) sanitizeMat.uniforms.uFallback.value.copy(fallback);
+    renderInto(rt, sanitizeScene, sanitizeCam); // three builds rt's mip chain afterwards
     return true;
   }
 
@@ -133,14 +221,30 @@ export function createPasses(renderer) {
     return depthRT;
   }
 
-  function renderDepth(scene, camera, hidden, w, h) {
+  const range = { near: 0.1, far: 2500 };
+  // Returns { near, far } of the projection the depth texture was written with.
+  function renderDepth(scene, camera, hidden, w, h, maxRange = Infinity) {
     const rt = ensureDepth(w, h);
     depthCam.matrixWorld.copy(camera.matrixWorld);
     depthCam.matrixWorldInverse.copy(camera.matrixWorldInverse);
     depthCam.projectionMatrix.copy(camera.projectionMatrix);
-    depthCam.projectionMatrixInverse.copy(camera.projectionMatrixInverse);
-    depthCam.near = camera.near;
-    depthCam.far = camera.far;
+    const near = camera.near;
+    let far = camera.far;
+    if (maxRange > near * 4 && maxRange < far && camera.isPerspectiveCamera) {
+      // pull the far plane in (same frustum otherwise, view offsets included):
+      // three culls every object beyond it, the rest is clipped per pixel
+      far = maxRange;
+      const e = depthCam.projectionMatrix.elements;
+      e[10] = -(far + near) / (far - near);
+      e[14] = (-2 * far * near) / (far - near);
+      depthCam.projectionMatrixInverse.copy(depthCam.projectionMatrix).invert();
+    } else {
+      depthCam.projectionMatrixInverse.copy(camera.projectionMatrixInverse);
+    }
+    depthCam.near = near;
+    depthCam.far = far;
+    range.near = near;
+    range.far = far;
     const bg = scene.background;
     const ov = scene.overrideMaterial;
     scene.background = null; // the background box would bypass the layer test
@@ -153,7 +257,7 @@ export function createPasses(renderer) {
       scene.overrideMaterial = ov;
       scene.background = bg;
     }
-    return rt;
+    return range;
   }
 
   // ---- shared render helper ----------------------------------------------------
@@ -186,17 +290,21 @@ export function createPasses(renderer) {
       return reflRT ? reflRT.texture : null;
     },
     get reflectionDepth() {
-      return reflRT ? reflRT.depthTexture : null;
+      return rawRT ? rawRT.depthTexture : null;
     },
     reflectionProjectionInverse: reflCam.projectionMatrixInverse,
+    reflectionCameraWorld: reflCam.matrixWorld,
+    reflectionProjXY: reflProjXY,
     get depthTexture() {
       return depthRT ? depthRT.depthTexture : null;
     },
     releaseReflection() {
-      if (reflRT) {
-        reflRT.depthTexture.dispose();
-        reflRT.dispose();
+      if (rawRT) {
+        rawRT.depthTexture.dispose();
+        rawRT.dispose();
       }
+      if (reflRT) reflRT.dispose();
+      rawRT = null;
       reflRT = null;
     },
     releaseDepth() {
@@ -210,6 +318,8 @@ export function createPasses(renderer) {
       this.releaseReflection();
       this.releaseDepth();
       depthMaterial.dispose();
+      sanitizeMat.dispose();
+      sanitizeGeo.dispose();
     },
   };
 }

@@ -7,7 +7,7 @@
 //    spires poking through it for a ragged skyline
 //  - two distant ridge silhouettes with a tree-line edge and aerial perspective
 import * as THREE from 'three';
-import { makeRng, clamp, smoothstep, DOCK } from '../config.js';
+import { makeRng, clamp, smoothstep, DOCK, PLAYER } from '../config.js';
 import { makeTreeAtlas, buildSpruce, buildPine, buildBirch, REF, builderExtents } from './trees.js';
 import { patchMaterial } from './shaderlib.js';
 import { makeNoise2, fbm2 } from './noise.js';
@@ -30,6 +30,16 @@ const SPECIES = [
 ];
 
 const CAP = { size: 1024, cw: 128, ch: 256 };
+
+function shuffle(list, rng) {
+  for (let i = list.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = list[i];
+    list[i] = list[j];
+    list[j] = t;
+  }
+  return list;
+}
 
 // Render albedo (sqrt-encoded) and crown normals of each template into a two-attachment
 // render target (one pass, one depth buffer).
@@ -188,10 +198,33 @@ export function buildForest({ env, quality, renderer, shared, grid, culler }) {
   // ---------- materials
   const nearMat = new THREE.MeshLambertMaterial({ map: atlas, alphaTest: 0.42, side: THREE.DoubleSide, vertexColors: true });
   nearMat.name = 'scenery.trees';
-  patchMaterial(nearMat, shared, { sway: { amp: 0.35, freq: 0.9, wave: 0.03, invH: 1 / 20, flutter: 0.05 }, noFlip: true, alphaMip: 0.5, transl: 0.22, wrap: 0.22 });
+  patchMaterial(nearMat, shared, { sway: { amp: 0.35, freq: 0.9, wave: 0.03, invH: 1 / 20, flutter: 0.05 }, noFlip: true, alphaMip: 0.5, transl: 0.22, wrap: 0.22, sunLift: true });
   const impMat = new THREE.MeshLambertMaterial({ map: imp.albedo, alphaTest: 0.45, side: THREE.DoubleSide });
   impMat.name = 'scenery.impostors';
-  patchMaterial(impMat, shared, { impostor: true, alphaMip: 0.7, transl: 0.18, wrap: 0.22, extraUniforms: { uImpNormal: { value: imp.normal } } });
+  patchMaterial(impMat, shared, { impostor: true, alphaMip: 0.7, transl: 0.18, wrap: 0.22, sunLift: true, extraUniforms: { uImpNormal: { value: imp.normal } } });
+
+  // ---------- skyline profile (for the environment's sun / moon occlusion): the highest elevation
+  // angle of ground, canopy, trees and ridges per azimuth bin, as seen from the eye on the dock
+  const SKY_BINS = 1440;
+  const skyEl = new Float32Array(SKY_BINS).fill(-Math.PI / 2);
+  const skyDist = new Float32Array(SKY_BINS).fill(1000); // distance of the occluder that sets it
+  const skyEyeY = DOCK.deckY + PLAYER.eyeHeight;
+  const skyPut = (x, y, z, halfW) => {
+    const R = Math.hypot(x, z);
+    if (R < 6) return;
+    const e = Math.atan2(y - skyEyeY, R);
+    const az = Math.atan2(x, -z);
+    const hw = Math.min(0.2, halfW / R);
+    const b0 = Math.floor(((az - hw + Math.PI) / (Math.PI * 2)) * SKY_BINS);
+    const b1 = Math.floor(((az + hw + Math.PI) / (Math.PI * 2)) * SKY_BINS);
+    for (let b = b0; b <= b1; b++) {
+      const k = ((b % SKY_BINS) + SKY_BINS) % SKY_BINS;
+      if (e > skyEl[k]) {
+        skyEl[k] = e;
+        skyDist[k] = R;
+      }
+    }
+  };
 
   // ---------- placement
   const S = Q.sectors;
@@ -233,6 +266,13 @@ export function buildForest({ env, quality, renderer, shared, grid, culler }) {
     const s = height / sp.ref;
     const yaw = rng() * Math.PI * 2;
     const tint = spId === 'birch' ? [0.92 + rng() * 0.16, 0.92 + rng() * 0.14, 0.85 + rng() * 0.18] : [0.84 + rng() * 0.2, 0.88 + rng() * 0.18, 0.86 + rng() * 0.2];
+    // skyline: a conifer's spire only blocks a sliver, so count the crown a little below the tip.
+    // A lone tree right by the dock only shades the dock, not the lake: the skyline is meant for
+    // landscape-scale shade (hills, the forest edge), so trees closer than 50 m are left out.
+    if (R >= 50) {
+      if (spId === 'birch') skyPut(x, yBase + height * 0.8, z, height * 0.15);
+      else skyPut(x, yBase + height * 0.88, z, height * 0.06);
+    }
     if (!forceFar && R < Q.detailR && !back) {
       const list = nearBySpecies.get(spId);
       const g = list[Math.floor(rng() * list.length)];
@@ -298,6 +338,9 @@ export function buildForest({ env, quality, renderer, shared, grid, culler }) {
     }
   }
 
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) skyPut(-half + i * cell, h[j * n + i], -half + j * cell, cell * 0.5);
+  }
   lap('placement');
   // ---------- canopy shell (+ spires beyond the placement grid)
   const shellMat = new THREE.MeshLambertMaterial({ vertexColors: true });
@@ -313,6 +356,7 @@ export function buildForest({ env, quality, renderer, shared, grid, culler }) {
       diffuseColor.rgb *= (0.6 + 0.6 * nA) * mix(0.85, 0.3 + 1.2 * st * st * (0.7 + 0.6 * st2), fine);
     }`,
     bump: `(sNoise3(vSWorld * vec3(0.16, 0.1, 0.16)) * 3.2 + sNoise3(vSWorld * 0.55) * 0.9 * (1.0 - smoothstep(150.0, 450.0, length(vViewPosition)))) * (1.0 - smoothstep(600.0, 1400.0, length(vViewPosition)))`,
+    sunLift: true,
   });
   const shellMeshes = buildShell();
   for (const m of shellMeshes) group.add(m);
@@ -363,6 +407,7 @@ export function buildForest({ env, quality, renderer, shared, grid, culler }) {
         zs[k] = z;
         cs[k] = c;
         ys[k] = c > 0.3 ? hh + c : Math.min(hh, 0) - 1.0;
+        skyPut(x, c > 0.3 ? hh + c : hh, z, (Math.PI * R) / AZ);
         const dn = fbm2(noise, x * 0.004 + 9, z * 0.004, 3);
         tmp.copy(cDark).lerp(cMid, clamp(0.5 + dn * 1.5, 0, 1));
         const decid = smoothstep(0.18, 0.4, fbm2(noise, x * 0.012 + 4, z * 0.012 - 2, 3));
@@ -518,7 +563,10 @@ export function buildForest({ env, quality, renderer, shared, grid, culler }) {
   const _c = new THREE.Color();
   const _ax = new THREE.Vector3();
   let nearCount = 0;
+  // instance lists in random order: runtime quality thins a chunk by lowering mesh.count
+  const thin = [];
   for (const [key, list] of near) {
+    shuffle(list, rng);
     const gi = Number(key.split('|')[0]);
     const g = nearGeos[gi];
     const mesh = new THREE.InstancedMesh(g.geometry, nearMat, list.length);
@@ -539,6 +587,7 @@ export function buildForest({ env, quality, renderer, shared, grid, culler }) {
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mesh.computeBoundingSphere();
     mesh.name = `forest.near.${g.sp.id}.${key}`;
+    thin.push({ mesh, base: list.length, kind: 'trees' });
     if (culler) culler.addSector(mesh, Math.floor(Number(key.split('|')[1]) / 2), S);
     group.add(mesh);
     nearCount += list.length;
@@ -547,6 +596,7 @@ export function buildForest({ env, quality, renderer, shared, grid, culler }) {
   let farCount = 0;
   far.forEach((list, si) => {
     if (!list.length) return;
+    shuffle(list, rng);
     const geo = quad.clone();
     const cells = new Float32Array(list.length * 4);
     const mesh = new THREE.InstancedMesh(geo, impMat, list.length);
@@ -565,6 +615,7 @@ export function buildForest({ env, quality, renderer, shared, grid, culler }) {
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mesh.computeBoundingSphere();
     mesh.name = `forest.far.${si}`;
+    thin.push({ mesh, base: list.length, kind: 'trees' });
     if (culler) culler.addSector(mesh, si, S);
     group.add(mesh);
     farCount += list.length;
@@ -629,6 +680,7 @@ export function buildForest({ env, quality, renderer, shared, grid, culler }) {
         const ridged = 1 - Math.abs(fbm2(noise, Math.cos(th) * 3 + L.seed, Math.sin(th) * 3 + L.seed, 4));
         const envH = env.getTerrainHeight(x, z);
         const top = Math.max(Number.isFinite(envH) ? envH + 20 : 0, L.lift + ridged * ridged * L.amp);
+        skyPut(x, top + 8, z, (Math.PI * L.R) / AZ); // body + the middle of the tree-line band
         const u = ((a / AZ) * circ) / 85;
         const nx = -sx * 0.9;
         const nz = -sz * 0.9;
@@ -660,7 +712,7 @@ export function buildForest({ env, quality, renderer, shared, grid, culler }) {
       hazeUniforms.push({ u: uHaze, base: L.base });
       const mat = new THREE.MeshStandardMaterial({ color: L.color, alphaMap: tex, alphaTest: 0.5, roughness: 1, metalness: 0, fog: false, side: THREE.DoubleSide });
       mat.name = 'scenery.ridge';
-      patchMaterial(mat, shared, { haze: true, extraUniforms: { uHaze, uHazeColor: { value: env.horizonColor || new THREE.Color(0xb0c0cc) } } });
+      patchMaterial(mat, shared, { haze: true, sunLift: true, extraUniforms: { uHaze, uHazeColor: { value: env.horizonColor || new THREE.Color(0xb0c0cc) } } });
       const m = new THREE.Mesh(g, mat);
       m.name = 'forest.ridge';
       m.frustumCulled = false;
@@ -680,6 +732,8 @@ export function buildForest({ env, quality, renderer, shared, grid, culler }) {
   return {
     group,
     stats: { near: nearCount, far: farCount, templates: templates.length, nearDraw: near.size, ms: T },
+    skyline: { bins: SKY_BINS, elevation: skyEl, distance: skyDist, eyeY: skyEyeY },
+    thin,
     impostorTextures: imp,
     update(frame, scene) {
       const k = fogAt(scene, 700);

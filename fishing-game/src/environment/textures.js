@@ -126,15 +126,40 @@ void main() {
 }
 `;
 
+// Cumulus puffs: every jittered cell point carries a puff with its own radius, about a third of
+// the cells carry none, and neighbouring puffs merge (soft union over the 3 x 3 cells around the
+// pixel, which covers every puff that can reach it). Unlike a Worley F1 field this gives clusters
+// and gaps without straight cell-border seams.
+const CLOUD_PUFFS = /* glsl */ `
+float puffs(vec2 uv, float P, float seed) {
+  vec2 p = uv * P;
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  float acc = 0.0;
+  for (int y = -1; y <= 1; y++)
+  for (int x = -1; x <= 1; x++) {
+    vec2 o = vec2(float(x), float(y));
+    vec2 cell = mod(i + o, P);
+    vec2 h = hash22(cell + seed);
+    vec2 d = o + h * 0.8 + 0.1 - f;
+    float rad = mix(0.45, 1.15, hash12(cell + seed + 17.0)) * 0.85;
+    float keep = step(0.35, hash12(cell + seed + 71.0));
+    float v = (1.0 - smoothstep(0.0, rad, length(d))) * keep;
+    acc = acc + v - acc * v;
+  }
+  return acc;
+}
+`;
+
 const CLOUD_FRAG = /* glsl */ `
 varying vec2 vUv;
 ${NOISE_LIB}
+${CLOUD_PUFFS}
 void main() {
   vec2 uv = vUv;
-  // R: billowy low octaves, G: worley puffs, B/A: detail octaves
+  // R: billowy low octaves, G: clustered cumulus puffs (two scales), B/A: detail octaves
   float r = fbmP(uv, 4.0, 4) * 0.5 + 0.5;
-  vec3 w = worley(uv, 8.0);
-  float g = 1.0 - smoothstep(0.0, 0.85, w.x);
+  float g = max(puffs(uv, 5.0, 3.0), puffs(uv + 0.37, 11.0, 11.0) * 0.85);
   float b = fbmP(uv + 0.31, 16.0, 3) * 0.5 + 0.5;
   float a = 1.0 - abs(fbmP(uv + 0.77, 8.0, 4));
   gl_FragColor = vec4(r, g, b, a);

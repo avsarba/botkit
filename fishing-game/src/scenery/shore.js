@@ -17,6 +17,16 @@ const QUALITY = {
 };
 
 const srgb = (r, g, b) => new THREE.Color().setRGB(r / 255, g / 255, b / 255, THREE.SRGBColorSpace);
+
+function shuffle(list, rng) {
+  for (let i = list.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = list[i];
+    list[i] = list[j];
+    list[j] = t;
+  }
+  return list;
+}
 const _c = new THREE.Color();
 
 // ---------------------------------------------------------------- reed clump geometry
@@ -473,7 +483,9 @@ export function buildShore({ env, quality, shared, grid, culler }) {
     }
   }
   const reedMeshes = [];
+  const thin = []; // { mesh, base, kind }: runtime quality lowers mesh.count (lists are shuffled)
   for (const [key, list] of reedNear) {
+    shuffle(list, rng);
     const v = Number(key.split('|')[0]);
     const mesh = new THREE.InstancedMesh(reedGeos[v], reedMat, list.length);
     list.forEach((t, i) => {
@@ -492,6 +504,7 @@ export function buildShore({ env, quality, shared, grid, culler }) {
     mesh.computeBoundingSphere();
     mesh.layers.enable(LAYERS.UNDERWATER);
     mesh.name = `shore.reeds.${key}`;
+    thin.push({ mesh, base: list.length, kind: 'reeds' });
     if (culler) culler.addSector(mesh, Number(key.split('|')[1]), S);
     group.add(mesh);
     reedMeshes.push(mesh);
@@ -504,6 +517,7 @@ export function buildShore({ env, quality, shared, grid, culler }) {
   const cardGeo = new THREE.PlaneGeometry(1, 1).translate(0, 0.5, 0);
   reedFar.forEach((list, si) => {
     if (!list.length) return;
+    shuffle(list, rng);
     const geo = cardGeo.clone();
     const uvOff = new Float32Array(list.length * 4);
     const mesh = new THREE.InstancedMesh(geo, cardMat, list.length);
@@ -552,16 +566,17 @@ export function buildShore({ env, quality, shared, grid, culler }) {
       const sp = padSpots[Math.floor(rng() * padSpots.length)];
       const x = sp.cx + (rng() - 0.5) * cell;
       const z = sp.cz + (rng() - 0.5) * cell;
-      // patchy colonies
-      if (fbm2(noise, x * 0.09 + 20, z * 0.09, 2) < 0.05 - sp.w * 0.2) continue;
+      // dense beds a few meters across with open channels between them
+      if (fbm2(noise, x * 0.12 + 20, z * 0.12, 2) < 0.1) continue;
       const y = env.getTerrainHeight(x, z);
       if (!(y < -0.25 && y > -2.2) || onDock(x, z)) continue;
-      const r = 0.1 + rng() * 0.07;
-      // avoid heavy overlap
+      // mostly small leaves, a few big pond-lily (Nuphar) pads
+      const r = 0.07 + rng() * rng() * 0.15;
+      // leaves may overlap into rafts, but not stack
       let ok = true;
       for (let k = Math.max(0, pads.length - 40); k < pads.length; k++) {
         const p = pads[k];
-        if ((p.x - x) ** 2 + (p.z - z) ** 2 < (p.r + r) ** 2 * 0.55) {
+        if ((p.x - x) ** 2 + (p.z - z) ** 2 < (p.r + r) ** 2 * 0.3) {
           ok = false;
           break;
         }
@@ -572,10 +587,15 @@ export function buildShore({ env, quality, shared, grid, culler }) {
     }
   }
   if (pads.length) {
-    const padMat = new THREE.MeshStandardMaterial({ map: makeLilyTexture(), alphaTest: 0.5, side: THREE.DoubleSide, roughness: 0.42, metalness: 0 });
+    // Floating leaves are drawn after the water (transparent queue, renderOrder above the water's
+    // 11, still alpha-tested and depth-writing): the lake surface is displaced by the waves and
+    // would otherwise wash over the leaves every few seconds and shade them as deep water.
+    const padMat = new THREE.MeshStandardMaterial({ map: makeLilyTexture(), alphaTest: 0.5, side: THREE.DoubleSide, roughness: 0.3, metalness: 0, transparent: true, depthWrite: true });
     padMat.name = 'scenery.lilypads';
     patchMaterial(padMat, shared, { alphaMip: 0.3 });
+    shuffle(pads, rng);
     const mesh = new THREE.InstancedMesh(buildPadGeometry(), padMat, pads.length);
+    thin.push({ mesh, base: pads.length, kind: 'pads' });
     pads.forEach((p, i) => {
       _q.setFromEuler(_e.set((rng() - 0.5) * 0.03, p.yaw, (rng() - 0.5) * 0.03));
       _p.set(p.x, 0.012 + rng() * 0.004, p.z);
@@ -583,20 +603,24 @@ export function buildShore({ env, quality, shared, grid, culler }) {
       _m.compose(_p, _q, _s);
       mesh.setMatrixAt(i, _m);
       const k = rng();
-      if (k < 0.12) mesh.setColorAt(i, _c.setRGB(1.25, 0.7, 0.62)); // young bronze-red pad
-      else if (k < 0.2) mesh.setColorAt(i, _c.setRGB(1.3, 1.15, 0.7)); // yellowing
-      else mesh.setColorAt(i, _c.setRGB(0.85 + rng() * 0.3, 0.85 + rng() * 0.3, 0.85 + rng() * 0.25));
+      if (k < 0.12) mesh.setColorAt(i, _c.setRGB(1.1, 0.62, 0.55)); // young bronze-red pad
+      else if (k < 0.2) mesh.setColorAt(i, _c.setRGB(1.15, 1.02, 0.62)); // yellowing
+      else {
+        const g = 0.75 + rng() * 0.25; // dark glossy leaves
+        mesh.setColorAt(i, _c.setRGB(g * (0.94 + rng() * 0.1), g, g * (0.9 + rng() * 0.12)));
+      }
     });
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mesh.computeBoundingSphere();
     mesh.name = 'shore.lilypads';
     mesh.receiveShadow = true;
+    mesh.renderOrder = 12;
     mesh.layers.enable(LAYERS.NO_REFLECT); // flat on the surface: no visible mirror image
     group.add(mesh);
   }
   if (flowers.length) {
-    const flMat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: 0.6, metalness: 0 });
+    const flMat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: 0.6, metalness: 0, transparent: true, depthWrite: true });
     flMat.name = 'scenery.waterlilies';
     patchMaterial(flMat, shared, { transl: 0.6 });
     for (const white of [true, false]) {
@@ -613,6 +637,7 @@ export function buildShore({ env, quality, shared, grid, culler }) {
       mesh.instanceMatrix.needsUpdate = true;
       mesh.computeBoundingSphere();
       mesh.name = white ? 'shore.waterlily' : 'shore.pondlily';
+      mesh.renderOrder = 12; // floats on the waves like the pads
       mesh.layers.enable(LAYERS.NO_REFLECT);
       group.add(mesh);
     }
@@ -693,6 +718,18 @@ export function buildShore({ env, quality, shared, grid, culler }) {
         if (rocks.length < Q.rocks) rocks.push(item);
       } else if (farRocks.length < Q.farRocks) farRocks.push(item);
     }
+  }
+  // a scatter of cobbles on the sandy shelf around the dock end (depth cue through the shallows;
+  // kept out of the pilings' footprint)
+  for (let k = 0, tries = 0; k < (quality === 'low' ? 10 : 18) && tries < 200; tries++) {
+    const x = (rng() - 0.5) * 18;
+    const z = -11 + rng() * 22;
+    if (onDock(x, z) || (Math.abs(x) < 1.8 && z > DOCK.endZ - 2)) continue;
+    const y = env.getTerrainHeight(x, z);
+    if (!Number.isFinite(y) || y > -0.35 || y < -3.2) continue;
+    const s = 0.1 + rng() * rng() * 0.3;
+    rocks.push({ x, y: y - s * (0.25 + rng() * 0.2), z, s, yaw: rng() * Math.PI * 2, tilt: (rng() - 0.5) * 0.4, g: Math.floor(rng() * rockGeos.length) });
+    k++;
   }
   const rockMeshes = [];
   const addRocks = (list, geos, name) => {
@@ -805,6 +842,7 @@ export function buildShore({ env, quality, shared, grid, culler }) {
   return {
     group,
     anchors,
+    thin,
     stats: { reedsNear: nNear, reedCards: nFar, pads: pads.length, flowers: flowers.length, rocks: rocks.length, farRocks: farRocks.length, logs: logDefs.length + shoreLogs.length },
     update() {},
   };

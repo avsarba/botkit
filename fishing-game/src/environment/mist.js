@@ -2,6 +2,7 @@
 // A few stacked horizontal layers; their optical path grows at grazing angles so they
 // pile up into a soft band toward the far shore while staying thin underfoot.
 import * as THREE from 'three';
+import { DITHER_GLSL } from './dither.js';
 
 const VERT = /* glsl */ `
 varying vec3 vWPos;
@@ -46,6 +47,7 @@ void main() {
   gl_FragColor = vec4( col, a );
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
+  ${DITHER_GLSL}
 }
 `;
 

@@ -9,9 +9,28 @@ export function createSharedUniforms() {
     uWind: { value: 0.25 },
     uWindDir: { value: new THREE.Vector2(1, 0) },
     uSunDir: { value: new THREE.Vector3(0, 1, 0) },
-    uSunColor: { value: new THREE.Color(1, 1, 1) }, // sun color * intensity (linear)
+    uSunColor: { value: new THREE.Color(1, 1, 1) }, // sun color * intensity (linear), as lit at the dock
+    // key light before the treeline occludes it, the occluder toward it (see env.sunOccluder) and
+    // how much of it reaches the dock: tall things (crowns, hillsides) above the dock-level
+    // shadow get the difference back (opts.sunLift)
+    uSunOpen: { value: new THREE.Color(1, 1, 1) },
+    uSunOcc: { value: new THREE.Vector4(0, 1000, 1, 0.005) },
+    uSunVisEye: { value: 1 },
   };
 }
+
+// Share of the key light that reaches world position wp over the treeline occluder toward it
+// (a wall of height uSunOcc.x at distance uSunOcc.y from the dock along the light's azimuth).
+export const SUN_LIFT_GLSL = /* glsl */ `
+float sunLiftAt( vec3 wp, vec3 sunDirW ) {
+  float sl = length( sunDirW.xz );
+  if ( sl < 1e-4 ) return uSunVisEye;
+  float dp = uSunOcc.y - dot( wp.xz, sunDirW.xz / sl );
+  if ( dp < 1.0 ) return 1.0;
+  float eo = atan( uSunOcc.x - wp.y, dp );
+  return smoothstep( eo - uSunOcc.w, eo + uSunOcc.w, uSunOcc.z );
+}
+`;
 
 const f = (x) => (Number.isInteger(x) ? x.toFixed(1) : String(x));
 
@@ -31,6 +50,8 @@ const NORMAL_BEGIN_NOFLIP = THREE.ShaderChunk.normal_fragment_begin.replace('nor
 //   fragHeader: glsl       extra functions/uniforms for the fragment shader
 //   wrap: 0.2              normal-independent share of sunlight (foliage multiple scattering)
 //   haze: true             custom aerial perspective: mix toward uHazeColor by uHaze
+//   sunLift: true          tall things (crowns, far hills) keep the low sun that the treeline
+//                          already hides from the dock: adds the missing direct + foliage light
 //   extraUniforms: {}      additional uniforms (shared by reference)
 export function patchMaterial(material, shared, opts = {}) {
   const key = JSON.stringify(opts, (k, v) => (k === 'extraUniforms' ? Object.keys(v) : v));
@@ -42,10 +63,11 @@ export function patchMaterial(material, shared, opts = {}) {
     let fs = shader.fragmentShader;
     let vHead = 'uniform float uTime;\nuniform float uWind;\nuniform vec2 uWindDir;\n';
     let fHead = 'uniform vec3 uSunDir;\nuniform vec3 uSunColor;\nuniform float uTime;\n';
-    if (opts.worldPos || opts.fragColor || opts.bump) {
+    if (opts.worldPos || opts.fragColor || opts.bump || opts.sunLift) {
       vHead += 'varying vec3 vSWorld;\n';
       fHead += 'varying vec3 vSWorld;\n';
     }
+    if (opts.sunLift) fHead += 'uniform vec3 uSunOpen;\nuniform vec4 uSunOcc;\nuniform float uSunVisEye;\n' + SUN_LIFT_GLSL;
     if (opts.fragColor || opts.bump || opts.fragHeader) fHead += GLSL_NOISE;
     if (opts.fragHeader) fHead += opts.fragHeader + '\n';
     if (opts.cellUV && !opts.impostor) vHead += 'attribute vec4 aCell;\n';
@@ -80,7 +102,7 @@ export function patchMaterial(material, shared, opts = {}) {
   mvPosition.xyz += disp;
 }\n`;
     }
-    if (opts.worldPos || opts.fragColor || opts.bump) proj += 'vSWorld = (modelMatrix * mvPosition).xyz;\n';
+    if (opts.worldPos || opts.fragColor || opts.bump || opts.sunLift) proj += 'vSWorld = (modelMatrix * mvPosition).xyz;\n';
     proj += 'mvPosition = modelViewMatrix * mvPosition;\ngl_Position = projectionMatrix * mvPosition;\n';
     if (opts.impostor) {
       proj += `{
@@ -124,10 +146,16 @@ export function patchMaterial(material, shared, opts = {}) {
     if (opts.fragRough) fs = fs.replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n' + opts.fragRough);
     if (opts.noFlip || opts.impostor) fs = fs.replace('#include <normal_fragment_begin>', NORMAL_BEGIN_NOFLIP);
     let nrm = '';
+    // Every normalize below is length-guarded: a zero vector (a mip-averaged captured normal, or a
+    // bump on a face seen exactly edge-on where det and grad are both 0, e.g. in the mirrored
+    // reflection camera) would otherwise give NaN, which the water's blurred reflection spreads
+    // into big white blocks.
     if (opts.impostor) {
       nrm += `{
   vec3 nT = texture2D(uImpNormal, vMapUv).xyz * 2.0 - 1.0;
-  normal = normalize(nT.x * vImpR + nT.y * vImpU + nT.z * vImpF);
+  vec3 nI = nT.x * vImpR + nT.y * vImpU + nT.z * vImpF;
+  float nIl = length(nI);
+  normal = nIl > 1e-4 ? nI / nIl : normal;
 }\n`;
     }
     if (opts.bump) {
@@ -141,33 +169,45 @@ export function patchMaterial(material, shared, opts = {}) {
   vec3 r2 = cross(normal, dpdx);
   float det = dot(dpdx, r1);
   vec3 grad = sign(det) * (dhx * r1 + dhy * r2);
-  normal = normalize(abs(det) * normal - grad);
+  vec3 nb = abs(det) * normal - grad;
+  float nbl = length(nb);
+  normal = nbl > 1e-12 ? nb / nbl : normal;
 }\n`;
     }
     if (nrm) fs = fs.replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n' + nrm);
-    if (opts.transl) {
-      fs = fs.replace(
-        '#include <lights_fragment_end>',
-        `#include <lights_fragment_end>
+    let lights = '';
+    if (opts.sunLift) {
+      // key light hidden from the dock by the treeline but still reaching this (taller) point
+      lights += `vec3 sunC = uSunColor;
 {
+  float lift = max(sunLiftAt(vSWorld, uSunDir) - uSunVisEye, 0.0);
+  if (lift > 0.0) {
+    vec3 extra = uSunOpen * lift;
+    sunC += extra;
+    vec3 sunVL = normalize((viewMatrix * vec4(uSunDir, 0.0)).xyz);
+    reflectedLight.directDiffuse += BRDF_Lambert(diffuseColor.rgb) * extra * saturate(dot(normal, sunVL));
+  }
+}
+`;
+    } else if (opts.transl || opts.wrap) lights += 'vec3 sunC = uSunColor;\n';
+    if (opts.transl) {
+      lights += `{
   vec3 sunV = normalize((viewMatrix * vec4(uSunDir, 0.0)).xyz);
   float bl = pow(max(dot(normalize(-vViewPosition), sunV), 0.0), 3.0);
   float sunUp = smoothstep(-0.02, 0.08, uSunDir.y);
-  reflectedLight.directDiffuse += diffuseColor.rgb * uSunColor * (bl * sunUp * ${f(opts.transl)} * RECIPROCAL_PI);
-}`
-      );
+  reflectedLight.directDiffuse += diffuseColor.rgb * sunC * (bl * sunUp * ${f(opts.transl)} * RECIPROCAL_PI);
+}
+`;
     }
     if (opts.wrap) {
       // foliage: light scattered through the canopy softens the Lambert falloff
-      fs = fs.replace(
-        '#include <lights_fragment_end>',
-        `#include <lights_fragment_end>
-{
+      lights += `{
   float sunUpW = smoothstep(-0.02, 0.1, uSunDir.y);
-  reflectedLight.directDiffuse += diffuseColor.rgb * uSunColor * (${f(opts.wrap)} * sunUpW * RECIPROCAL_PI);
-}`
-      );
+  reflectedLight.directDiffuse += diffuseColor.rgb * sunC * (${f(opts.wrap)} * sunUpW * RECIPROCAL_PI);
+}
+`;
     }
+    if (lights) fs = fs.replace('#include <lights_fragment_end>', '#include <lights_fragment_end>\n' + lights);
     if (opts.haze) {
       fs = fs.replace('#include <fog_fragment>', '#include <fog_fragment>\ngl_FragColor.rgb = mix(gl_FragColor.rgb, uHazeColor, uHaze);');
     }

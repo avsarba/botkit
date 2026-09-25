@@ -220,7 +220,9 @@ export function createSplashSystem({ scene, maxParticles = 900, getHeight }) {
         0.004 + 0.01 * rnd() * (0.4 + s), 3, false, 0.85);
     }
     if (s > 0.42) {
-      // Crown: a ring sheet that breaks into drops, launched up and out.
+      // Crown: a ring sheet that breaks into drops, launched up and out. Each
+      // particle stands for a sheet fragment (a few cm), so the crown reads as a
+      // white wall at 8-15 m instead of sub-pixel dashes.
       const crown = Math.round((90 + 260 * (s - 0.42)) * q);
       const r0 = 0.08 + 0.22 * s;
       for (let i = 0; i < crown; i++) {
@@ -228,16 +230,17 @@ export function createSplashSystem({ scene, maxParticles = 900, getHeight }) {
         const out = (0.9 + 1.7 * s) * (0.7 + 0.5 * rnd());
         const up = (1.5 + 2.6 * s) * (0.6 + 0.55 * rnd());
         spawn(px + Math.cos(a) * r0, baseY, pz + Math.sin(a) * r0, Math.cos(a) * out, up, Math.sin(a) * out,
-          0.008 + 0.022 * rnd() * s, 3, false, 0.85);
+          (0.02 + 0.04 * s) * (0.55 + 0.6 * rnd()), 3, false, 0.85);
       }
-      // white water churned up at the impact point, and a little mist
-      const churn = Math.round((4 + 8 * s) * q);
+      // white water churned up at the impact point: a column that rises, spreads and
+      // hangs for most of a second; and a little mist
+      const churn = Math.round((5 + 10 * s) * q);
       for (let i = 0; i < churn; i++) {
         const a = rnd() * Math.PI * 2;
-        const out = 0.2 + 0.5 * rnd();
-        spawn(px + Math.cos(a) * 0.1 * rnd(), baseY + 0.03, pz + Math.sin(a) * 0.1 * rnd(),
-          Math.cos(a) * out, 0.3 + 0.9 * rnd() * s, Math.sin(a) * out,
-          0.1 + 0.14 * s * rnd(), 0.45 + 0.35 * rnd(), true, 0.5);
+        const out = 0.2 + 0.55 * rnd();
+        spawn(px + Math.cos(a) * 0.12 * rnd(), baseY + 0.03, pz + Math.sin(a) * 0.12 * rnd(),
+          Math.cos(a) * out, 0.4 + 1.5 * rnd() * s, Math.sin(a) * out,
+          (0.12 + 0.26 * s) * (0.6 + 0.6 * rnd()), 0.6 + 0.5 * rnd(), true, 0.55);
       }
       const mist = Math.round((3 + 6 * s) * q);
       for (let i = 0; i < mist; i++) {

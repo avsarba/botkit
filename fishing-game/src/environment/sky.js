@@ -6,6 +6,7 @@ import * as THREE from 'three';
 import { Sky } from 'three/addons/objects/Sky.js';
 import { makeRng } from '../config.js';
 import { CELESTIAL_POLE, worldDirection } from './astro.js';
+import { DITHER_GLSL } from './dither.js';
 
 const SKY_SCALE = 2000; // box half-size 1000 m: corners at 1732 m, inside the 2500 m far plane
 
@@ -213,7 +214,7 @@ varying vec3 vWorldPosition;
 uniform float uCumulus;
 uniform float uThick;
 uniform float uTopErode;
-// Fair-weather cumulus: worley puffs gated by a low-frequency fbm and a very broad
+// Fair-weather cumulus: clustered puffs of mixed sizes gated by a low-frequency fbm and a very broad
 // "weather" field (clear stretches of sky between cloud streets); billowy edge erosion.
 // Streaks (dawn / dusk): stretched fbm bands.
 float dens( vec2 q ) {
@@ -221,7 +222,9 @@ float dens( vec2 q ) {
   float r = texture2D( tNoise, q * 0.61 ).r;
   float g = texture2D( tNoise, q + vec2( 0.11, 0.37 ) ).g;
 #ifdef CLOUD_DETAIL
-  g = max( g, texture2D( tNoise, q * 1.73 + vec2( 0.61, 0.29 ) ).g * 0.9 );
+  // a second, rotated and non-integer-scaled sample hides the tile period
+  vec2 qr = vec2( q.x * 0.8 - q.y * 0.6, q.x * 0.6 + q.y * 0.8 ) * 1.73;
+  g = max( g, texture2D( tNoise, qr + vec2( 0.61, 0.29 ) ).g * 0.9 );
 #endif
   float b = texture2D( tNoise, q * 2.9 + vec2( 0.53, 0.21 ) ).b;
 #ifdef CLOUD_DETAIL
@@ -229,8 +232,9 @@ float dens( vec2 q ) {
 #else
   float a = 0.62;
 #endif
-  float gate = smoothstep( 0.36, 0.7, r * 0.6 + w * 0.55 );
-  float cu = g * ( 0.25 + 0.95 * gate ) + ( b - 0.5 ) * 0.22 + ( a - 0.62 ) * 0.16;
+  // high-contrast weather mask: clusters and cloud streets with wide clear gaps between them
+  float gate = smoothstep( 0.46, 0.6, r * 0.6 + w * 0.55 ); // ~22% cover at the day preset, as before
+  float cu = g * ( 0.05 + 1.15 * gate * gate ) + ( b - 0.5 ) * 0.22 + ( a - 0.62 ) * 0.16;
   float st = r * 0.6 + w * 0.35 + ( b - 0.5 ) * 0.3 + ( a - 0.62 ) * 0.1;
   return mix( st, cu, uCumulus );
 }
@@ -278,6 +282,7 @@ void main() {
   gl_FragColor = vec4( col, alpha * uOpacity * smoothstep( 0.004, 0.09, dir.y ) );
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
+  ${DITHER_GLSL}
 }
 `;
 
@@ -406,7 +411,8 @@ export function createSkySystem({ quality, cloudNoise }) {
   frag = frag.replace('uniform vec3 up;', 'uniform vec3 up;\n' + SKY_EXTRA_UNIFORMS);
   frag = frag.replace('L0 += ( vSunE * 19000.0 * Fex ) * sundisk;', 'L0 += ( vSunE * 19000.0 * Fex ) * sundisk * uSunDisk;');
   frag = frag.replace('gl_FragColor = vec4( retColor, 1.0 );', SKY_COMPOSE);
-  if (!frag.includes('uSunDisk;') || !frag.includes('uMilkyPole')) console.warn('[environment] sky shader patch did not apply');
+  frag = frag.replace('#include <colorspace_fragment>', '#include <colorspace_fragment>\n' + DITHER_GLSL);
+  if (!frag.includes('uSunDisk;') || !frag.includes('uMilkyPole') || !frag.includes('52.9829189')) console.warn('[environment] sky shader patch did not apply');
   sky.material.fragmentShader = frag;
   sky.material.needsUpdate = true;
   followCamera(sky);

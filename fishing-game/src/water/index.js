@@ -20,10 +20,12 @@ import { createSplashSystem } from './splash.js';
 import { createPasses } from './passes.js';
 import { waterVertex, waterFragment } from './shaders.js';
 
+// depthRange: the pre-pass only draws under-water things this close (m). Further out
+// Fresnel leaves a few percent of transmission and the env depth map stands in.
 const QUALITY = {
-  high: { refl: 0.5, reflMaxW: 1280, depth: 0.5, depthMaxW: 1024, rings: 32, particles: 900 },
-  medium: { refl: 1 / 3, reflMaxW: 800, depth: 1 / 3, depthMaxW: 640, rings: 24, particles: 500 },
-  low: { refl: 0, reflMaxW: 0, depth: 0, depthMaxW: 0, rings: 14, particles: 220 },
+  high: { refl: 0.5, reflMaxW: 1280, depth: 0.5, depthMaxW: 1024, depthRange: 220, rings: 32, particles: 900 },
+  medium: { refl: 1 / 3, reflMaxW: 800, depth: 1 / 3, depthMaxW: 640, depthRange: 170, rings: 24, particles: 500 },
+  low: { refl: 0, reflMaxW: 0, depth: 0, depthMaxW: 0, depthRange: 0, rings: 14, particles: 220 },
 };
 const normQ = (q) => (q === 'low' || q === 'medium' ? q : 'high');
 
@@ -45,6 +47,16 @@ const DETAIL = [
 ];
 const PATCH_TILE = 190; // m, wind patches ("cat's paws")
 
+// Wind 0..1 -> strength of the ripple (detail normal) layers. Light airs at dawn and
+// dusk (< ~0.08) leave the lake nearly glassy; a small floor keeps a hint of life so
+// the reduced-resolution mirror never reads as a perfect, soft copy. From the
+// midday breeze up (>= 0.3) this is the original calibration (0.2 + 1.3 w).
+function ruffleFor(w) {
+  const x = Number.isFinite(w) ? w : 0.25;
+  if (x >= 0.3) return Math.min(1.8, 0.2 + 1.3 * x);
+  return 0.06 + 2.12 * Math.max(0, x - 0.05);
+}
+
 export function createWater(ctx) {
   const { renderer, scene, events } = ctx;
   const env = ctx.env || {};
@@ -55,7 +67,11 @@ export function createWater(ctx) {
   const detailTex = createDetailTexture(renderer);
   const ripples = createRipples();
   const passes = createPasses(renderer);
-  let grid = buildSurfaceGeometry(quality);
+  // Surface grids are kept per quality level, so switching back and forth at run
+  // time costs nothing after the first build (a few hundred KB each).
+  const grids = {};
+  const gridFor = (q) => grids[q] || (grids[q] = buildSurfaceGeometry(q));
+  let grid = gridFor(quality);
 
   // ---- uniforms (shared by both passes) --------------------------------------------
   const uniforms = {
@@ -82,11 +98,15 @@ export function createWater(ctx) {
     uDetOff2P: { value: new THREE.Vector4() },
     uPatchScale: { value: 1 / PATCH_TILE },
     uRuffle: { value: 1 },
+    uSpreadCap: { value: 10 },
+    uWindDir: { value: new THREE.Vector2(1, 0) },
     uResolution: { value: new THREE.Vector2(1, 1) },
     tEnvDepth: { value: null },
     uEnvDepthXf: { value: new THREE.Vector4(-500, -500, 1 / 1000, 1 / 1000) },
     uEnvDepthMode: { value: 1 },
     uReflClamp: { value: 8 },
+    uUseDepth: { value: 0 },
+    uUseRefl: { value: 0 },
     tSceneDepth: { value: null },
     uDepthTexel: { value: new THREE.Vector2(1, 1) },
     uCamNear: { value: 0.1 },
@@ -95,6 +115,8 @@ export function createWater(ctx) {
     tReflDepth: { value: null },
     uTexMatrix: { value: passes.textureMatrix },
     uReflProjInv: { value: passes.reflectionProjectionInverse },
+    uReflCamWorld: { value: passes.reflectionCameraWorld },
+    uReflProjXY: { value: passes.reflectionProjXY },
     uReflPxPerRad: { value: 300 },
     uReflTexel: { value: new THREE.Vector2(1 / 512, 1 / 256) },
     uShoreColor: { value: new THREE.Vector3(0.02, 0.03, 0.02) },
@@ -185,18 +207,20 @@ export function createWater(ctx) {
   }
 
   // ---- defines / quality ------------------------------------------------------------------
+  // Quality levels only switch uniforms (uUseRefl / uUseDepth), never defines: a
+  // runtime quality change must not recompile the water programs. The only define
+  // that follows the environment is the PMREM layout of the sky fallback, which is
+  // fixed once the environment has baked its first env map.
   let definesKey = '';
   let debugMode = 0;
   let envMapSeen = undefined;
   let envMapHeight = 0;
   function syncDefines() {
     const d = {};
-    if (cfg.refl > 0) d.USE_REFLECTION = '';
-    if (cfg.depth > 0) d.USE_DEPTH_PREPASS = '';
     if (debugMode) d.WATER_DEBUG = String(debugMode);
     const em = env.envMap;
     uniforms.tEnv.value = null;
-    if (!cfg.refl && em && em.mapping === THREE.CubeUVReflectionMapping && em.image && em.image.height > 0) {
+    if (em && em.mapping === THREE.CubeUVReflectionMapping && em.image && em.image.height > 0) {
       const h = em.image.height;
       const maxMip = Math.log2(h) - 2;
       d.ENVMAP_TYPE_CUBE_UV = '';
@@ -214,24 +238,41 @@ export function createWater(ctx) {
     addMat.needsUpdate = true;
   }
 
+  function syncPassSwitches() {
+    uniforms.uUseRefl.value = cfg.refl > 0 ? 1 : 0;
+    uniforms.uUseDepth.value = cfg.depth > 0 ? 1 : 0;
+    if (!cfg.refl) {
+      uniforms.tRefl.value = null;
+      uniforms.tReflDepth.value = null;
+    }
+    if (!cfg.depth) uniforms.tSceneDepth.value = null;
+  }
+
+  // Cheap at run time: uniforms, a cached grid, render-target sizes. No shader
+  // recompiles, no texture re-uploads.
   function applyQuality(q) {
     quality = q;
     cfg = QUALITY[q];
     ripples.setLimit(cfg.rings);
     splashSys.setCapacity(cfg.particles);
-    const next = buildSurfaceGeometry(q);
-    grid.geometry.dispose();
-    grid = next;
+    grid = gridFor(q);
     mesh.geometry = grid.geometry;
     mulMesh.geometry = grid.geometry;
     if (!cfg.refl) passes.releaseReflection();
     if (!cfg.depth) passes.releaseDepth();
-    detailTex.anisotropy = Math.min(q === 'high' ? 8 : q === 'medium' ? 4 : 1, renderer.capabilities.getMaxAnisotropy());
-    detailTex.needsUpdate = true;
-    syncDefines();
+    setAnisotropy(q);
+    syncPassSwitches();
   }
+  function setAnisotropy(q) {
+    const an = Math.min(q === 'high' ? 8 : q === 'medium' ? 4 : 1, renderer.capabilities.getMaxAnisotropy());
+    if (detailTex.anisotropy === an) return;
+    detailTex.anisotropy = an; // a 256 px texture: re-uploading it is trivial
+    detailTex.needsUpdate = true;
+  }
+  setAnisotropy(quality);
   ripples.setLimit(cfg.rings);
   splashSys.setCapacity(cfg.particles);
+  syncPassSwitches();
   syncDefines();
 
   // ---- per-frame environment ----------------------------------------------------------------
@@ -246,6 +287,10 @@ export function createWater(ctx) {
     const sd = env.sunDirection;
     if (sd && Number.isFinite(sd.x) && sd.lengthSq() > 1e-8) u.uSunDir.value.copy(sd).normalize();
     const sunDir = u.uSunDir.value;
+    // env.sunIntensity already carries env.sunVisibility (the share of the sun / moon disc
+    // above the terrain + treeline skyline seen from the dock), so a key light behind the
+    // far forest leaves the lake in shade and makes no glint. Only the geometric horizon
+    // is added here.
     const sunI = Number.isFinite(env.sunIntensity) ? Math.max(0, env.sunIntensity) : 2;
     const vis = smoothstep(-0.015, 0.02, sunDir.y);
     lin(env.sunColor, tmpC.set(1, 0.95, 0.88));
@@ -268,7 +313,9 @@ export function createWater(ctx) {
     const forest = tmpC.set(0.018, 0.028, 0.017).multiplyScalar(0.6 + 0.4 * Math.min(1, lum(E)));
     u.uShoreColor.value.copy(forest).lerp(hor, f300);
     if (Number.isFinite(env.windStrength)) windStrength = env.windStrength;
-    u.uRuffle.value = clamp(0.2 + 1.3 * windStrength, 0.1, 1.8);
+    u.uRuffle.value = ruffleFor(windStrength);
+    // Light airs: the ripples are too weak to smear the mirrored treeline into the sky.
+    u.uSpreadCap.value = 0.03 + 4 * smoothstep(0.1, 0.24, windStrength);
     if (env.envMap !== envMapSeen || (env.envMap && env.envMap.image && env.envMap.image.height !== envMapHeight)) {
       envMapSeen = env.envMap;
       envMapHeight = env.envMap && env.envMap.image ? env.envMap.image.height : 0;
@@ -376,11 +423,14 @@ export function createWater(ctx) {
     splashSys.burst(x, getHeight(x, z), z, 0.16 + 0.32 * s, { quality });
   }
 
+  // A nibble at the float: a few mm high rings spreading 0.5-1 m, long enough (10 cm
+  // crests) to catch the light at 15-25 m, where shorter capillary rings would only
+  // roughen a pixel or two.
   function plip(position, strength01) {
     if (!position || !Number.isFinite(position.x) || !Number.isFinite(position.z)) return;
     const s = clamp(Number.isFinite(strength01) ? strength01 : 0.4, 0, 1);
-    ripples.add(position.x, position.z, 0.0007 + 0.0012 * s, 0.05, 0.22, 0.55 + 0.5 * s, 0);
-    ripples.add(position.x, position.z, 0.0005 + 0.0008 * s, 0.04, 0.2, 0.4 + 0.3 * s, 0, 0.22);
+    ripples.add(position.x, position.z, 0.003 + 0.0025 * s, 0.1, 0.3, 0.55 + 0.45 * s, 0);
+    ripples.add(position.x, position.z, 0.0018 + 0.0015 * s, 0.065, 0.24, 0.4 + 0.3 * s, 0, 0.2);
   }
 
   let lastDt = 1 / 60;
@@ -442,6 +492,7 @@ export function createWater(ctx) {
     readEnv();
     syncEnvDepth();
     waves.update(time, dt, windStrength, env.windDirection);
+    uniforms.uWindDir.value.set(Math.cos(waves.angle), Math.sin(waves.angle));
     scrollDetail(dt);
     ripples.update(time);
     uniforms.uRingCount.value = ripples.count;
@@ -481,17 +532,17 @@ export function createWater(ctx) {
       const scale = Math.min(cfg.depth, cfg.depthMaxW / bw);
       const w = Math.max(16, Math.round(bw * scale));
       const h = Math.max(16, Math.round(bh * scale));
-      passes.renderDepth(scene, cam, hiddenDepth, w, h);
+      const range = passes.renderDepth(scene, cam, hiddenDepth, w, h, cfg.depthRange);
       uniforms.tSceneDepth.value = passes.depthTexture;
       uniforms.uDepthTexel.value.set(1 / w, 1 / h);
-      uniforms.uCamNear.value = cam.near;
-      uniforms.uCamFar.value = cam.far;
+      uniforms.uCamNear.value = range.near;
+      uniforms.uCamFar.value = range.far;
     }
     if (cfg.refl) {
       const scale = Math.min(cfg.refl, cfg.reflMaxW / bw);
       const w = Math.max(16, Math.round(bw * scale));
       const h = Math.max(16, Math.round(bh * scale));
-      passes.renderReflection(scene, cam, hiddenRefl, w, h);
+      passes.renderReflection(scene, cam, hiddenRefl, w, h, uniforms.uHorizonColor.value);
       uniforms.tRefl.value = passes.reflectionTexture;
       uniforms.tReflDepth.value = passes.reflectionDepth;
       uniforms.uReflPxPerRad.value = h / (fovRad / (cam.zoom || 1));
@@ -502,7 +553,7 @@ export function createWater(ctx) {
   function dispose() {
     for (const off of offs) if (typeof off === 'function') off();
     scene.remove(mesh);
-    grid.geometry.dispose();
+    for (const k of Object.keys(grids)) grids[k].geometry.dispose();
     mulMat.dispose();
     addMat.dispose();
     detailTex.dispose();
@@ -527,9 +578,9 @@ export function createWater(ctx) {
     clarityM: 3,
     dispose,
     // Integration aid: 0 off, 1 reflection, 2 water depth over the visible point,
-    // 3 transmittance, 4 normals, 5 sun glint.
+    // 3 transmittance, 4 normals, 5 sun glint, 6 lee / calm / unresolved slope.
     debugView(mode = 0) {
-      debugMode = clamp(mode | 0, 0, 5);
+      debugMode = clamp(mode | 0, 0, 6);
       syncDefines();
     },
     get quality() {

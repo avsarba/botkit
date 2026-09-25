@@ -2,8 +2,18 @@
 // The player never leaves the dock, so the LOD is fixed: a dense grid around the dock, a
 // medium ring out past the far shore, and a coarse ring for the distant ridges. Edge vertices
 // of each finer grid are snapped onto the coarser grid's edges (no T-junction cracks).
+//
+// Draw structure (all index-only views of each ring's single vertex buffer, no extra vertices):
+//  - the two inner rings are split into tiles, each its own Mesh with a bounding volume set from
+//    the vertices it draws, so the tiles behind / beside the view are culled in every pass;
+//  - main view: the full-detail tiles (layer 0 + NO_REFLECT), box-tested against the main camera
+//    by cull() (a sphere around a flat tile is too loose for three's own test to reject much);
+//  - planar reflection: coarse above-water proxies (4 m / 8 m cells) on LAYERS.REFLECTION only;
+//  - water depth pre-pass: wet-only tiles (cells that reach below +0.6 m) on LAYERS.UNDERWATER only;
+//  - runtime quality below the boot level swaps the 1 m inner tiles for a 2 m index (setDetail).
 import * as THREE from 'three';
 import { LAYERS } from '../config.js';
+import { DITHER_GLSL } from './dither.js';
 
 const LOD = {
   // step: vertex spacing (m). Bounds are multiples of the next ring's step.
@@ -14,6 +24,15 @@ const LOD = {
 const B0 = { x0: -152, z0: -184, x1: 152, z1: 120 };
 const B1 = { x0: -448, z0: -704, x1: 448, z1: 192 };
 const B2 = { x0: -2048, z0: -2240, x1: 2048, z1: 1856 };
+// tiles per axis for ring 0 / 1 / 2: the main view's tiles are small enough for frustum culling to
+// drop what is behind / beside the view; the cheap reflection and depth-pass meshes use bigger
+// tiles (fewer draw calls). 0 = none.
+const TILES_MAIN = [4, 2, 1]; // ring 1 is mostly in view from the dock: 2 x 2 saves calls
+const TILES_REFL = [2, 2, 1];
+const TILES_WET = [2, 1, 0];
+const WET_Y = 0.6; // depth pre-pass keeps cells with a corner below this (m)
+const DRY_Y = -0.3; // reflection proxy keeps cells with a corner above this (m)
+const PROXY_STEP = [4, 8]; // reflection proxy cell size (m) for ring 0 / ring 1
 
 function buildGrid(field, b, step, hole, stitchStep) {
   const nx = Math.round((b.x1 - b.x0) / step) + 1;
@@ -70,34 +89,100 @@ function buildGrid(field, b, step, hole, stitchStep) {
       cover[k * 4 + 3] = Math.round(lc.beach * 255);
     }
   }
+  return {
+    b,
+    step,
+    hole,
+    nx,
+    nz,
+    position,
+    attrs: {
+      position: new THREE.BufferAttribute(position, 3),
+      normal: new THREE.BufferAttribute(normal, 3),
+      aCover: new THREE.BufferAttribute(cover, 4, true),
+    },
+  };
+}
+
+// Index of the cells [i0, i1) x [j0, j1) of a sampled ring at `stride` vertices per cell,
+// skipping cells inside the ring's hole and cells rejected by keep(ymin, ymax).
+function cellIndex(G, i0, i1, j0, j1, stride, keep) {
+  const { nx, b, step, hole, position: P } = G;
+  const k = stride;
   const idx = [];
-  for (let j = 0; j < nz - 1; j++) {
-    const cz = b.z0 + (j + 0.5) * step;
-    for (let i = 0; i < nx - 1; i++) {
+  for (let j = j0; j + k <= j1; j += k) {
+    const cz = b.z0 + (j + k * 0.5) * step;
+    for (let i = i0; i + k <= i1; i += k) {
       if (hole) {
-        const cx = b.x0 + (i + 0.5) * step;
+        const cx = b.x0 + (i + k * 0.5) * step;
         if (cx > hole.x0 && cx < hole.x1 && cz > hole.z0 && cz < hole.z1) continue;
       }
       const a = j * nx + i;
-      const bb = a + 1;
-      const c = a + nx;
-      const d = c + 1;
+      const bb = a + k;
+      const c = a + k * nx;
+      const d = c + k;
+      if (keep) {
+        const ya = P[a * 3 + 1];
+        const yb = P[bb * 3 + 1];
+        const yc = P[c * 3 + 1];
+        const yd = P[d * 3 + 1];
+        if (!keep(Math.min(ya, yb, yc, yd), Math.max(ya, yb, yc, yd))) continue;
+      }
       // alternate the diagonal for a less directional look
-      if ((i + j) & 1) {
+      if (((i + j) / k) & 1) {
         idx.push(a, c, bb, bb, c, d);
       } else {
         idx.push(a, c, d, a, d, bb);
       }
     }
   }
+  return idx;
+}
+
+// A geometry that shares the ring's vertex attributes and draws `idx`, with a bounding volume
+// set by hand from the vertices it actually draws (computeBoundingSphere ignores the index and
+// would span the whole ring, so frustum culling could never reject a tile).
+function tileGeometry(G, idx) {
   const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.BufferAttribute(position, 3));
-  g.setAttribute('normal', new THREE.BufferAttribute(normal, 3));
-  g.setAttribute('aCover', new THREE.BufferAttribute(cover, 4, true));
+  for (const k in G.attrs) g.setAttribute(k, G.attrs[k]);
+  const count = G.nx * G.nz;
   g.setIndex(count > 65535 ? new THREE.Uint32BufferAttribute(idx, 1) : new THREE.Uint16BufferAttribute(idx, 1));
-  g.computeBoundingSphere();
-  g.computeBoundingBox();
+  const P = G.position;
+  let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+  for (let n = 0; n < idx.length; n++) {
+    const o = idx[n] * 3;
+    const x = P[o];
+    const y = P[o + 1];
+    const z = P[o + 2];
+    if (x < x0) x0 = x;
+    if (x > x1) x1 = x;
+    if (y < y0) y0 = y;
+    if (y > y1) y1 = y;
+    if (z < z0) z0 = z;
+    if (z > z1) z1 = z;
+  }
+  g.boundingBox = new THREE.Box3(new THREE.Vector3(x0, y0, z0), new THREE.Vector3(x1, y1, z1));
+  g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
   return g;
+}
+
+// Split a ring's cells into n x n tiles (cell ranges; boundaries are multiples of every stride used).
+function tilesOf(G, n) {
+  const cellsX = G.nx - 1;
+  const cellsZ = G.nz - 1;
+  const out = [];
+  for (let tj = 0; tj < n; tj++) {
+    for (let ti = 0; ti < n; ti++) {
+      out.push({
+        i0: Math.round((ti * cellsX) / n),
+        i1: Math.round(((ti + 1) * cellsX) / n),
+        j0: Math.round((tj * cellsZ) / n),
+        j1: Math.round(((tj + 1) * cellsZ) / n),
+        name: `${ti}${tj}`,
+      });
+    }
+  }
+  return out;
 }
 
 // --------------------------------------------------------------------------------------
@@ -112,6 +197,9 @@ uniform vec3 uFogSun;
 uniform vec3 uFogMid;
 uniform vec3 uFogSide;
 uniform vec3 uFogAway;
+uniform vec3 uSunOpen;
+uniform vec4 uSunOcc;
+uniform float uSunVisEye;
 varying vec3 vWPos;
 varying vec3 vWNormal;
 varying vec4 vCover;
@@ -130,6 +218,17 @@ float causticPattern( vec2 uv, float time ) {
   c /= 4.0;
   c = 1.17 - pow( c, 1.4 );
   return pow( abs( c ), 8.0 );
+}
+
+// Share of the key light reaching wp over the treeline occluder toward it (uSunOcc: occluder top
+// height, its distance from the dock along the light's azimuth, light elevation, disc radius).
+float sunLiftAt( vec3 wp, vec3 sunDirW ) {
+  float sl = length( sunDirW.xz );
+  if ( sl < 1e-4 ) return uSunVisEye;
+  float dp = uSunOcc.y - dot( wp.xz, sunDirW.xz / sl );
+  if ( dp < 1.0 ) return 1.0;
+  float eo = atan( uSunOcc.x - wp.y, dp );
+  return smoothstep( eo - uSunOcc.w, eo + uSunOcc.w, uSunOcc.z );
 }
 
 vec3 bumpNormal( vec3 pos, vec3 n, float hgt ) {
@@ -211,14 +310,16 @@ const SPLAT = /* glsl */ `
 
   // ---- lake bed ----
   float depth = max( 0.0, -h );
-  vec3 bedSand = mix( vec3( 0.14, 0.125, 0.085 ), vec3( 0.21, 0.185, 0.13 ), n2 * 0.7 + nMid * 0.3 );
-  bedSand *= 0.92 + 0.16 * dA.r;
-  bedSand = mix( bedSand, pebC * 0.8, smoothstep( 0.25, 0.5, peb ) * ( 1.0 - smoothstep( 0.8, 3.0, depth ) ) );
+  // sandy / gravel shelf out to ~2.5 m: pale sand with dark and light cobbles (visible from the dock)
+  vec3 bedSand = mix( vec3( 0.15, 0.135, 0.092 ), vec3( 0.235, 0.207, 0.145 ), n2 * 0.7 + nMid * 0.3 );
+  bedSand *= 0.9 + 0.2 * dA.r;
+  vec3 bedPeb = mix( vec3( 0.07, 0.066, 0.056 ), vec3( 0.27, 0.245, 0.2 ), smoothstep( 0.15, 0.9, pebH ) );
+  bedSand = mix( bedSand, bedPeb, smoothstep( 0.25, 0.5, peb ) * ( 1.0 - smoothstep( 2.0, 3.4, depth ) ) );
   // scattered organic debris / algae film in the shallows
   bedSand = mix( bedSand, vec3( 0.07, 0.075, 0.04 ), smoothstep( 0.6, 0.85, dC.r ) * 0.5 );
   vec3 silt = mix( vec3( 0.06, 0.055, 0.032 ), vec3( 0.095, 0.085, 0.05 ), n1 );
   vec3 muckC = mix( vec3( 0.03, 0.03, 0.017 ), vec3( 0.035, 0.05, 0.018 ), smoothstep( 0.4, 0.7, n2 ) );
-  float siltW = smoothstep( 1.5, 3.8, depth + ( nMid - 0.5 ) * 1.6 ); // sandy shelf around the dock, silt deeper
+  float siltW = smoothstep( 2.4, 4.5, depth + ( nMid - 0.5 ) * 1.6 ); // sandy shelf around the dock, silt deeper
   vec3 bed = mix( bedSand, silt, siltW );
   bed = mix( bed, muckC, muck );
   bed = mix( bed, granite * 0.75, rockW );
@@ -252,7 +353,7 @@ const SPLAT = /* glsl */ `
   if ( h < 0.05 ) {
     vec2 rd = vec2( 0.8, 0.6 );
     float ph = dot( wp, rd ) * 52.0 + ( nMid - 0.5 ) * 9.0 + n2 * 4.0;
-    ripples = ( 0.5 + 0.5 * sin( ph ) ) * ( 1.0 - smoothstep( 0.4, 2.2, depth ) ) * ( 1.0 - rockW ) * ( 1.0 - muck );
+    ripples = ( 0.5 + 0.5 * sin( ph ) ) * ( 1.0 - smoothstep( 0.6, 2.8, depth ) ) * ( 1.0 - rockW ) * ( 1.0 - muck );
   }
   float tBump = ( peb * 0.011 * ( sandW * ( 1.0 - 0.7 * wet ) + ( 1.0 - aboveWater ) * 0.7 ) + ripples * 0.005
     + dA.a * 0.006 * rockW + dA.b * 0.005 * ( 1.0 - rockW ) * ( 1.0 - sandW ) ) * fineFade
@@ -261,7 +362,7 @@ const SPLAT = /* glsl */ `
   // caustics on the shallow bed
   float tCaustic = 0.0;
   if ( h < 0.0 && uCaustic > 0.001 ) {
-    float cf = smoothstep( 0.0, 0.25, depth ) * ( 1.0 - smoothstep( 1.2, 4.0, depth ) );
+    float cf = smoothstep( 0.0, 0.25, depth ) * ( 1.0 - smoothstep( 2.5, 5.0, depth ) );
     if ( cf > 0.0 ) {
       vec2 warp = ( dC.gb - 0.5 ) * 0.9 + ( dB.rb - 0.5 ) * 0.25;
       float ca = causticPattern( wp * 1.21 + warp, uTime * 0.6 ) * 0.7 + causticPattern( rp * 0.77 + 0.5 - warp * 0.7, uTime * 0.45 + 3.0 ) * 0.3;
@@ -284,6 +385,14 @@ if ( tCanopy > 0.01 ) {
 }
 `;
 const LIGHT_INJECT = /* glsl */ `
+// hillsides that stand above the treeline shadow over the dock keep the low sun
+{
+  float lift = max( sunLiftAt( vWPos, uSunDirW ) - uSunVisEye, 0.0 );
+  if ( lift > 0.0 ) {
+    vec3 sunVL = normalize( ( viewMatrix * vec4( uSunDirW, 0.0 ) ).xyz );
+    reflectedLight.directDiffuse += BRDF_Lambert( diffuseColor.rgb ) * uSunOpen * ( lift * saturate( dot( normal, sunVL ) ) );
+  }
+}
 reflectedLight.directDiffuse *= 1.0 + tCaustic * 2.2;
 reflectedLight.directSpecular *= tSpec;
 reflectedLight.indirectSpecular *= tSpec;
@@ -304,6 +413,7 @@ const FOG = /* glsl */ `
   fogC = cs > 0.7071 ? mix( uFogMid, uFogSun, smoothstep( 0.7071, 1.0, cs ) ) : fogC;
   gl_FragColor.rgb = mix( gl_FragColor.rgb, fogC, fogFactor );
 #endif
+${DITHER_GLSL}
 `;
 
 export function createTerrain({ field, quality, detailTexture }) {
@@ -319,6 +429,9 @@ export function createTerrain({ field, quality, detailTexture }) {
     uFogMid: { value: new THREE.Color(1, 1, 1) },
     uFogSide: { value: new THREE.Color(1, 1, 1) },
     uFogAway: { value: new THREE.Color(1, 1, 1) },
+    uSunOpen: { value: new THREE.Color(0, 0, 0) },
+    uSunOcc: { value: new THREE.Vector4(0, 1000, 1, 0.005) },
+    uSunVisEye: { value: 1 },
   };
   const material = new THREE.MeshStandardMaterial({ name: 'env-terrain', roughness: 0.92, metalness: 0 });
   material.onBeforeCompile = (shader) => {
@@ -343,33 +456,131 @@ export function createTerrain({ field, quality, detailTexture }) {
       .replace('#include <lights_fragment_end>', '#include <lights_fragment_end>\n' + LIGHT_INJECT)
       .replace('#include <fog_fragment>', FOG);
   };
-  material.customProgramCacheKey = () => 'env-terrain-1';
+  material.customProgramCacheKey = () => 'env-terrain-2';
 
   const t0 = performance.now();
-  const g0 = buildGrid(field, B0, lod.s0, null, lod.s1);
-  const g1 = buildGrid(field, B1, lod.s1, B0, lod.s2);
-  const g2 = buildGrid(field, B2, lod.s2, B1, 0);
+  const G = [buildGrid(field, B0, lod.s0, null, lod.s1), buildGrid(field, B1, lod.s1, B0, lod.s2), buildGrid(field, B2, lod.s2, B1, 0)];
   const buildMs = performance.now() - t0;
 
-  const meshes = [g0, g1, g2].map((g, i) => {
-    const m = new THREE.Mesh(g, material);
-    m.name = `env-terrain-${i}`;
-    m.receiveShadow = i === 0; // the shadow box (+-25 m around the dock) lies inside the dense grid
+  const meshes = []; // everything to add to the scene
+  const fine = []; // full-detail main-view tiles (all rings)
+  const inner = []; // { tile, fineMesh, coarseMesh } for ring 0 (runtime 2 m LOD)
+  const wet = [];
+  const proxies = [];
+  const geometries = [];
+  const mk = (geo, name, receive) => {
+    const m = new THREE.Mesh(geo, material);
+    m.name = name;
+    m.receiveShadow = receive; // the shadow box (+-25 m around the dock) lies inside the dense ring
     m.castShadow = false;
     m.matrixAutoUpdate = false;
     m.updateMatrix();
-    m.layers.enable(LAYERS.UNDERWATER);
+    geometries.push(geo);
+    meshes.push(m);
     return m;
+  };
+  const wetKeep = (ymin) => ymin < WET_Y;
+  const dryKeep = (ymin, ymax) => ymax > DRY_Y;
+  G.forEach((g, ri) => {
+    // main view: full detail, NO_REFLECT (the reflection draws the proxies instead)
+    for (const t of tilesOf(g, TILES_MAIN[ri])) {
+      const idx = cellIndex(g, t.i0, t.i1, t.j0, t.j1, 1, null);
+      if (!idx.length) continue;
+      const m = mk(tileGeometry(g, idx), `env-terrain-${ri}.${t.name}`, ri === 0);
+      m.layers.enable(LAYERS.NO_REFLECT);
+      fine.push(m);
+      if (ri === 0) inner.push({ g, t, fineMesh: m, coarseMesh: null });
+    }
+    // water depth pre-pass: only cells that reach below the waterline
+    if (TILES_WET[ri]) {
+      for (const t of tilesOf(g, TILES_WET[ri])) {
+        const idx = cellIndex(g, t.i0, t.i1, t.j0, t.j1, 1, wetKeep);
+        if (!idx.length) continue;
+        const w = mk(tileGeometry(g, idx), `env-terrain-wet-${ri}.${t.name}`, false);
+        w.layers.set(LAYERS.UNDERWATER);
+        wet.push(w);
+      }
+    }
+    // planar reflection: coarse cells (4 m / 8 m) with some land above the water
+    const stride = ri < 2 ? Math.max(1, Math.round(PROXY_STEP[ri] / g.step)) : 1;
+    for (const t of tilesOf(g, TILES_REFL[ri])) {
+      const idx = cellIndex(g, t.i0, t.i1, t.j0, t.j1, stride, dryKeep);
+      if (!idx.length) continue;
+      const p = mk(tileGeometry(g, idx), `env-terrain-refl-${ri}.${t.name}`, ri === 0);
+      p.layers.set(LAYERS.REFLECTION);
+      proxies.push(p);
+    }
   });
-  const triangles = meshes.reduce((s, m) => s + m.geometry.index.count / 3, 0);
+  const tris = (list) => list.reduce((s, m) => s + (m.visible ? m.geometry.index.count / 3 : 0), 0);
+  const triangles = tris(fine);
+
+  // Main-view tiles are culled against the main camera with their boxes (cull(), called by the
+  // environment right before three builds the render list): a bounding sphere around a flat
+  // 76 m tile is so loose that three's own test keeps most tiles beside and behind the view.
+  // `on` says whether the tile belongs to the active LOD.
+  for (const m of fine) {
+    m.frustumCulled = false;
+    m.userData.on = true;
+  }
+  const frustum = new THREE.Frustum();
+  const projScreen = new THREE.Matrix4();
+  function cull(cam) {
+    projScreen.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    frustum.setFromProjectionMatrix(projScreen);
+    for (let i = 0; i < mainTiles.length; i++) {
+      const m = mainTiles[i];
+      m.visible = m.userData.on && frustum.intersectsBox(m.geometry.boundingBox);
+    }
+  }
+  const mainTiles = fine.slice();
+
+  // Runtime detail for the dense ring: 'fine' (boot LOD) or 'coarse' (2 m cells, same vertices;
+  // the ring's edge vertices sit on the 4 m stitch lines, so the 2 m index stays crack-free).
+  let detail = 'fine';
+  const canCoarsen = lod.s0 === 1;
+  function setDetail(d) {
+    const want = d === 'coarse' && canCoarsen ? 'coarse' : 'fine';
+    if (want === detail) return;
+    detail = want;
+    for (const it of inner) {
+      if (want === 'coarse' && !it.coarseMesh) {
+        const idx = cellIndex(it.g, it.t.i0, it.t.i1, it.t.j0, it.t.j1, 2, null);
+        const c = mk(tileGeometry(it.g, idx), `${it.fineMesh.name}.coarse`, true);
+        c.layers.mask = it.fineMesh.layers.mask;
+        c.frustumCulled = false;
+        it.coarseMesh = c;
+        mainTiles.push(c);
+        if (it.fineMesh.parent) it.fineMesh.parent.add(c);
+      }
+      it.fineMesh.userData.on = want === 'fine';
+      it.fineMesh.visible = want === 'fine';
+      if (it.coarseMesh) {
+        it.coarseMesh.userData.on = want === 'coarse';
+        it.coarseMesh.visible = want === 'coarse';
+      }
+    }
+  }
+
   return {
     meshes,
     material,
     uniforms,
     buildMs,
     triangles,
+    setDetail,
+    cull,
+    get detail() {
+      return detail;
+    },
+    stats() {
+      const on = mainTiles.filter((m) => m.userData.on);
+      const total = (list) => list.reduce((s, m) => s + m.geometry.index.count / 3, 0);
+      return { mainTris: total(on), mainVisibleTris: tris(on), wetTris: total(wet), reflTris: total(proxies), meshes: meshes.length, detail };
+    },
     dispose() {
-      for (const m of meshes) m.geometry.dispose();
+      for (const m of meshes) m.removeFromParent();
+      // the tile geometries share each ring's attributes: dispose them all together
+      for (const g of geometries) g.dispose();
       material.dispose();
     },
   };

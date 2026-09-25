@@ -14,7 +14,8 @@
 //   }
 // ctx = { renderer, scene, camera, events, quality, env }. Only the contract env API is used
 // (getTerrainHeight / getDepth / getHabitat / windStrength / windDirection / sunDirection /
-// sunColor / sunIntensity / horizonColor / envMap).
+// sunColor / sunIntensity / horizonColor / envMap), plus the optional env.setSkylineProfile()
+// extra: the forest's skyline, for the environment's sun / moon occlusion.
 import * as THREE from 'three';
 import { buildDock } from './dock.js';
 import { createSharedUniforms } from './shaderlib.js';
@@ -47,6 +48,8 @@ export function createScenery(ctx) {
   const forest = buildForest({ env, quality, renderer: ctx.renderer, shared, grid, culler });
   root.add(forest.group);
   parts.push({ update: (frame) => forest.update(frame, scene) });
+  // the environment dims the key light while the sun / moon is behind the treeline we just built
+  if (env && typeof env.setSkylineProfile === 'function') env.setSkylineProfile(forest.skyline);
   const t2 = performance.now();
   const shore = buildShore({ env, quality, shared, grid, culler });
   root.add(shore.group);
@@ -64,6 +67,12 @@ export function createScenery(ctx) {
     if (env.sunColor && env.sunColor.isColor) {
       const si = Number.isFinite(env.sunIntensity) ? env.sunIntensity : 1;
       shared.uSunColor.value.copy(env.sunColor).multiplyScalar(si);
+      // treeline occlusion (env extras; without them tall things simply get no extra light)
+      const open = Number.isFinite(env.sunOpenIntensity) ? env.sunOpenIntensity : si;
+      shared.uSunOpen.value.copy(env.sunColor).multiplyScalar(open);
+      shared.uSunVisEye.value = Number.isFinite(env.sunVisibility) ? env.sunVisibility : 1;
+      if (env.sunOccluder && env.sunOccluder.isVector4) shared.uSunOcc.value.copy(env.sunOccluder);
+      else shared.uSunVisEye.value = 1;
     }
   }
   syncShared(null);
@@ -80,12 +89,17 @@ export function createScenery(ctx) {
     }
   }
 
-  // Runtime quality: the build uses ctx.quality; if the core drops to 'low' later (adaptive
-  // quality), hide optional detail. Restores when quality goes back up.
+  // Runtime quality: the build uses ctx.quality; if the core changes it later (adaptive or manual)
+  // only cheap switches happen, never a shader recompile: below the boot level the instanced
+  // trees / reeds / lily pads are thinned by lowering InstancedMesh.count (their instance lists
+  // are shuffled at build, so a prefix is an even subsample), and on 'low' optional detail hides.
+  // Everything restores when quality goes back up.
   const optional = [];
   root.traverse((o) => {
     if (/^(shore\.reedCards|shore\.farRocks|wildlife\.dragonflies|shore\.pondlily)/.test(o.name)) optional.push(o);
   });
+  const DENSITY = { high: { trees: 1, reeds: 1, pads: 1 }, medium: { trees: 0.85, reeds: 0.8, pads: 0.8 }, low: { trees: 0.6, reeds: 0.5, pads: 0.5 } };
+  const thin = [...(forest.thin || []), ...(shore.thin || [])];
   let runtimeQ = quality;
   function applyRuntimeQuality(q) {
     if (q === runtimeQ) return;
@@ -95,6 +109,10 @@ export function createScenery(ctx) {
       o.userData.sceneryHidden = hide;
       if (hide) o.visible = false;
       else if (!o.name.startsWith('wildlife.')) o.visible = true;
+    }
+    for (const t of thin) {
+      const k = Math.min(1, DENSITY[q][t.kind] / DENSITY[quality][t.kind]);
+      t.mesh.count = Math.max(1, Math.ceil(t.base * k));
     }
   }
 

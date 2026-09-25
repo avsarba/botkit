@@ -1,5 +1,8 @@
 <title>Loon Lake Angler</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Stencil+Display:wght@700;800&family=Barlow+Semi+Condensed:ital,wght@0,400;0,500;0,600;0,700;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<!-- Fonts load without blocking the first paint (a hanging fonts host must not hold up the title);
+     the fallback stacks in --f-* cover the wait. If a CSP blocks this inline handler, src/ui/index.js
+     adds a script-created stylesheet link instead. -->
+<link id="font-css" rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Stencil+Display:wght@700;800&family=Barlow+Semi+Condensed:ital,wght@0,400;0,500;0,600;0,700;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" onload="this.onload=null;this.rel='stylesheet'">
 <style>
 /* Loon Lake Angler: overlay UI. One dark game world, so a single theme with explicit colors. */
 :root {
@@ -12,6 +15,7 @@
   --hair: rgba(236, 244, 240, 0.14);
   --hair-strong: rgba(236, 244, 240, 0.3);
   --text: #ecf3ef;
+  --text-soft: rgba(236, 243, 239, 0.84); /* small labels on glass that must hold 4.5:1 over bright sky */
   --muted: #9db1ad;
   --dim: rgba(157, 177, 173, 0.62);
   --red: #e0452b;
@@ -101,6 +105,7 @@ body {
   touch-action: manipulation;
 }
 :where(#ui) button:disabled { cursor: default; }
+#ui [hidden] { display: none !important; } /* many HUD parts set display; hidden must still win */
 #ui :focus { outline: none; }
 #ui :focus-visible { outline: 2px solid var(--line); outline-offset: 2px; }
 #ui .paper :focus-visible { outline-color: var(--ink); }
@@ -137,12 +142,21 @@ body {
   pointer-events: none;
 }
 .clock { display: flex; flex-direction: column; gap: 4px; padding: 4px; pointer-events: auto; }
+/* the clock sits on the sky: a denser glass keeps its small labels readable over white cloud */
+.clock.glass { background: var(--glass-strong); }
 .clock-face {
   display: flex; align-items: center; gap: 10px;
   min-height: 40px; padding: 2px 10px 2px 8px;
   border: 0; border-radius: 7px; background: transparent;
 }
 .clock-face:hover { background: var(--glass-hi); }
+/* chevron: the clock opens the time-of-day presets */
+.clock-face::after {
+  content: ""; flex: none; width: 6px; height: 6px; margin: -3px 0 0 -2px;
+  border: solid var(--muted); border-width: 0 1.5px 1.5px 0;
+  transform: translateY(0) rotate(45deg); transition: transform 160ms ease;
+}
+.clock-face[aria-expanded="true"]::after { transform: translateY(4px) rotate(-135deg); }
 .sunarc { width: 38px; height: 22px; flex: none; overflow: visible; }
 .sunarc .horizon { stroke: var(--hair-strong); stroke-width: 1; }
 .sunarc .path { fill: none; stroke: var(--hair-strong); stroke-width: 1; stroke-dasharray: 1.5 2.5; }
@@ -153,7 +167,7 @@ body {
 .presets { display: flex; gap: 2px; padding: 0 2px 2px; }
 .chip {
   font: 600 11px/1 var(--f-ui); letter-spacing: 0.1em; text-transform: uppercase;
-  color: var(--muted); background: transparent;
+  color: var(--text-soft); background: transparent;
   border: 1px solid transparent; border-radius: 6px;
   padding: 7px 8px 6px; min-height: 28px;
 }
@@ -178,10 +192,11 @@ body {
   font: 600 10px/18px var(--f-mono); text-align: center;
 }
 
-/* toasts */
+/* toasts: src/ui/index.js moves the stack below an open time-preset row and, while the catch card is
+   a side panel, into the free strip left of the card (--toast-top / --toast-x / --toast-w). */
 .toasts {
-  position: fixed; left: 50%; top: calc(70px + var(--safe-t)); transform: translateX(-50%);
-  width: min(440px, calc(100% - 2 * var(--gut)));
+  position: fixed; left: var(--toast-x, 50%); top: var(--toast-top, calc(70px + var(--safe-t))); transform: translateX(-50%);
+  width: var(--toast-w, min(440px, calc(100% - 2 * var(--gut))));
   display: flex; flex-direction: column; align-items: center; gap: 8px;
   pointer-events: none;
 }
@@ -202,13 +217,19 @@ body {
 .toast.is-out { opacity: 0; transform: translateY(-6px); }
 @keyframes toast-in { from { transform: translateY(-8px); } to { transform: none; } }
 
-/* center: cast power + prompt */
+/* Prompt band: cast power + prompt live in a bottom-centre band, never in the middle of the screen
+   where the float and the hooked fish sit. src/ui/index.js measures the lure panel and the gauge and
+   sets --band-x / --band-w / --band-b: between the two panels when the gap is wide enough (desktop,
+   landscape phones), else just above the bottom controls (portrait phones and tablets). The power bar
+   stacks above the prompt. */
 .center {
-  position: fixed; left: 50%; top: 61%; transform: translateX(-50%);
-  width: min(420px, calc(100% - 2 * var(--gut)));
-  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  position: fixed; left: var(--band-x, 50%); bottom: var(--band-b, calc(var(--gut) + var(--safe-b))); transform: translateX(-50%);
+  width: var(--band-w, min(420px, calc(100% - 2 * var(--gut))));
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
   pointer-events: none;
 }
+/* netting: the bottom controls fade out (no input), so the pill drops to the bottom edge */
+#ui[data-state="landing"] .center { bottom: calc(var(--gut) + var(--safe-b)); }
 .power { width: min(300px, 100%); box-sizing: border-box; padding: 9px 14px 12px; }
 .power-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
 .power-est { font: 500 14px/1 var(--f-mono); color: var(--text); font-variant-numeric: tabular-nums; }
@@ -232,11 +253,14 @@ body {
   display: flex; align-items: center; gap: 10px;
   max-width: 100%; box-sizing: border-box;
   padding: 8px 16px 8px 13px;
-  font: 600 15px/1.2 var(--f-ui); letter-spacing: 0.12em; text-transform: uppercase;
-  color: var(--text); text-align: center;
-  background: var(--glass); border: 1px solid var(--hair); border-radius: 999px;
+  font: 600 15px/1.3 var(--f-ui); letter-spacing: 0.02em;
+  color: var(--text); text-align: center; text-wrap: balance;
+  background: var(--glass-strong); border: 1px solid var(--hair); border-radius: 18px;
   -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+  transition: opacity 400ms ease;
 }
+/* steady hints (waiting / fighting) fade after a few seconds; warnings always stay */
+.prompt.is-quiet { opacity: 0; }
 .prompt::before { content: ""; flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
 .prompt[data-kind="ready"]::before, .prompt[data-kind="good"]::before { background: var(--line); }
 .prompt[data-kind="warn"] { border-color: var(--amber-soft); }
@@ -245,11 +269,14 @@ body {
 .prompt[data-kind="danger"]::before { background: var(--red); animation: blink 0.5s steps(2, jump-none) infinite; }
 @keyframes blink { 50% { opacity: 0.25; } }
 
-/* strike cue */
+/* strike cue: upper third, above the horizon, so the float going under / a topwater blow-up stays in view */
 .strike {
   position: fixed; left: 0; right: 0; top: 30%;
   display: flex; flex-direction: column; align-items: center; gap: 4px;
   pointer-events: none; text-align: center;
+}
+@media (min-width: 721px) and (min-height: 521px) {
+  .strike { top: auto; bottom: 63%; }
 }
 .strike-word {
   font: 800 clamp(76px, 12vw, 150px)/0.9 var(--f-display);
@@ -262,12 +289,32 @@ body {
   color: var(--text); text-shadow: 0 1px 2px var(--shadow-deep), 0 0 12px var(--text-shadow);
 }
 
+/* aim mark: a cast flies along the view's centre line (ready + charging only) */
+.aim {
+  position: fixed; left: 50%; top: 50%; width: 24px; height: 32px; margin: -16px 0 0 -12px;
+  overflow: visible; pointer-events: none;
+  opacity: 0; transition: opacity 220ms ease;
+}
+.aim path { fill: none; stroke-linecap: round; }
+.aim .aim-halo path { stroke: var(--text-shadow); stroke-width: 3.6; }
+.aim .aim-halo circle { fill: var(--text-shadow); }
+.aim .aim-mark path { stroke: var(--text); stroke-width: 1.5; }
+.aim .aim-mark circle { fill: var(--text); }
+#ui[data-state="ready"] .aim { opacity: 0.5; }
+#ui[data-state="charging"] .aim { opacity: 0.8; }
+
 /* bottom: lures + tension gauge */
 .hud-bottom {
   position: fixed; left: 0; right: 0; bottom: 0;
   display: flex; justify-content: space-between; align-items: flex-end; gap: 12px;
   padding: 0 max(var(--gut), var(--safe-r)) calc(var(--gut) + var(--safe-b)) max(var(--gut), var(--safe-l));
   pointer-events: none;
+  transition: opacity 250ms ease, visibility 0s linear 0s;
+}
+/* netting: no input is possible, so the bottom controls step aside for the fish coming to the net */
+#ui[data-state="landing"] .hud-bottom {
+  opacity: 0; visibility: hidden;
+  transition: opacity 250ms ease, visibility 0s linear 250ms;
 }
 .lures { display: flex; gap: 4px; padding: 5px; pointer-events: auto; }
 .lure {
@@ -297,6 +344,16 @@ body {
   pointer-events: auto;
 }
 .gauge-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-height: 16px; }
+/* rod meter (fighting): the rod seen from behind; it leans with side pressure, stands taller as it is
+   lifted, and turns amber when it points straight down the line at the fish (no cushion) */
+.rodmeter { display: inline-grid; place-items: center; width: 40px; height: 22px; margin: -4px 0; }
+.rodmeter svg { width: 40px; height: 22px; overflow: visible; }
+.rm-arc { fill: none; stroke: var(--hair-strong); stroke-width: 1; stroke-dasharray: 1.5 2.5; }
+.rm-base { stroke: var(--muted); stroke-width: 1.5; stroke-linecap: round; }
+.rm-rod { stroke: var(--text); stroke-width: 2.2; stroke-linecap: round; }
+.rm-tip { fill: var(--line); }
+.rodmeter.is-stiff .rm-rod { stroke: var(--amber); }
+.rodmeter.is-stiff .rm-tip { fill: var(--amber); }
 .fish-on { display: inline-flex; align-items: center; gap: 6px; font: 600 11px/1 var(--f-ui); letter-spacing: 0.14em; text-transform: uppercase; color: var(--text); }
 .fish-on::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--red); }
 .dial { position: relative; width: 100%; aspect-ratio: 240 / 164; }
@@ -322,6 +379,10 @@ body {
 .dial-value { font: 500 30px/1 var(--f-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
 .dial[data-level="1"] .dial-value { color: var(--amber); }
 .dial[data-level="2"] .dial-value { color: var(--red); }
+/* slack line with a fish on: the empty track pulses amber (the hook can fall out) */
+.dial[data-slack="1"] .g-track { animation: slack-pulse 0.9s ease-in-out infinite; }
+.dial[data-slack="1"] .dial-value { color: var(--amber); }
+@keyframes slack-pulse { 50% { stroke: var(--amber-soft); } }
 .action {
   display: none;
   position: absolute; left: 50%; top: 68.3%; transform: translate(-50%, -50%);
@@ -363,10 +424,15 @@ body {
 #ui[data-input="touch"] .dial-center { display: none; }
 #ui[data-input="touch"] .ro-fish { display: none; }
 #ui[data-input="touch"] .ro-tension { display: flex; }
+/* touch: thumb-sized targets (44 px) */
 #ui[data-input="touch"] .icon-btn { width: 46px; height: 46px; }
-#ui[data-input="touch"] .clock-face { min-height: 36px; }
-#ui[data-input="touch"] .drag-btn { height: 42px; }
+#ui[data-input="touch"] .clock-face { min-height: 44px; }
+#ui[data-input="touch"] .presets { gap: 4px; }
+#ui[data-input="touch"] .chip { min-height: 40px; padding-inline: 10px; }
+#ui[data-input="touch"] .drag-btn { height: 44px; }
 #ui[data-input="touch"] .drag-row { grid-template-columns: 44px 1fr 44px; }
+#ui[data-input="touch"] .close-btn { width: 44px; height: 44px; }
+#ui[data-input="touch"] .seg button { min-height: 44px; }
 
 /* ---------- title ---------- */
 .title {
@@ -398,24 +464,45 @@ body {
 }
 .wordmark span { display: block; }
 .lede { margin: 0; max-width: 36ch; font: 400 19px/1.4 var(--f-ui); color: var(--text); text-wrap: pretty; }
-.controls { margin: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 22px; max-width: 470px; }
-.controls > div { display: grid; grid-template-columns: 92px 1fr; align-items: baseline; gap: 10px; }
+/* Controls lists (title + pause). The <div> rows are display: contents so the key and action columns
+   line up across rows and size to the real font (max-content), whatever font actually loaded. */
+.controls {
+  margin: 0; display: grid; align-items: baseline;
+  grid-template-columns: max-content minmax(0, 1fr) max-content minmax(0, 1fr);
+  gap: 9px 10px; max-width: 560px;
+}
+.controls > div { display: contents; }
+.controls > div:nth-child(even) > dt { margin-left: 14px; }
 .controls dt, .controls dd { margin: 0; }
 .controls dt { font: 500 13px/1.25 var(--f-ui); color: var(--muted); white-space: nowrap; }
 .controls dd { font: 500 14px/1.25 var(--f-ui); color: var(--muted); }
+.controls > .ctl-note { display: flex; align-items: baseline; gap: 10px; grid-column: 1 / -1; margin-top: 2px; }
+.controls > .ctl-note > dt { margin-left: 0; }
+.controls > .ctl-note > dd { color: var(--text); }
+.keys { margin: 0; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 12px; align-items: baseline; }
+.keys > div { display: contents; }
+.keys dt, .keys dd { margin: 0; }
+.keys dt { font: 500 13px/1.3 var(--f-ui); color: var(--muted); white-space: nowrap; }
+.keys dd { font: 500 14px/1.3 var(--f-ui); color: var(--text); }
 kbd {
   display: inline-block; padding: 3px 6px 2px;
   font: 500 11px/1.2 var(--f-mono); color: var(--text); white-space: nowrap;
   border: 1px solid var(--hair-strong); border-bottom-width: 2px; border-radius: 4px;
   background: var(--fill-faint);
 }
-.ctl-touch { display: none; grid-template-columns: minmax(0, 1fr); max-width: 380px; }
-.ctl-touch > div { grid-template-columns: 158px 1fr; }
+/* show the list for the current input (mouse + keyboard, or touch) */
+.ctl-touch { display: none; }
 #ui[data-input="touch"] .ctl-mouse { display: none; }
 #ui[data-input="touch"] .ctl-touch { display: grid; }
 @media (pointer: coarse) {
   #ui:not([data-input]) .ctl-mouse { display: none; }
   #ui:not([data-input]) .ctl-touch { display: grid; }
+}
+.controls.ctl-touch { grid-template-columns: max-content minmax(0, 1fr); max-width: 440px; }
+.controls.ctl-touch > div:nth-child(even) > dt { margin-left: 0; }
+/* the fight hint only where the title has room for it (the pause menu always lists it) */
+@media (max-height: 599px) {
+  .title .ctl-note { display: none; }
 }
 .title-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 14px 22px; }
 .btn-primary {
@@ -450,7 +537,8 @@ kbd {
   box-shadow: 0 22px 60px var(--shadow-deep), 0 1px 0 var(--paper-edge) inset;
 }
 .nb-head {
-  display: grid; grid-template-columns: 1.5fr 1fr 0.8fr; gap: 10px;
+  /* date and time size to their text; the location takes what is left (and may ellipsize) */
+  display: grid; grid-template-columns: minmax(0, 1.3fr) max-content max-content; gap: 10px 14px;
   padding-bottom: 10px; border-bottom: 1.5px solid var(--ink);
 }
 .nb-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
@@ -479,7 +567,12 @@ kbd {
   animation: card-in 460ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 @keyframes card-in { from { transform: translateX(calc(100% + 40px)) rotate(2deg); } to { transform: none; } }
-.catch-scroll { position: relative; overflow: auto; padding: 18px 22px 8px; display: flex; flex-direction: column; gap: 14px; }
+.catch-scroll { position: relative; overflow: auto; padding: 18px 22px 8px; display: flex; flex-direction: column; gap: 14px; overscroll-behavior: contain; }
+/* more below: the last lines fade out until the card is scrolled to the end (class set in src/ui/index.js) */
+.catch-scroll.has-more {
+  -webkit-mask-image: linear-gradient(#000 calc(100% - 28px), transparent);
+  mask-image: linear-gradient(#000 calc(100% - 28px), transparent);
+}
 .catch-title { display: flex; flex-direction: column; gap: 4px; padding-top: 4px; }
 .sp-name {
   margin: 0; font: 800 44px/0.92 var(--f-display); letter-spacing: 0.02em; text-transform: uppercase;
@@ -556,6 +649,11 @@ kbd {
 .j-sp-latin { display: block; margin-top: 2px; font: italic 400 13px/1.2 var(--f-ui); color: var(--ink-soft); }
 .j-table tr.uncaught .j-sp-name { color: var(--ink-soft); font-weight: 600; }
 .j-none { text-align: right !important; font: italic 400 14px/1.2 var(--f-ui); color: var(--ink-soft); }
+/* field tip for a species not caught yet: best bait, best time, where to look */
+.j-table tr.has-tip > th, .j-table tr.has-tip > td { border-bottom: 0; padding-bottom: 3px; }
+.j-table tr.j-tip-row > td { padding-top: 0; }
+.j-tip { display: block; max-width: 62ch; font: 500 13px/1.3 var(--f-ui); color: var(--ink); text-wrap: pretty; }
+.j-tip b { font-weight: 600; }
 .recent-list { list-style: none; margin: 0; padding: 0; }
 .recent-list .r-row {
   display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 12px; align-items: baseline;
@@ -571,15 +669,33 @@ kbd {
 .pause {
   width: min(400px, 100%); box-sizing: border-box; max-height: 100%; overflow: auto;
   padding: 24px 24px 22px;
-  display: flex; flex-direction: column; gap: 16px;
+  display: flex; flex-direction: column; gap: 22px;
   background: var(--glass-strong);
 }
+.pause-main { display: flex; flex-direction: column; gap: 16px; }
 .pause h2 { margin: 0 0 4px; font: 800 52px/0.9 var(--f-display); letter-spacing: 0.04em; text-transform: uppercase; }
+/* how to play: every control for the current input, the fight controls and what each lure is for */
+.pause-help { display: flex; flex-direction: column; gap: 10px; padding-top: 18px; border-top: 1px solid var(--hair); }
+.help-h { margin: 8px 0 0; }
+.help-h:first-child { margin-top: 0; }
+.help-p { margin: 0; font: 500 13px/1.4 var(--f-ui); color: var(--muted); }
+.lure-notes dt { font: 600 11px/1.3 var(--f-ui); letter-spacing: 0.1em; text-transform: uppercase; color: var(--text); }
+.lure-notes dd { color: var(--muted); }
+#ui .pause-help:focus-visible { outline-offset: -2px; }
+.pause.has-more, .pause-help.has-more {
+  -webkit-mask-image: linear-gradient(#000 calc(100% - 32px), transparent);
+  mask-image: linear-gradient(#000 calc(100% - 32px), transparent);
+}
+@media (min-width: 700px) {
+  .pause { width: min(860px, 100%); flex-direction: row; align-items: stretch; gap: 0; overflow: hidden; }
+  .pause-main { flex: 0 0 356px; min-height: 0; overflow: auto; padding-right: 26px; }
+  .pause-help { flex: 1 1 auto; min-width: 0; min-height: 0; overflow: auto; padding: 0 2px 2px 26px; border-top: 0; border-left: 1px solid var(--hair); }
+}
 .set-row { display: grid; grid-template-columns: 84px 1fr; align-items: center; gap: 12px; }
 .seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 2px; padding: 3px; border: 1px solid var(--hair); border-radius: 8px; background: var(--fill-faint); }
 .seg button {
-  min-height: 36px; padding: 0 8px;
-  font: 600 13px/1 var(--f-ui); letter-spacing: 0.08em; text-transform: uppercase;
+  min-height: 38px; padding: 0 4px;
+  font: 600 13px/1 var(--f-ui); letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap;
   color: var(--muted); background: transparent; border: 0; border-radius: 5px;
 }
 .seg button:hover { color: var(--text); background: var(--glass-hi); }
@@ -598,8 +714,8 @@ kbd {
   .title-inner { gap: 18px; }
   .wordmark { font-size: min(18vw, 84px); }
   .lede { font-size: 17px; }
-  .controls { grid-template-columns: 1fr; gap: 8px; }
-  .ctl-mouse > div { grid-template-columns: 116px 1fr; }
+  .controls { grid-template-columns: max-content minmax(0, 1fr); gap: 8px 12px; }
+  .controls > div:nth-child(even) > dt { margin-left: 0; }
   .title-actions { flex-direction: column; align-items: stretch; }
   .btn-primary { width: 100%; }
 
@@ -609,21 +725,13 @@ kbd {
   .lure svg { width: 50px; height: 25px; }
   .lure-name { font-size: 10px; letter-spacing: 0.04em; gap: 4px; }
   .gauge { width: 208px; padding: 8px 10px 10px; }
-  .center { top: 56%; }
   .strike { top: 26%; }
 
-  .catch {
-    left: 0; right: 0; bottom: 0; top: auto;
-    width: auto; height: auto; margin: 0;
-    max-height: min(66%, 600px);
-    border-radius: 14px 14px 0 0;
-    animation-name: sheet-in;
-  }
   .catch-scroll { padding: 16px 20px 6px; gap: 12px; }
   .sp-name { font-size: 38px; }
   .measure .big { font-size: 25px; }
   .stamp { font-size: 15px; }
-  .catch-actions { padding: 10px 20px calc(14px + var(--safe-b)); }
+  .catch-actions { padding: 10px 20px 14px; }
 
   .modal { padding: calc(10px + var(--safe-t)) 10px calc(10px + var(--safe-b)); }
   .journal-head { padding: 16px 16px 12px; }
@@ -631,20 +739,22 @@ kbd {
   .journal-body { padding: 4px 16px 18px; }
   .j-table .c-len { display: none; }
   .j-table .num { padding-left: 14px; }
+  .pause { padding: 20px 18px 18px; }
 }
 @media (max-width: 860px) {
   .journal { width: min(640px, 100%); }
   .journal-body { grid-template-columns: minmax(0, 1fr); gap: 18px; }
 }
 @media (max-width: 400px) {
-  .hud-top { gap: 8px; }
-  .clock-face { gap: 7px; padding: 2px 8px 2px 6px; }
-  .sunarc { width: 32px; height: 19px; }
+  /* narrow phones: tighten the clock, never the 46 px touch buttons */
+  .hud-top { gap: 4px; }
+  .clock { padding: 3px; }
+  .clock-face { gap: 5px; padding: 2px 6px 2px 5px; }
+  .clock-face::after { margin-left: -1px; }
+  .sunarc { width: 30px; height: 18px; }
   .clock-time { font-size: 18px; }
   .clock-ampm { font-size: 11px; margin-left: 3px; }
-  .tools { gap: 6px; }
-  #ui[data-input] .icon-btn { width: 42px; height: 42px; }
-  #ui[data-input] .clock-face { min-height: 32px; }
+  .tools { gap: 4px; }
 }
 @media (max-width: 370px) {
   /* units stay available in the pause menu */
@@ -658,33 +768,38 @@ kbd {
   .title-inner { gap: 12px; }
   .wordmark { font-size: min(13vh, 64px); }
   .lede { font-size: 15px; }
-  .controls { gap: 5px 18px; }
+  .controls { gap: 5px 10px; }
   .gauge { width: 188px; padding: 6px 8px 8px; }
   .readouts { display: none; }
   .drag-row { margin-top: 2px; }
   .lures { flex-direction: column; padding: 3px; gap: 2px; }
-  .lure { width: 60px; padding: 4px 2px 5px; gap: 3px; }
+  /* names, not key digits: the digits mean nothing on a phone */
+  .lure { width: 74px; padding: 4px 2px 5px; gap: 3px; }
   .lure svg { width: 44px; height: 22px; }
-  .lure .lure-name span:last-child { display: none; }
+  .lure-name { font-size: 10px; letter-spacing: 0.03em; gap: 3px; }
+  #ui[data-input="touch"] .lure .key { display: none; }
   .action-main { font-size: 13px; letter-spacing: 0.05em; }
   .action-sub { font-size: 9px; }
-  /* prompt + power move to the free strip between the lure column and the dial */
-  .center { top: auto; bottom: calc(16px + var(--safe-b)); width: clamp(200px, calc(100% - 520px), 320px); flex-direction: column-reverse; gap: 8px; }
   .prompt { font-size: 13px; padding: 7px 13px 7px 11px; border-radius: 16px; }
   .strike { top: 14%; }
   .strike-word { font-size: clamp(64px, 18vh, 110px); }
   .catch { width: min(380px, 46vw); max-height: calc(100% - 16px - var(--safe-t) - var(--safe-b)); }
   .catch-scroll { padding: 12px 18px 4px; gap: 9px; }
+  /* the notebook header collapses to one line of small mono text */
+  .nb-head { padding-bottom: 6px; gap: 4px 12px; }
+  .nb-head .nb-label { display: none; }
+  .nb-head .nb-val { font-size: 11px; border-bottom: 0; padding-bottom: 0; color: var(--ink-soft); }
   .sp-name { font-size: 30px; }
   .sp-latin { font-size: 15px; }
   .measure { padding: 8px 0; }
   .measure .big { font-size: 22px; }
   .blurb { font-size: 14px; }
   .catch-actions { padding: 8px 18px 12px; }
-  .btn-ink, .btn-ink-line { min-height: 40px; }
   .journal-head { padding: 12px 18px 10px; }
   .journal-head h2 { font-size: 28px; }
   .journal-body { padding: 2px 18px 14px; }
+  .pause { padding: 16px 18px; }
+  .pause h2 { font-size: 40px; }
 }
 @media (max-height: 520px) and (min-width: 600px) {
   .title {
@@ -701,9 +816,41 @@ kbd {
   .eyebrow { grid-area: eyebrow; }
   .wordmark { grid-area: word; }
   .lede { grid-area: lede; }
-  .controls { grid-area: controls; align-self: center; grid-template-columns: minmax(0, 1fr); }
+  /* the controls column sits over the rod and the bright line: give it its own panel */
+  .controls {
+    grid-area: controls; align-self: center; grid-template-columns: max-content minmax(0, 1fr);
+    padding: 10px 14px; border: 1px solid var(--hair); border-radius: var(--radius);
+    background: var(--glass-strong);
+    -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  }
+  .controls > div:nth-child(even) > dt { margin-left: 0; }
+  .controls dt, .controls dd { color: var(--text); }
   .title-actions { grid-area: actions; flex-direction: row; align-items: center; }
   .btn-primary { width: auto; min-height: 50px; }
+  /* journal: two columns and a one-line header, so recent catches are not 700 px down */
+  .journal { width: min(1000px, 100%); }
+  .journal-body { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 0 24px; }
+  .j-sp-latin { display: none; }
+  .j-table th, .j-table td { padding: 6px 0; }
+  .r-meta { white-space: normal; }
+  .journal-head { grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; }
+  .journal-totals { grid-column: 2; grid-row: 1; }
+  .close-btn { grid-row: 1; grid-column: 3; }
+}
+
+/* ONE rule decides the catch card's form: a bottom sheet when the window is narrow (width <= 720 px)
+   or portrait (aspect <= 0.85: max-aspect-ratio 17/20), otherwise a side panel on the right. Core
+   frames the showcase fish from ui.getCatchRect(), so the fish and the card always agree. Keep this
+   block last: it must win over the short-landscape side-panel sizing above. */
+@media (max-width: 720px), (max-aspect-ratio: 17/20) {
+  .catch {
+    left: 0; right: 0; bottom: 0; top: auto;
+    width: auto; max-width: 640px; height: auto; margin: 0 auto;
+    max-height: min(66%, 600px);
+    border-radius: 14px 14px 0 0;
+    animation-name: sheet-in;
+  }
+  .catch-actions { padding-bottom: calc(14px + var(--safe-b)); }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -711,6 +858,8 @@ kbd {
   .toast { transition: none; }
   .catch { transform: none; }
   .prompt[data-kind="danger"]::before { animation: none; }
+  .prompt, .aim, .hud-bottom, .clock-face::after { transition: none; }
+  .dial[data-slack="1"] .g-track { animation: none; stroke: var(--amber-soft); }
 }
 </style>
 <div id="stage" aria-hidden="true"></div>
@@ -758,11 +907,24 @@ kbd {
       <span class="strike-sub" id="strike-sub">Click to set the hook</span>
     </div>
 
+    <svg class="aim" id="aim" viewBox="0 0 24 32" aria-hidden="true">
+      <g class="aim-halo"><path d="M12 3v7M12 22v7"></path><circle cx="12" cy="16" r="2.4"></circle></g>
+      <g class="aim-mark"><path d="M12 3v7M12 22v7"></path><circle cx="12" cy="16" r="1.5"></circle></g>
+    </svg>
+
     <footer class="hud-bottom">
       <div class="lures glass" id="lures" role="group" aria-label="Lure"></div>
       <section class="gauge glass" id="gauge" aria-label="Line tension">
         <div class="gauge-head">
           <span class="label" id="gauge-label">12 lb test</span>
+          <span class="rodmeter" id="rodmeter" title="Your rod: height and side pressure" hidden>
+            <svg viewBox="0 0 44 24" aria-hidden="true">
+              <path class="rm-arc" d="M5.2 15.3A18 18 0 0 1 38.8 15.3"></path>
+              <line class="rm-base" x1="14" y1="22.5" x2="30" y2="22.5"></line>
+              <line class="rm-rod" id="rodmeter-rod" x1="22" y1="22" x2="22" y2="8"></line>
+              <circle class="rm-tip" id="rodmeter-tip" cx="22" cy="8" r="1.8"></circle>
+            </svg>
+          </span>
           <span class="fish-on" id="fish-on" hidden>Fish on</span>
         </div>
         <div class="dial" id="dial" data-level="0">
@@ -797,21 +959,23 @@ kbd {
       <h1 class="wordmark" id="title-h"><span>Loon Lake</span> <span>Angler</span></h1>
       <p class="lede">Cast from the dock at first light and play every fish on 12&nbsp;lb line.</p>
       <dl class="controls ctl-mouse" aria-label="Controls">
-        <div><dt><kbd>Mouse</kbd></dt><dd>Aim</dd></div>
+        <div><dt><kbd>Mouse</kbd> <kbd>A</kbd> <kbd>D</kbd></dt><dd>Aim</dd></div>
         <div><dt><kbd>1</kbd> – <kbd>4</kbd></dt><dd>Lures</dd></div>
-        <div><dt><kbd>Hold click</kbd></dt><dd>Cast, then reel</dd></div>
-        <div><dt><kbd>J</kbd></dt><dd>Journal</dd></div>
-        <div><dt><kbd>Click</kbd></dt><dd>Set the hook</dd></div>
-        <div><dt><kbd>M</kbd></dt><dd>Sound</dd></div>
+        <div><dt><kbd>Hold click</kbd> <kbd>Space</kbd></dt><dd>Cast, then reel</dd></div>
+        <div><dt><kbd>Shift</kbd></dt><dd>Slow retrieve</dd></div>
+        <div><dt><kbd>Click</kbd> <kbd>Space</kbd></dt><dd>Set the hook</dd></div>
         <div><dt><kbd>Wheel</kbd> <kbd>[ ]</kbd></dt><dd>Drag</dd></div>
-        <div><dt><kbd>Esc</kbd></dt><dd>Pause</dd></div>
+        <div><dt><kbd>J</kbd> <kbd>M</kbd> <kbd>U</kbd></dt><dd>Journal, sound, units</dd></div>
+        <div><dt><kbd>Esc</kbd></dt><dd>Pause, all controls</dd></div>
+        <div class="ctl-note"><dt>In a fight</dt><dd>Move the mouse up to lift the rod, and sideways against the fish’s run for side pressure.</dd></div>
       </dl>
       <dl class="controls ctl-touch" aria-label="Controls">
         <div><dt><kbd>Drag</kbd> the view</dt><dd>Aim</dd></div>
         <div><dt><kbd>Hold</kbd> the big button</dt><dd>Cast, then reel</dd></div>
-        <div><dt><kbd>Tap</kbd> it on a bite</dt><dd>Set the hook</dd></div>
+        <div><dt><kbd>Tap</kbd> anywhere on a bite</dt><dd>Set the hook</dd></div>
         <div><dt><kbd>–</kbd> <kbd>+</kbd></dt><dd>Drag</dd></div>
-        <div><dt>Chips <kbd>1</kbd>–<kbd>4</kbd></dt><dd>Lures</dd></div>
+        <div><dt>Lure chips</dt><dd>Lures</dd></div>
+        <div class="ctl-note"><dt>In a fight</dt><dd>Drag on the lake (a second finger while you reel): up lifts the rod, sideways adds side pressure.</dd></div>
       </dl>
       <div class="title-actions">
         <button class="btn-primary" id="btn-start" type="button" disabled>Loading the lake…</button>
@@ -870,18 +1034,59 @@ kbd {
 
   <div class="modal" id="pause-modal" hidden>
     <section class="pause glass" id="pause" role="dialog" aria-modal="true" aria-labelledby="pause-h" tabindex="-1">
-      <h2 id="pause-h">Paused</h2>
-      <div class="set-row"><span class="label">Sound</span>
-        <div class="seg" role="group" aria-label="Sound"><button type="button" data-muted="0" aria-pressed="true">On</button><button type="button" data-muted="1" aria-pressed="false">Off</button></div>
+      <div class="pause-main">
+        <h2 id="pause-h">Paused</h2>
+        <div class="set-row"><span class="label">Sound</span>
+          <div class="seg" role="group" aria-label="Sound"><button type="button" data-muted="0" aria-pressed="true">On</button><button type="button" data-muted="1" aria-pressed="false">Off</button></div>
+        </div>
+        <div class="set-row"><span class="label">Units</span>
+          <div class="seg" role="group" aria-label="Units"><button type="button" data-units="imperial" aria-pressed="true">lb · in</button><button type="button" data-units="metric" aria-pressed="false">kg · cm</button></div>
+        </div>
+        <div class="set-row"><span class="label">Graphics</span>
+          <div class="seg" role="group" aria-label="Graphics quality"><button type="button" data-quality="auto" aria-pressed="true" title="Adjusts to keep the frame rate smooth">Auto</button><button type="button" data-quality="high" aria-pressed="false">High</button><button type="button" data-quality="medium" aria-pressed="false">Medium</button><button type="button" data-quality="low" aria-pressed="false">Low</button></div>
+        </div>
+        <button class="btn-primary" id="btn-resume" type="button">Resume</button>
+        <p class="pause-note">Esc to resume</p>
       </div>
-      <div class="set-row"><span class="label">Units</span>
-        <div class="seg" role="group" aria-label="Units"><button type="button" data-units="imperial" aria-pressed="true">lb · in</button><button type="button" data-units="metric" aria-pressed="false">kg · cm</button></div>
+      <div class="pause-help" id="pause-help" role="region" aria-labelledby="help-h" tabindex="0">
+        <h3 class="label help-h" id="help-h">Controls</h3>
+        <dl class="keys ctl-mouse">
+          <div><dt><kbd>Mouse</kbd></dt><dd>Aim: push the pointer toward an edge</dd></div>
+          <div><dt><kbd>A</kbd> <kbd>D</kbd> <kbd>W</kbd> <kbd>S</kbd></dt><dd>Turn and look up or down (or arrow keys)</dd></div>
+          <div><dt><kbd>Hold click</kbd> <kbd>Space</kbd></dt><dd>Charge a cast, let go to throw. Hold again to reel in</dd></div>
+          <div><dt><kbd>Shift</kbd></dt><dd>Slow retrieve while reeling</dd></div>
+          <div><dt><kbd>Click</kbd> <kbd>Space</kbd></dt><dd>Set the hook when the float goes under</dd></div>
+          <div><dt><kbd>Wheel</kbd> <kbd>[</kbd> <kbd>]</kbd></dt><dd>Drag: wheel down or [ loosens, up or ] tightens</dd></div>
+          <div><dt><kbd>1</kbd> – <kbd>4</kbd></dt><dd>Tie on a lure (with the line reeled in)</dd></div>
+          <div><dt>Clock</dt><dd>Jump to dawn, morning, noon, dusk or night</dd></div>
+          <div><dt><kbd>J</kbd> <kbd>M</kbd> <kbd>U</kbd></dt><dd>Journal, sound, units</dd></div>
+          <div><dt><kbd>Esc</kbd> <kbd>P</kbd></dt><dd>Pause</dd></div>
+        </dl>
+        <dl class="keys ctl-touch">
+          <div><dt>Drag the view</dt><dd>Aim</dd></div>
+          <div><dt>Hold the big button</dt><dd>Charge a cast, let go to throw. Hold again to reel in</dd></div>
+          <div><dt>Tap the lake or button</dt><dd>Set the hook when the float goes under</dd></div>
+          <div><dt><kbd>–</kbd> <kbd>+</kbd></dt><dd>Loosen or tighten the drag</dd></div>
+          <div><dt>Lure chips</dt><dd>Tie on a lure (with the line reeled in)</dd></div>
+          <div><dt>Tap the clock</dt><dd>Jump to dawn, morning, noon, dusk or night</dd></div>
+        </dl>
+        <h3 class="label help-h">Fighting a fish</h3>
+        <dl class="keys ctl-mouse">
+          <div><dt><kbd>Mouse</kbd> <kbd>W</kbd></dt><dd>Move up to lift the rod: a high rod cushions runs and head shakes</dd></div>
+          <div><dt><kbd>Mouse</kbd> <kbd>A</kbd> <kbd>D</kbd></dt><dd>Side pressure: sweep the rod against the fish’s run to tire it</dd></div>
+          <div><dt><kbd>Hold click</kbd> <kbd>Space</kbd></dt><dd>Reel. Stop cranking while the drag is slipping</dd></div>
+          <div><dt><kbd>Wheel</kbd> <kbd>[</kbd> <kbd>]</kbd></dt><dd>Loosen the drag when the dial runs into the red</dd></div>
+        </dl>
+        <dl class="keys ctl-touch">
+          <div><dt>Hold Reel</dt><dd>Reel. Let go while the drag is slipping</dd></div>
+          <div><dt>Drag up on the lake</dt><dd>Lift the rod (a second finger while you reel). A high rod cushions runs and head shakes</dd></div>
+          <div><dt>Drag sideways</dt><dd>Side pressure: sweep against the fish’s run to tire it</dd></div>
+          <div><dt><kbd>–</kbd></dt><dd>Loosen the drag when the dial runs into the red</dd></div>
+        </dl>
+        <p class="help-p">Keep the line tight: slack lets a shaking fish throw the hook. When the fish is tired and close, it comes to the net by itself.</p>
+        <h3 class="label help-h">Lures</h3>
+        <dl class="keys lure-notes" id="lure-notes"></dl>
       </div>
-      <div class="set-row"><span class="label">Graphics</span>
-        <div class="seg" role="group" aria-label="Graphics quality"><button type="button" data-quality="high" aria-pressed="true">High</button><button type="button" data-quality="medium" aria-pressed="false">Medium</button><button type="button" data-quality="low" aria-pressed="false">Low</button></div>
-      </div>
-      <button class="btn-primary" id="btn-resume" type="button">Resume</button>
-      <p class="pause-note">Esc to resume</p>
     </section>
   </div>
 

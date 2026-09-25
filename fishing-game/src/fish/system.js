@@ -63,6 +63,13 @@ function randRange(rng, a, b) {
 function randInt(rng, a, b) {
   return a + Math.floor(rng() * (b - a + 1));
 }
+// The dock deck (plus a margin) seen from the water: a hooked fish is kept out from under it, where the angler
+// can neither see it nor keep the line off the pilings. z runs from the lake end to the waterline (~+16 m).
+const DOCK_HALF_W = DOCK.width * 0.5 + 0.3;
+const DOCK_Z0 = DOCK.endZ - 0.3;
+function underDock(x, z) {
+  return Math.abs(x) < DOCK_HALF_W && z > DOCK_Z0 && z < 17;
+}
 
 // Scratch objects (never allocate in per-frame paths).
 const _v1 = new THREE.Vector3();
@@ -125,6 +132,12 @@ export class HookedFish {
     this._jumpH = 0;
     this._jumps = 0;
     this._surged = false;
+    // A fresh fish's first run (and the last surge at the dock) starts with a burst above its steady effort, so
+    // even a 1-2 kg bass or trout takes line against the default drag for a second or two.
+    this._burstLeft = true;
+    this._burst = 0;
+    this._burstMul = 1;
+    this._lastSurge = false;
     this._probeT = 0;
     this._lastValid = new THREE.Vector3().copy(this.position);
     this._fwd = new THREE.Vector3(Math.sin(rec.yaw), 0, Math.cos(rec.yaw));
@@ -181,6 +194,7 @@ export class HookedFish {
     // Near the dock with some fight left: the classic last surge.
     if (!this._surged && this._lineOut < 7 && st > 0.18 && this._rng() < 0.55) {
       this._surged = true;
+      this._lastSurge = true;
       return 'run';
     }
     let sum = 0;
@@ -203,12 +217,23 @@ export class HookedFish {
     const sys = this._sys;
     const bottomY = sys._terrainY(this.position.x, this.position.z);
     const depth = Math.max(0.3, -bottomY);
+    // burst on top of the run's peak effort (decays over ~1.6 s, see step())
+    this._burst = 0;
+    if (mode === 'run' || mode === 'dive') {
+      if (this._burstLeft && this._t < 6) {
+        this._burst = randRange(rng, 0.8, 1.1) * (0.6 + 0.4 * st);
+        this._burstLeft = false;
+      } else if (this._lastSurge) {
+        this._burst = randRange(rng, 0.2, 0.35) * st;
+      }
+    }
+    this._lastSurge = false;
     switch (mode) {
       case 'run': {
         this._modeDur = randRange(rng, 1.5, 2.2 + 3.8 * sp.stamina * st) * (0.6 + 0.4 * st);
         this._peak = randRange(rng, 0.7, 1.0) * vigor;
         this.effort = this._peak;
-        this._pickRunDir();
+        this._pickRunDir(false, this._burst > 0);
         this._yTarget = -depth * clamp(sp.column + randRange(rng, -0.2, 0.1), 0.25, 0.85);
         break;
       }
@@ -216,7 +241,7 @@ export class HookedFish {
         this._modeDur = randRange(rng, 2, 5.5) * (0.6 + 0.4 * st);
         this._peak = randRange(rng, 0.55, 0.85) * vigor;
         this.effort = this._peak;
-        this._pickRunDir(true);
+        this._pickRunDir(true, this._burst > 0);
         this._yTarget = bottomY + 0.2 + this._bodyH;
         break;
       }
@@ -268,8 +293,9 @@ export class HookedFish {
     }
   }
 
-  // Direction for a run: away from the angler toward open/deep water or cover (species dependent).
-  _pickRunDir(preferDeep = false) {
+  // Direction for a run: away from the angler toward open/deep water or cover (species dependent). A burst
+  // (the bolt right after the hookset, the last surge at the dock) goes more directly away, against the line.
+  _pickRunDir(preferDeep = false, bolt = false) {
     const sys = this._sys;
     const sp = this.species;
     const p = this.position;
@@ -287,16 +313,21 @@ export class HookedFish {
       const a = base + (i / 10) * TAU + (this._rng() - 0.5) * 0.4;
       const dx = Math.sin(a);
       const dz = Math.cos(a);
-      const d6 = sys._depthAt(p.x + dx * 6, p.z + dz * 6);
+      const x6 = p.x + dx * 6;
+      const z6 = p.z + dz * 6;
+      const d6 = sys._depthAt(x6, z6);
       const d12 = sys._depthAt(p.x + dx * 12, p.z + dz * 12);
-      if (d6 < 0.5) continue;
+      if (d6 < 0.5 || underDock(x6, z6) || underDock(p.x + dx * 2.5, p.z + dz * 2.5)) continue;
       const away = dx * awayX + dz * awayZ; // -1 .. 1
-      let s = away * 1.1 + deepW * clamp((d12 - p.y * -1) / 4, -1, 1);
+      let s = away * (bolt ? 2.6 : 1.1) + deepW * clamp((d12 - p.y * -1) / 4, -1, 1);
       if (coverW > 0.2) {
-        const h = sys._habitat(p.x + dx * 8, p.z + dz * 8);
+        // (the dock itself is not a refuge here: the run would go under the deck, behind the angler)
+        const h = sys._habitat(p.x + dx * 8, p.z + dz * 8, true);
         s += coverW * (sp.habitat.weeds * h.weeds + sp.habitat.wood * h.wood + sp.habitat.rocks * h.rocks);
       }
       if (d12 < 0.6) s -= 1.5;
+      // runs that would take the line behind the angler along the dock are rare
+      if (z6 > DOCK.endZ + 0.5 && Math.abs(x6) < 6) s -= 1.2;
       s += this._rng() * 0.8;
       if (s > bestS) {
         bestS = s;
@@ -315,7 +346,9 @@ export class HookedFish {
     const hl = Math.hypot(hx, hz);
     if (hl < 1e-4) return;
     const probe = 2.5 + this.velocity.length() * 0.8;
-    const d = sys._depthAt(p.x + (hx / hl) * probe, p.z + (hz / hl) * probe);
+    // water depth ahead; the space under the dock counts as blocked
+    const depthAt = (x, z) => (underDock(x, z) ? 0 : sys._depthAt(x, z));
+    const d = depthAt(p.x + (hx / hl) * probe, p.z + (hz / hl) * probe);
     if (d > 0.55 + this._bodyH) return;
     // Turn toward the deepest of a fan of directions, preferring small turns.
     let best = -1;
@@ -323,7 +356,7 @@ export class HookedFish {
     const a0 = Math.atan2(hx, hz);
     for (let i = 1; i <= 8; i++) {
       const a = a0 + (i % 2 ? 1 : -1) * Math.ceil(i / 2) * 0.55;
-      const dd = sys._depthAt(p.x + Math.sin(a) * probe, p.z + Math.cos(a) * probe) - Math.ceil(i / 2) * 0.05;
+      const dd = depthAt(p.x + Math.sin(a) * probe, p.z + Math.cos(a) * probe) - Math.ceil(i / 2) * 0.05;
       if (dd > best) {
         best = dd;
         bestA = a;
@@ -372,7 +405,8 @@ export class HookedFish {
         // the first surge is the strongest; then the fish settles into a steady pull
         const tau = 1.0 + 1.6 * sp.stamina;
         this.effort = this._peak * (0.3 + 0.7 * Math.exp(-this._modeT / tau));
-      }
+        this._burstMul = 1 + this._burst * Math.exp(-this._modeT / 1.6);
+      } else this._burstMul = 1;
       this._probeT -= dt;
       if (this._probeT <= 0 && (this.mode === 'run' || this.mode === 'dive' || this.mode === 'jumpPrep' || this.mode === 'circle')) {
         this._probeT = 0.2;
@@ -426,7 +460,7 @@ export class HookedFish {
       }
     } else {
       // --- swim force (thrust falls off toward top speed) ---
-      const vig = this.effort;
+      const vig = this.effort * this._burstMul;
       // vertical intent: blend in the depth target
       let yT = this._yTarget;
       yT = clamp(yT, bottomY + 0.12 + this._bodyH * 0.5, surfY - 0.04);
@@ -506,6 +540,21 @@ export class HookedFish {
           this._avoidShallow();
           if (p.y < by + 0.05) p.y = Math.min(this._lastValid.y, top);
         }
+        if (underDock(p.x, p.z)) {
+          // never under the deck: out past the nearest edge (the side it came from when it is dead centre)
+          const penX = DOCK_HALF_W - Math.abs(p.x);
+          const penZ = p.z - DOCK_Z0;
+          if (penZ < penX) {
+            p.z = DOCK_Z0;
+            if (v.z > 0) v.z *= -0.25;
+          } else {
+            const sx = Math.abs(p.x) > 1e-3 ? Math.sign(p.x) : this._lastValid.x >= 0 ? 1 : -1;
+            p.x = sx * DOCK_HALF_W;
+            if (v.x * sx < 0) v.x *= -0.25;
+          }
+          this._probeT = 0;
+          this._avoidShallow();
+        }
       }
       if (this.mode === 'jumpPrep' && this._modeT > this._modeDur) this._startMode('run');
     }
@@ -529,7 +578,7 @@ export class HookedFish {
     const sl = Math.hypot(sx, sz) || 1;
     const pl = Math.hypot(pull.x, pull.z) || 1;
     const lateral = 1 - Math.abs((sx * pull.x + sz * pull.z) / (sl * pl));
-    const effortCost = Math.pow(this.effort, 1.6);
+    const effortCost = Math.pow(this.effort * this._burstMul, 1.6);
     const tensionCost = 0.12 * Math.min(tRel, 4) * (1 + 0.8 * lateral) * (0.4 + this.effort);
     let dS = -(effortCost + tensionCost) / this._cap;
     // only an unpressured fish (slack line) gets its wind back
@@ -655,6 +704,7 @@ export class HookedFish {
 // =====================================================================================
 export function createFishSystem(ctx = {}) {
   const scene = ctx.scene || null;
+  const renderer = ctx.renderer || null;
   const events = ctx.events || { emit() {}, on() {} };
   const env = ctx.env;
   const water = ctx.water || null;
@@ -685,12 +735,13 @@ export function createFishSystem(ctx = {}) {
     return WATER_LEVEL;
   }
   const _hab = { depth: 0, weeds: 0, rocks: 0, wood: 0 };
-  function habitat(x, z) {
+  function habitat(x, z, noDock = false) {
     const h = env && env.getHabitat ? env.getHabitat(x, z) : null;
     _hab.depth = h ? fin(h.depth, depthAt(x, z)) : depthAt(x, z);
     _hab.weeds = h ? clamp(fin(h.weeds), 0, 1) : 0;
     _hab.rocks = h ? clamp(fin(h.rocks), 0, 1) : 0;
     _hab.wood = h ? clamp(fin(h.wood), 0, 1) : 0;
+    if (noDock) return _hab;
     // The dock itself is cover (shade + pilings) for panfish and bass.
     const ddx = Math.max(0, Math.abs(x) - DOCK.width * 0.5);
     const ddz = Math.max(0, DOCK.endZ - z, z - 16);
@@ -734,7 +785,9 @@ export function createFishSystem(ctx = {}) {
       // weed edges: some weeds, not a solid mat, and enough water
       s += 2.4 * h.weeds * (1 - h.weeds) * smoothstep(1.0, 2.2, d);
     }
-    if (sp.id === 'rainbow_trout') s *= smoothstep(3.5, 7, d); // cool water lives deep
+    // cool water lives deep; at dawn / dusk (and at night) trout cruise up onto the edge of the basin to feed,
+    // within a long float cast of the dock
+    if (sp.id === 'rainbow_trout') s *= smoothstep(lerp(3.5, 2.4, lowLight), lerp(7, 4.4, lowLight), d);
     if (sp.id === 'walleye' || sp.id === 'smallmouth_bass') s *= 0.35 + smoothstep(1.8, 4, d); // drop-off, not the flat
     const [dMin, dMax] = sp.depthM;
     if (d > dMax) s *= Math.exp(-(d - dMax) / 3);
@@ -863,6 +916,7 @@ export function createFishSystem(ctx = {}) {
       forced: false,
       mesh: null,
       ownMesh: null,
+      highUntil: 0, // an escaped fish keeps its fight model this long (then back to a pooled population model)
       exhaustion: 0,
       removed: false,
       hooked: null,
@@ -1246,6 +1300,11 @@ export function createFishSystem(ctx = {}) {
     const weights = _speciesW;
     for (let i = 0; i < SPECIES.length; i++) {
       const sp = SPECIES[i];
+      // a trophy (the lone musky) is never brought to the lure: it has to be found on its own patrol
+      if (sp.rarity >= 0.9) {
+        weights[i] = 0;
+        continue;
+      }
       const hs = habitatScore(sp, lx, lz);
       const w = sp.abundance * prospectScore(sp) * Math.min(hs, 1.5);
       weights[i] = w > 0.002 ? w : 0;
@@ -1478,6 +1537,10 @@ export function createFishSystem(ctx = {}) {
           if (d3 < 0.6 && (!activeBite || activeBite.closed)) openBite(f);
           if (f.state !== 'approach') break;
         }
+        if ((isBait && d3 < 0.5) || (!isBait && d3 < 1.0 + gap)) {
+          // on the bait / trailing the lure: likely to bite, so start painting its fight model now
+          requestAssets(f.species, false);
+        }
         if (isBait && d3 < 0.5) {
           setState(f, 'inspect', 0);
           const [a, b] = sp.nibbles;
@@ -1514,6 +1577,9 @@ export function createFishSystem(ctx = {}) {
         const canBite = !activeBite || activeBite.closed;
         const mot = motivation(f);
         let hz = 0.42 * mot * sp.boldness * (lureCtx.pauseTrigger ? 3.5 : 1) * (time - lureCtx.lastTwitch < 0.5 ? 2 : 1);
+        // the "fish of ten thousand casts" follows far more often than it eats; its real chance is the
+        // figure-eight at the dock (the final decision below)
+        if (sp.rarity >= 0.9) hz *= 0.3;
         if (f.forced) hz = 50;
         const nearDock = lureCtx.distanceM < 3.4 || depthAt(tx, tz) < Math.max(0.45, f.bodyH + 0.3);
         if (nearDock && !f.finalDecided && !f.forced) {
@@ -1824,7 +1890,7 @@ export function createFishSystem(ctx = {}) {
     const L = lengthCm / 100;
     let mouth = _box.isEmpty() ? 0 : _box.max.z;
     if (!(mouth > -0.1 * L && mouth < 1.1 * L)) mouth = 0;
-    return { handle: mh, speciesId: sp.id, baseLenCm: lengthCm, mouth, inUse: false };
+    return { handle: mh, speciesId: sp.id, baseLenCm: lengthCm, mouth, inUse: false, detail, pooled: false };
   }
   function acquireMesh(f) {
     if (!renderFish) return null;
@@ -1846,6 +1912,7 @@ export function createFishSystem(ctx = {}) {
       if (h) {
         createdThisFrame++;
         meshCount++;
+        h.pooled = true;
         list.push(h);
         scene.add(h.handle.object3d);
         best = h;
@@ -1873,6 +1940,14 @@ export function createFishSystem(ctx = {}) {
     } catch (err) {
       console.warn('[fish] dispose failed', err);
     }
+  }
+  // Give back a handle a hooked fish was drawn with: pooled ones return to their pool, own ones are freed.
+  function dropHandle(h) {
+    if (!h) return;
+    if (h.pooled) {
+      h.inUse = false;
+      h.handle.object3d.visible = false;
+    } else disposeHandle(h);
   }
   function placeMesh(h, pos, yaw, pitch, roll, lengthCm) {
     const o = h.handle.object3d;
@@ -1907,6 +1982,13 @@ export function createFishSystem(ctx = {}) {
     for (let i = 0; i < renderList.length; i++) renderList[i]._want = i < cap;
     for (const f of population) {
       if (f.state === 'hooked') continue;
+      // an escaped / snapped-off fish keeps its fight model only while it bolts away near the dock
+      if (f.ownMesh && f.state !== 'release' && !f.removed && (time > f.highUntil || Math.hypot(f.pos.x - camPos.x, f.pos.z - camPos.z) > 12)) {
+        if (f.mesh === f.ownMesh) f.mesh = null;
+        f.ownMesh.handle.object3d.visible = false;
+        dropHandle(f.ownMesh);
+        f.ownMesh = null;
+      }
       const want = f._want && f._score !== Infinity && !f.removed;
       f._want = false;
       if (!want) {
@@ -1931,32 +2013,197 @@ export function createFishSystem(ctx = {}) {
     placeMesh(h, hf.position, hf._yaw, hf._pitch, hf._roll, hf.lengthCm);
   }
 
+  // ---------- hooked-fish model: high detail, prepared without a hitch ----------
+  // The fight model ('high' detail; 'medium' at low quality) paints 1-2k textures. Instead of doing that in the
+  // hookset frame, the fish fights with its population model while mesh.js builds the assets a few ms per frame
+  // (started as soon as a fish shows interest in the lure), then the model is swapped. A tiny stand-in with the
+  // same materials compiles the shader programs at load (programKeeper), so the swap does not compile either.
+  const canPrepare = renderFish && meshFactory === createFishMesh && typeof FishMesh.prepareFishAssets === 'function' && typeof FishMesh.fishAssetsReady === 'function';
+  const hookedDetail = () => (quality === 'low' ? 'medium' : 'high');
+  let assetJob = null;
+  let assetNext = null; // species whose model to build next (latest interest)
+  let paused = null; // an interrupted build (kept to resume after the hooked fish's model)
+  function assetsReady(sp, detail = hookedDetail()) {
+    if (!canPrepare) return true;
+    return FishMesh.fishAssetsReady(sp, { detail, quality });
+  }
+  const failedBuilds = new Set(); // keys whose build threw: never retried (the fish keeps its population model)
+  function startJob(sp, detail) {
+    if (failedBuilds.has(`${sp.id}|${detail}|${quality}`)) return;
+    assetJob = FishMesh.prepareFishAssets(sp, { detail, quality, renderer });
+    if (assetJob.done) assetJob = null;
+  }
+  function requestAssets(sp, urgent) {
+    if (!canPrepare || !sp || assetsReady(sp)) return;
+    const detail = hookedDetail();
+    const running = assetJob && !assetJob.done && !assetJob.cancelled ? assetJob : null;
+    if (running && running.speciesId === sp.id && running.detail === detail) return;
+    if (!urgent) {
+      assetNext = sp;
+      return;
+    }
+    if (running) {
+      // the fish on the line comes first; the interrupted build resumes afterwards
+      if (paused && paused !== running) paused.cancel();
+      paused = running;
+    }
+    startJob(sp, detail);
+  }
+  function pumpAssets() {
+    if (!canPrepare) return;
+    if (assetJob && assetJob.failed) failedBuilds.add(assetJob.key);
+    if (assetJob && (assetJob.done || assetJob.cancelled)) assetJob = null;
+    if (assetJob && assetJob.quality !== quality) {
+      assetJob.cancel();
+      assetJob = null;
+    }
+    if (!assetJob) {
+      const detail = hookedDetail();
+      if (hooked && !assetsReady(hooked.species, detail)) startJob(hooked.species, detail);
+      else if (hooked && detail !== 'high' && !assetsReady(hooked.species, 'high')) startJob(hooked.species, 'high'); // catch showcase
+      else if (hooked) {
+        // nothing else while a fish is on
+      } else if (paused) {
+        const job = paused;
+        paused = null;
+        if (!job.done && !job.cancelled && job.quality === quality) assetJob = job;
+        else job.cancel();
+      } else if (assetNext) {
+        const sp = assetNext;
+        assetNext = null;
+        if (!assetsReady(sp, detail)) startJob(sp, detail);
+      }
+    }
+    // a few ms per frame; more while a fish is on (its model is what the player is looking at)
+    if (assetJob && assetJob.step(hooked ? 5 : 2.5) && !assetJob.failed) {
+      builtLog.push({ key: assetJob.key, steps: assetJob.steps, maxStepMs: +assetJob.maxStepMs.toFixed(1) });
+      if (builtLog.length > 6) builtLog.shift();
+      assetJob = null;
+    }
+  }
+  const builtLog = []; // recent incremental builds (debug stats)
+
+  // Shader warm-up: the stand-in is drawn for a few frames at load (and after a quality change) in every pass
+  // (main, shadow, reflection), then hidden but kept, so its programs stay compiled for the real fight model.
+  // (High and medium quality give the fight model the same material flags; low uses the population material.)
+  let keeper = null;
+  let keeperFrames = 0;
+  function ensureKeeper() {
+    if (!canPrepare || typeof FishMesh.createFishProgramKeeper !== 'function' || quality === 'low') return;
+    if (!keeper) {
+      try {
+        keeper = FishMesh.createFishProgramKeeper({ quality });
+      } catch (err) {
+        console.warn('[fish] shader warm-up model failed', err);
+        return;
+      }
+      // under the lake bed beside the dock and a few millimetres long: never seen, only compiled
+      keeper.object3d.position.set(0, -40, 6);
+      keeper.object3d.scale.setScalar(0.01);
+      scene.add(keeper.object3d);
+    }
+    keeper.object3d.visible = true;
+    keeperFrames = 8; // rendered frames (fish.update runs once per frame, before the render)
+  }
+  function tickKeeper() {
+    if (!keeper || !keeper.object3d.visible) return;
+    if (--keeperFrames <= 0) keeper.object3d.visible = false;
+  }
+
+  function makeFightHandle(f, detail) {
+    const std = weightFromLength(f.species, f.lengthCm);
+    const girth = clamp(Math.sqrt(f.weightKg / Math.max(std, 1e-4)), 0.85, 1.2);
+    const h = makeHandle(f.species, f.lengthCm, detail, { seed: f.id * 7919, girth, castShadow: quality !== 'low' });
+    if (h) {
+      h.inUse = true;
+      scene.add(h.handle.object3d);
+    }
+    return h;
+  }
+  // The model a hooked fish fights with until its high-detail one is ready: the one it already swims with.
+  function takeTempHandle(f) {
+    let h = null;
+    if (f.mesh && f.mesh !== f.ownMesh) {
+      h = f.mesh;
+      f.mesh = null;
+    } else if (f.ownMesh) {
+      h = f.ownMesh;
+      f.ownMesh = null;
+      f.mesh = null;
+    } else {
+      const saved = createdThisFrame;
+      createdThisFrame = Math.min(createdThisFrame, MESH_CREATES_PER_FRAME - 1); // one more is fine here
+      h = acquireMesh(f);
+      createdThisFrame = Math.max(saved, createdThisFrame);
+      if (!h) {
+        h = makeHandle(f.species, f.lengthCm, 'low');
+        if (h) scene.add(h.handle.object3d);
+      }
+    }
+    if (h) h.inUse = true;
+    return h;
+  }
+
   function makeHooked(f) {
     const hf = new HookedFish(sysInternal, f);
-    // high-detail mesh for the fight (it comes right up to the camera)
+    hf._temp = false;
+    hf._detail = null;
     if (renderFish) {
+      const detail = hookedDetail();
       let h = null;
-      const detail = quality === 'low' ? 'medium' : 'high';
-      const std = weightFromLength(f.species, f.lengthCm);
-      const girth = clamp(Math.sqrt(f.weightKg / Math.max(std, 1e-4)), 0.85, 1.2);
-      h = makeHandle(f.species, f.lengthCm, detail, { seed: f.id * 7919, girth, castShadow: quality !== 'low' });
-      if (h) {
-        h.inUse = true;
-        scene.add(h.handle.object3d);
-      }
-      releaseMesh(f);
-      if (f.ownMesh && f.ownMesh !== h) {
-        disposeHandle(f.ownMesh);
+      if (f.ownMesh && f.ownMesh.detail === detail) {
+        // an escapee hooked again, still on its fight model
+        h = f.ownMesh;
         f.ownMesh = null;
+      } else if (assetsReady(f.species, detail)) {
+        h = makeFightHandle(f, detail);
+      }
+      if (!h) {
+        // fight on the population model (or none) until the fight model is built, then swap
+        h = takeTempHandle(f);
+        hf._temp = true;
+        requestAssets(f.species, true);
+      }
+      // whatever else the fish was drawn with goes back
+      if (f.mesh && f.mesh !== h && f.mesh !== f.ownMesh) {
+        f.mesh.inUse = false;
+        f.mesh.handle.object3d.visible = false;
       }
       f.mesh = null;
+      if (f.ownMesh && f.ownMesh !== h) disposeHandle(f.ownMesh);
+      f.ownMesh = null;
+      if (h) {
+        if (h.handle.object3d.parent !== scene) scene.add(h.handle.object3d);
+        h.handle.object3d.visible = true;
+      }
+      hf._detail = detail;
       hf._handle = h;
       hf.object3d = h ? h.handle.object3d : null;
-      if (hf.object3d) hf.object3d.visible = true;
     }
     hf._yaw = f.yaw;
     placeHookedMesh(hf);
     return hf;
+  }
+
+  // Swap the hooked fish onto its high-detail model once the assets are built (same pose, same visibility).
+  function upgradeHooked(hf) {
+    const f = hookedRec;
+    const old = hf._handle;
+    if (!f || (old && old.handle.object3d.parent !== scene)) {
+      hf._temp = false; // core has taken the model (showcase): leave it alone
+      return;
+    }
+    const h = makeFightHandle(f, hf._detail || hookedDetail());
+    if (!h) {
+      hf._temp = false;
+      return;
+    }
+    h.handle.object3d.visible = old ? old.handle.object3d.visible : true;
+    if (old) dropHandle(old);
+    hf._handle = h;
+    hf._temp = false;
+    hf.object3d = h.handle.object3d;
+    placeHookedMesh(hf);
   }
 
   function hookBite(biteId) {
@@ -2010,7 +2257,8 @@ export function createFishSystem(ctx = {}) {
       if (j >= 0) f.school.members.splice(j, 1);
     }
     if (engaged === f) engaged = null;
-    if (respawn && !f.debug) respawnQueue.push({ speciesId: f.speciesId, school: f.school, t: randRange(rng, 20, 45) });
+    // a very rare trophy takes a long while to be replaced (15-30 min); everything else 20-45 s
+    if (respawn && !f.debug) respawnQueue.push({ speciesId: f.speciesId, school: f.school, t: f.species.rarity >= 0.9 ? randRange(rng, 900, 1800) : randRange(rng, 20, 45) });
   }
 
   function releaseHooked(outcome = 'escaped') {
@@ -2025,9 +2273,12 @@ export function createFishSystem(ctx = {}) {
     const inScene = h && hf.object3d && hf.object3d.parent === scene;
     if (outcome === 'landed') {
       // kept: gone from the lake. If core re-parented the mesh (showcase), core owns it now.
-      if (inScene) disposeHandle(h);
+      if (inScene) dropHandle(h);
       hf._handle = null;
-      removeFish(f, true);
+      // a kept fish thins the lake: its place is only restocked after 10-20 min (a rare trophy never),
+      // while a released one is back in ~30-60 s
+      removeFish(f, false);
+      if (!f.debug && f.species.rarity < 0.9) respawnQueue.push({ speciesId: f.speciesId, school: f.school, t: randRange(rng, 600, 1200) });
       return;
     }
     // back into the water where the hooked fish is (or beside the dock after a release)
@@ -2038,7 +2289,11 @@ export function createFishSystem(ctx = {}) {
     f.speed = 0.3;
     f.vy = 0;
     f.bottomY = terrainY(f.pos.x, f.pos.z);
-    if (inScene) {
+    if (inScene && h.pooled) {
+      // still on its population model (the fight model was not ready): it simply keeps it
+      f.ownMesh = null;
+      f.mesh = h;
+    } else if (inScene) {
       f.ownMesh = h;
       f.mesh = h;
     } else {
@@ -2057,7 +2312,9 @@ export function createFishSystem(ctx = {}) {
       f.cooldown = 1e9;
       return;
     }
-    // escaped / snapped: bolts, sulks, won't bite again for a while
+    // escaped / snapped: bolts, sulks, won't bite again for a while; its fight model goes back to a
+    // population model once it has fled (evaluateRendering)
+    f.highUntil = time + 6;
     f.exhaustion = 1 - hf.stamina01;
     f.state = 'cruise';
     startFlee(f, f.pos.x - hf.velocity.x, f.pos.z - hf.velocity.z, 1.2);
@@ -2150,6 +2407,7 @@ export function createFishSystem(ctx = {}) {
     f.finalDecided = true;
     setState(f, 'approach', 0);
     events.emit('fish:interest', { fishId: f.id, speciesId: f.speciesId, position: f.pos.clone() });
+    requestAssets(f.species, false);
     forced = null;
   }
 
@@ -2181,7 +2439,10 @@ export function createFishSystem(ctx = {}) {
     if (dt <= 0) return;
     dt = Math.min(dt, 0.05);
     time += dt;
-    if (frame.quality && MAX_RENDERED[frame.quality]) quality = frame.quality;
+    if (frame.quality && MAX_RENDERED[frame.quality] && frame.quality !== quality) {
+      quality = frame.quality;
+      if (renderFish) ensureKeeper();
+    }
     hours = fin(frame.hours, hours);
     light = lightLevel(hours);
     lowLight = lowLightLevel(hours);
@@ -2306,6 +2567,14 @@ export function createFishSystem(ctx = {}) {
 
     // meshes
     if (renderFish) {
+      tickKeeper();
+      pumpAssets();
+      if (hooked && hooked._temp) {
+        // swap once the assets are built AND uploaded (the job uploads one texture per frame after painting)
+        const detail = hooked._detail || hookedDetail();
+        const uploading = assetJob && !assetJob.done && !assetJob.cancelled && assetJob.speciesId === hooked.species.id && assetJob.detail === detail;
+        if (!uploading && assetsReady(hooked.species, detail)) upgradeHooked(hooked);
+      }
       renderEvalT -= dt;
       if (renderEvalT <= 0) {
         renderEvalT = 0.25;
@@ -2338,7 +2607,12 @@ export function createFishSystem(ctx = {}) {
     for (const list of pools.values()) for (const h of list) disposeHandle(h);
     pools.clear();
     for (const f of population) if (f.ownMesh) disposeHandle(f.ownMesh);
-    if (hooked && hooked._handle) disposeHandle(hooked._handle);
+    if (hooked && hooked._handle && !hooked._handle.pooled) disposeHandle(hooked._handle);
+    if (assetJob) assetJob.cancel();
+    if (paused) paused.cancel();
+    assetJob = paused = assetNext = null;
+    if (keeper) keeper.dispose();
+    keeper = null;
   }
 
   // what HookedFish needs from the system
@@ -2363,6 +2637,7 @@ export function createFishSystem(ctx = {}) {
     }
   }
   if (renderFish) {
+    ensureKeeper();
     readCamera(camera0);
     const saved = MESH_CREATES_PER_FRAME;
     createdThisFrame = -999; // allow creating the initial set in one go
@@ -2393,7 +2668,17 @@ export function createFishSystem(ctx = {}) {
         if (f.mesh && f.mesh.handle.object3d.visible) rendered++;
         states[f.state] = (states[f.state] || 0) + 1;
       }
-      return { fish: population.length, rendered, meshes: meshCount, states, hooked: hooked ? hooked.speciesId : null };
+      return {
+        fish: population.length,
+        rendered,
+        meshes: meshCount,
+        states,
+        hooked: hooked ? hooked.speciesId : null,
+        hookedModel: hooked ? (hooked._temp ? 'population' : hooked._handle ? hooked._handle.detail : null) : null,
+        assetJob: assetJob ? { key: assetJob.key, steps: assetJob.steps, maxStepMs: +assetJob.maxStepMs.toFixed(1) } : null,
+        built: builtLog.slice(),
+        warmup: !!(keeper && keeper.object3d.visible),
+      };
     },
     schools,
     counters,

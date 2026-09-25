@@ -18,9 +18,15 @@ const BASE = [
   [0.46, 0.0038, 1.32, 0.7],
 ];
 
-// windStrength 0..1 -> amplitude scale. The contract's default breeze (0.25)
-// gives ~1.9 cm on the longest component (a calm lake with a light breeze).
-export const windScaleFor = (w) => clamp(0.12 + 1.75 * w, 0.08, 2.2);
+// windStrength 0..1 -> amplitude scale. From the midday breeze up (>= 0.3) this is
+// the original calibration (0.12 + 1.75 w: ~1.9 cm on the longest component at 0.3);
+// below it the waves die away toward glassy calm (~1 mm at light airs < 0.05), as a
+// real lake does at dawn and dusk.
+export const windScaleFor = (w) => {
+  const x = Number.isFinite(w) ? w : 0.25;
+  if (x >= 0.3) return Math.min(2.2, 0.12 + 1.75 * x);
+  return 0.04 + 2.42 * Math.max(0, x - 0.05);
+};
 
 export function createWaveField({ windStrength = 0.25, windDirection = null, seed = 11 } = {}) {
   const rng = makeRng(seed);

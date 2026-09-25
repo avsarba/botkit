@@ -52,7 +52,7 @@ export const LURES = [
     castMassG: 7,
     maxCastM: 38,
     depthM: 0.8,
-    note: 'Flashing blade. Trout, perch and bass hit it on a steady retrieve.',
+    note: 'Flashing blade. A steady, medium retrieve (Shift) for trout, perch and bass.',
   },
   {
     id: 'crankbait',
@@ -72,7 +72,7 @@ export const LURES = [
     castMassG: 12,
     maxCastM: 40,
     depthM: 0,
-    note: 'Walks on the surface. Explosive strikes at dawn and dusk.',
+    note: 'Walk it slowly (hold Shift) and pause. Explosive strikes at dawn and dusk.',
   },
 ];
 
@@ -93,7 +93,9 @@ export const STATES = Object.freeze({
 
 export const DAY = {
   startHours: 6.1, // dawn
-  gameMinutesPerSecond: 1, // 1 real second = 1 in-game minute
+  // 1 real second = 15 in-game seconds: an hour of light takes ~4 real minutes, dawn and dusk bites
+  // last a good while and a 14 h day ~56 minutes. The clock stops while paused and on the catch card.
+  gameMinutesPerSecond: 0.25,
   sunriseHours: 6.0,
   sunsetHours: 20.2,
 };

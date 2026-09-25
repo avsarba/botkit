@@ -34,7 +34,14 @@ const N_PER_LBF = G * KG_PER_LB;
 const LURE_BY_ID = Object.freeze(Object.fromEntries(LURES.map((l) => [l.id, l])));
 const DRAG_STEP = 0.05; // of the 0..1 drag range, ~0.45 lb per click
 const PROMPT_KINDS = new Set(['info', 'ready', 'good', 'warn', 'danger']);
-const QUALITIES = ['high', 'medium', 'low'];
+const QUALITIES = ['auto', 'high', 'medium', 'low']; // 'auto': core's adaptive quality (hud.quality reports the setting)
+const GUT = 16; // --gut in the template
+// Prompt band (see .center in the template): between the lure panel and the gauge when that gap is
+// at least BAND_MIN_W wide, else just above the bottom controls.
+const BAND_MIN_W = 250;
+const BAND_MAX_W = 440;
+const QUIET_AFTER_MS = 4000; // steady waiting / fighting hints fade after this long
+const SLACK_PULSE_MS = 800; // slack line with a fish on for this long -> the dial pulses
 
 const fin = (v, d = 0) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
 export const normUnits = (u) => (u === 'metric' || u === 'kg' || u === 'cm' || u === 'si' ? 'metric' : 'imperial');
@@ -65,7 +72,7 @@ function nullUI() {
   return {
     showTitle: noop, hideTitle: noop, setState: noop, update: noop, strikeCue: noop,
     showCatch: noop, hideCatch: noop, toast: noop, openJournal: noop, closeJournal: noop,
-    setLoading: noop, setPaused: noop, isModalOpen: () => false, dispose: noop,
+    setLoading: noop, setPaused: noop, isModalOpen: () => false, getCatchRect: () => null, dispose: noop,
   };
 }
 
@@ -112,6 +119,9 @@ export function createUI(ctx = {}) {
   const lures = $('lures');
   const gaugeLabel = $('gauge-label');
   const fishOnEl = $('fish-on');
+  const rodMeter = $('rodmeter');
+  const rodLine = $('rodmeter-rod');
+  const rodTip = $('rodmeter-tip');
   const dial = $('dial');
   const dialSvg = $('dial-svg');
   const dialValue = $('dial-value');
@@ -149,6 +159,22 @@ export function createUI(ctx = {}) {
   const pauseModal = $('pause-modal');
   const pauseEl = $('pause');
   const btnResume = $('btn-resume');
+  const lureNotes = $('lure-notes');
+  const pauseHelp = $('pause-help');
+  const center = hud.querySelector('.center') || doc.createElement('div');
+  const clockPanel = clockBtn.closest('.clock') || clockBtn;
+  const catchScroll = catchEl.querySelector('.catch-scroll') || catchEl;
+
+  // The fonts stylesheet is preloaded without blocking the first paint; its inline onload flips it
+  // to a stylesheet. If a CSP ever blocks that inline handler (element.onload is then null while the
+  // link is still a preload), add a script-created stylesheet link instead (never render-blocking).
+  const fontLink = doc.getElementById('font-css');
+  if (fontLink && fontLink.rel === 'preload' && typeof fontLink.onload !== 'function' && fontLink.href) {
+    const l = doc.createElement('link');
+    l.rel = 'stylesheet';
+    l.href = fontLink.href;
+    fontLink.after(l);
+  }
 
   const gauge = createGauge(dialSvg, dial);
   const reducedMq = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
@@ -174,13 +200,15 @@ export function createUI(ctx = {}) {
   // Last values written to the DOM (per-frame change detection; numbers are quantized keys).
   const last = {
     hud: null, units: null, minuteKey: NaN, sunKey: NaN, preset: undefined, tensionKey: NaN, dragKey: NaN,
-    lineKey: NaN, fishKey: NaN, fishOn: null, powerOn: null, powerQ: -1, powerKey: NaN,
+    lineKey: NaN, fishKey: NaN, fishOn: null, powerOn: null, powerQ: -1, powerKey: NaN, rodOn: null, rodKey: NaN,
     prompt: null, promptKind: null, action: null, catches: -1, lureId: null, dragFracQ: -1,
   };
   // hud-derived numbers kept between frames so drag clicks can preview instantly
   const dragNFor = (d01) => TACKLE.dragMinN + d01 * (TACKLE.dragMaxN - TACKLE.dragMinN);
   const num = { tensionN: 0, tension01: 0, dragN: dragNFor(TACKLE.dragDefault01), lineOutM: 0, fishOn: false, fishDistanceM: NaN };
   let lastRecords = Array.isArray(config.records) ? config.records : [];
+  // prompt quieting: a steady hint fades QUIET_AFTER_MS after it appears
+  let quietTimer = 0;
   let catchRecord = null;
   let catchOpts = { isPersonalBest: false, isNewSpecies: false };
   const speciesList = Array.isArray(ctx.species) ? ctx.species : Array.isArray(config.species) ? config.species : null;
@@ -222,27 +250,64 @@ export function createUI(ctx = {}) {
   const lureButtons = Array.from(lures.querySelectorAll('.lure'));
   const presetButtons = Array.from(presets.querySelectorAll('.chip'));
   const segButtons = Array.from(pauseEl.querySelectorAll('.seg button'));
+  // A lure's note for the current input: touch has no Shift key, so drop "(hold Shift)" hints there.
+  const noteFor = (l) => {
+    const n = (l && l.note) || '';
+    return cur.input === 'touch' ? n.replace(/\s*\((?:hold\s+)?shift\)/gi, '').replace(/\s+([.,])/g, '$1') : n;
+  };
+  // What each lure is for, in the pause menu (the chip tooltips are hover-only).
+  const lureNoteDDs = [];
+  lureNotes.textContent = '';
+  for (const l of LURES) {
+    const row = doc.createElement('div');
+    const dt = doc.createElement('dt');
+    const dd = doc.createElement('dd');
+    dt.textContent = l.short;
+    row.append(dt, dd);
+    lureNotes.appendChild(row);
+    lureNoteDDs.push([l, dd]);
+  }
+  function renderLureNotes() {
+    for (const [l, dd] of lureNoteDDs) dd.textContent = noteFor(l);
+  }
 
   // ---------- input mode (mouse vs touch) ----------
+  // Pen behaves like a mouse (core's input treats a pen press on the lake as the hold action), so
+  // only fingers switch the HUD to the touch layout with its big hold button.
+  let lastKeyAt = -1e9;
+  let lastPointerAt = -1e9;
   function setInput(mode) {
     if (mode !== 'touch' && mode !== 'mouse') return;
     if (mode === cur.input && root.dataset.input === mode) return;
     cur.input = mode;
     root.dataset.input = mode;
     last.prompt = null; // derived prompts depend on the input mode
-    strikeSub.textContent = mode === 'touch' ? 'Tap the button to set the hook' : 'Click to set the hook';
+    strikeSub.textContent = mode === 'touch' ? 'Tap anywhere to set the hook' : 'Click to set the hook';
+    renderLureNotes();
   }
   setInput(config.touch === true || (config.touch !== false && coarseMq && coarseMq.matches) ? 'touch' : 'mouse');
   const onAnyPointer = (e) => {
+    lastPointerAt = performance.now();
     if (e.pointerType === 'touch') setInput('touch');
-    else if (e.pointerType === 'mouse') setInput('mouse');
+    else if (e.pointerType === 'mouse' || e.pointerType === 'pen') setInput('mouse');
   };
   window.addEventListener('pointerdown', onAnyPointer, { capture: true, passive: true });
+  const onAnyKeyUp = () => {
+    lastKeyAt = performance.now();
+  };
+  window.addEventListener('keyup', onAnyKeyUp, true);
+  // True while handling (or right after) a real key press: a dialog opened now was opened from the keyboard.
+  const fromKeyboard = () => lastKeyAt > lastPointerAt && performance.now() - lastKeyAt < 300;
 
   // Time presets start expanded on roomy desktop screens, collapsed on phones.
+  function clockLabel() {
+    const s = formatClock(((fin(cur.hours, DAY.startHours) % 24) + 24) % 24);
+    clockBtn.setAttribute('aria-label', `Time of day ${s}. ${presets.hidden ? 'Show' : 'Hide'} time presets`);
+  }
   function setPresetsOpen(open) {
     presets.hidden = !open;
     clockBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    clockLabel();
   }
   setPresetsOpen(cur.input !== 'touch' && window.innerWidth >= 760);
 
@@ -288,6 +353,14 @@ export function createUI(ctx = {}) {
     last.lureId = id;
     for (const b of lureButtons) b.setAttribute('aria-pressed', b.dataset.lure === id ? 'true' : 'false');
     last.prompt = null;
+  }
+  // A lure's note ("Dives to about 8 ft when reeled…") as a toast: shown whenever core confirms a new
+  // lure (chip, keys 1-4) and when the tied-on lure's chip is tapped again, so touch players get it too.
+  let noteLure = null;
+  function showLureNote(id) {
+    const l = LURE_BY_ID[id];
+    const n = noteFor(l);
+    if (n) toast(`${l.name}: ${n}`, 'info', 5200);
   }
   applyUnits(cur.units);
   applyMuted(cur.muted);
@@ -363,12 +436,14 @@ export function createUI(ctx = {}) {
       (n) => !n.hidden && n.offsetParent !== null
     );
   }
-  function openDialog(el, focusEl, onEsc) {
+  // Focus goes back to the control that was focused before only when the player opened the dialog from
+  // the keyboard (Esc / J / Enter on a HUD button). Dialogs opened by a click or by the game itself (the
+  // catch card) leave focus on nothing when they close, so Space goes straight back to the lake.
+  function openDialog(el, focusEl, onEsc, { mayRestore = true } = {}) {
     const i = dialogStack.findIndex((d) => d.el === el);
     if (i >= 0) dialogStack.splice(i, 1);
     const prev = doc.activeElement;
-    // Only hand focus back to a control the player reached by keyboard (see integration notes).
-    const restore = prev && prev !== doc.body && prev.matches && prev.matches(':focus-visible') ? prev : null;
+    const restore = mayRestore && fromKeyboard() && prev && prev !== doc.body && root.contains(prev) && !el.contains(prev) ? prev : null;
     dialogStack.push({ el, onEsc, restore, openedAt: performance.now() });
     const target = focusEl && !focusEl.disabled ? focusEl : el;
     try {
@@ -397,6 +472,7 @@ export function createUI(ctx = {}) {
     }
   }
   function onKeyDown(e) {
+    if (!e.repeat) lastKeyAt = performance.now();
     const top = dialogStack[dialogStack.length - 1];
     if (!top) return;
     // A key still held from gameplay (Space = hold to reel) auto-repeats onto the button that just
@@ -470,20 +546,51 @@ export function createUI(ctx = {}) {
     const wasOpen = cur.catchOpen;
     catchEl.hidden = false;
     cur.catchOpen = true;
+    catchScroll.scrollTop = 0;
     syncHud();
     if (!wasOpen) {
-      openDialog(catchEl, btnRelease, () => release());
+      // opened by the game, not by the player: never hand focus back to a HUD control afterwards
+      openDialog(catchEl, btnRelease, () => release(), { mayRestore: false });
       const inf = speciesInfo(record.speciesId, record);
       announce(`${inf.name}, ${formatWeight(fin(record.weightKg), cur.units)}, ${formatLength(fin(record.lengthCm), cur.units)}. ${catchFlags.textContent} Keep or release?`);
     }
+    relayout();
+    requestAnimationFrame(updateScrollHint);
   }
   function hideCatch() {
     if (!cur.catchOpen) return;
     cur.catchOpen = false;
     catchEl.hidden = true;
+    catchScroll.classList.remove('has-more');
     closeDialog(catchEl);
     syncHud();
+    relayout();
   }
+  // The card's final layout box in viewport CSS px (ignores the slide-in transform), or null when the
+  // card is not up. Core frames the showcase fish in the free region beside / above it.
+  function getCatchRect() {
+    if (!cur.catchOpen || catchEl.hidden) return null;
+    const w = catchEl.offsetWidth;
+    const h = catchEl.offsetHeight;
+    if (!(w > 0 && h > 0)) return null;
+    const x = catchEl.offsetLeft;
+    const y = catchEl.offsetTop;
+    if (typeof DOMRect === 'function') return new DOMRect(x, y, w, h);
+    return { x, y, width: w, height: h, left: x, top: y, right: x + w, bottom: y + h };
+  }
+  // Fade the bottom of a scroll area (catch card, pause menu) while there is more to scroll to.
+  function scrollHint(el) {
+    const more = el.scrollHeight - el.clientHeight > 2 && el.scrollTop + el.clientHeight < el.scrollHeight - 4;
+    if (more !== el.classList.contains('has-more')) el.classList.toggle('has-more', more);
+  }
+  function updateScrollHint() {
+    if (cur.catchOpen) scrollHint(catchScroll);
+    if (cur.pauseOpen) {
+      scrollHint(pauseEl);
+      scrollHint(pauseHelp);
+    }
+  }
+  for (const el of [catchScroll, pauseEl, pauseHelp]) el.addEventListener('scroll', () => scrollHint(el), { passive: true });
   function keep() {
     if (!cur.catchOpen) return;
     call('onKeep');
@@ -499,7 +606,7 @@ export function createUI(ctx = {}) {
 
   // ---------- journal ----------
   function renderJournal() {
-    const { totals, body } = renderJournalBody(lastRecords, cur.units, speciesInfo);
+    const { totals, body } = renderJournalBody(lastRecords, cur.units, speciesInfo, speciesList);
     journalTotals.innerHTML = totals;
     journalBody.innerHTML = body;
   }
@@ -545,8 +652,12 @@ export function createUI(ctx = {}) {
     cur.pauseOpen = p;
     pauseModal.hidden = !p;
     syncHud();
-    if (p) openDialog(pauseEl, btnResume, resume);
-    else closeDialog(pauseEl);
+    if (p) {
+      openDialog(pauseEl, btnResume, resume);
+      pauseEl.scrollTop = 0;
+      pauseHelp.scrollTop = 0;
+      requestAnimationFrame(updateScrollHint);
+    } else closeDialog(pauseEl);
   }
   function resume() {
     if (!cur.pauseOpen) return;
@@ -593,6 +704,8 @@ export function createUI(ctx = {}) {
       cur.hours = h;
       updateClock(h);
       call('onTimePreset', h);
+      // on phones the open preset rows push into the toast lane: fold them away once used
+      if (cur.input === 'touch') setPresetsOpen(false);
     });
   }
   btnSound.addEventListener('click', () => {
@@ -608,6 +721,10 @@ export function createUI(ctx = {}) {
   for (const b of lureButtons) {
     b.addEventListener('click', () => {
       const id = b.dataset.lure;
+      if (id === cur.lureId && id === noteLure) {
+        showLureNote(id); // already tied on: just say what it is for
+        return;
+      }
       applyLure(id);
       call('onLure', id);
     });
@@ -750,6 +867,79 @@ export function createUI(ctx = {}) {
   root.addEventListener('pointerdown', stopPointer);
   root.addEventListener('mousedown', stopPointer);
 
+  // ---------- layout: prompt band + toast lane (measured, so it follows fonts, safe areas, input mode) ----------
+  const bandSet = { x: '', w: '', b: '' };
+  const toastSet = { x: '', w: '', top: '' };
+  function setVar(el, store, key, prop, value) {
+    if (store[key] === value) return;
+    store[key] = value;
+    if (value) el.style.setProperty(prop, value);
+    else el.style.removeProperty(prop);
+  }
+  // The prompt (and the cast-power bar above it) never sits in the middle band where the camera puts
+  // the float and the hooked fish: it goes between the lure panel and the gauge when that gap is wide
+  // enough, else above whichever bottom panel it would cover (above the lures on narrow desktops and
+  // tablets, above both on phones).
+  function layoutBand() {
+    if (hud.hidden) return;
+    const vw = window.innerWidth || doc.documentElement.clientWidth;
+    const vh = window.innerHeight || doc.documentElement.clientHeight;
+    const lr = lures.getBoundingClientRect();
+    const gr = gaugeEl.getBoundingClientRect();
+    if (!(lr.width > 0 && gr.width > 0 && vw > 0 && vh > 0)) return;
+    const pad = 12;
+    let x0 = lr.right + pad;
+    let x1 = gr.left - pad;
+    let bottom;
+    if (x1 - x0 >= BAND_MIN_W) {
+      bottom = vh - Math.max(lr.bottom, gr.bottom); // between the panels, on their baseline
+    } else if (gr.left - pad - GUT >= Math.min(BAND_MAX_W, 360)) {
+      x0 = GUT; // above the lure panel, clear of the (taller) gauge
+      bottom = vh - lr.top + 10;
+    } else {
+      x0 = GUT; // full width above both (portrait phones)
+      x1 = vw - GUT;
+      bottom = vh - Math.min(lr.top, gr.top) + 10;
+    }
+    const w = Math.max(0, Math.min(BAND_MAX_W, x1 - x0));
+    const x = clamp(vw / 2, x0 + w / 2, x1 - w / 2);
+    setVar(center, bandSet, 'x', '--band-x', `${Math.round(x)}px`);
+    setVar(center, bandSet, 'w', '--band-w', `${Math.floor(w)}px`);
+    setVar(center, bandSet, 'b', '--band-b', `${Math.round(Math.max(0, bottom))}px`);
+  }
+  // Toasts: below an open time-preset row they would cover, and beside (not over) a side-panel catch card.
+  function placeToasts() {
+    const vw = window.innerWidth || doc.documentElement.clientWidth;
+    let x0 = 0;
+    let x1 = vw;
+    const cr = getCatchRect();
+    if (cr && cr.left > vw * 0.3) x1 = cr.left - 8; // side panel: use the strip left of it
+    const w = Math.max(160, Math.min(440, x1 - x0 - 2 * GUT));
+    const cx = (x0 + x1) / 2;
+    let top = '';
+    if (!hud.hidden) {
+      const c = clockPanel.getBoundingClientRect();
+      const defTop = c.top + 58; // CSS default: 70px + safe-area top (the clock sits at 12px + safe-area top)
+      if (c.height > 0 && c.bottom + 8 > defTop && c.right > cx - w / 2 && c.left < cx + w / 2) top = `${Math.round(c.bottom + 8)}px`;
+    }
+    const moved = x1 < vw;
+    setVar(toasts, toastSet, 'x', '--toast-x', moved ? `${Math.round(cx)}px` : '');
+    setVar(toasts, toastSet, 'w', '--toast-w', moved ? `${Math.floor(w)}px` : '');
+    setVar(toasts, toastSet, 'top', '--toast-top', top);
+  }
+  function relayout() {
+    layoutBand();
+    placeToasts();
+    updateScrollHint();
+  }
+  let ro = null;
+  if (typeof ResizeObserver === 'function') {
+    ro = new ResizeObserver(() => relayout());
+    for (const el of [lures, gaugeEl, clockPanel, catchEl, ...catchScroll.children, pauseEl, pauseHelp]) ro.observe(el);
+  }
+  window.addEventListener('resize', relayout);
+  if (doc.fonts && doc.fonts.ready) doc.fonts.ready.then(relayout, () => {});
+
   // ---------- per-frame pieces ----------
   function updateClock(hours) {
     const h = ((fin(hours, cur.hours) % 24) + 24) % 24;
@@ -843,6 +1033,51 @@ export function createUI(ctx = {}) {
     }
   }
 
+  // Rod meter (fighting): the rod from behind. It leans with side pressure (hud.rodSide -1..1), stands
+  // taller as it is lifted (hud.rodLift01) and turns amber while it points down the line (hud.rodStiff01).
+  function updateRodMeter(h) {
+    const on = cur.state === STATES.FIGHTING && num.fishOn && Number.isFinite(h.rodLift01);
+    if (on !== last.rodOn) {
+      last.rodOn = on;
+      rodMeter.hidden = !on;
+      last.rodKey = NaN;
+    }
+    if (!on) return;
+    const side = clamp(fin(h.rodSide), -1, 1);
+    const lift = clamp(fin(h.rodLift01), 0, 1);
+    const stiff = fin(h.rodStiff01) > 0.6;
+    const qs = Math.round(side * 20);
+    const ql = Math.round(lift * 20);
+    const key = (qs + 20) * 100 + ql * 2 + (stiff ? 1 : 0); // numeric: no per-frame garbage
+    if (key === last.rodKey) return;
+    last.rodKey = key;
+    const a = (qs / 20) * 0.95; // radians from upright
+    const len = 7 + 11 * (ql / 20);
+    const x = (22 + len * Math.sin(a)).toFixed(1);
+    const y = (22 - len * Math.cos(a)).toFixed(1);
+    rodLine.setAttribute('x2', x);
+    rodLine.setAttribute('y2', y);
+    rodTip.setAttribute('cx', x);
+    rodTip.setAttribute('cy', y);
+    rodMeter.classList.toggle('is-stiff', stiff);
+  }
+
+  // Slack line with a fish on (the dial sits at zero): after a moment the empty track pulses amber,
+  // because slack is when a shaking fish throws the hook.
+  let slackSince = 0;
+  let slackOn = false;
+  function updateSlack() {
+    const slack = cur.state === STATES.FIGHTING && num.fishOn && num.tension01 < 0.02;
+    const now = performance.now();
+    if (!slack) slackSince = 0;
+    else if (!slackSince) slackSince = now;
+    const on = slack && now - slackSince >= SLACK_PULSE_MS;
+    if (on === slackOn) return;
+    slackOn = on;
+    if (on) dial.dataset.slack = '1';
+    else delete dial.dataset.slack;
+  }
+
   // Fallback prompts when core does not send hud.prompt. Writes into a scratch object (no per-frame garbage).
   const derived = { text: '', kind: 'info' };
   function derivePrompt(h) {
@@ -855,24 +1090,31 @@ export function createUI(ctx = {}) {
         kind = 'ready';
         break;
       case STATES.CHARGING:
-        text = 'Release to cast';
+        text = touch ? 'Let go to cast' : 'Release to cast';
         kind = 'ready';
         break;
       case STATES.WAITING: {
         const lure = LURE_BY_ID[h.lureId || cur.lureId];
-        text = lure && lure.kind === 'bait' ? 'Watch the float' : 'Hold to reel';
+        if (!lure || lure.kind === 'bait') {
+          text = touch ? 'Watch the float · tap when it goes under · hold Reel to bring it in' : 'Watch the float · click when it goes under · hold to reel in';
+        } else if (lure.id === 'topwater') {
+          text = touch ? 'Reel in short bursts · pause now and then' : 'Shift + hold for a slow walk · pause now and then';
+        } else {
+          text = touch ? 'Hold Reel to retrieve · pause now and then' : 'Hold to reel · Shift for a slower retrieve';
+        }
         break;
       }
       case STATES.STRIKE:
-        text = touch ? 'Tap to set the hook' : 'Click to set the hook';
+        text = touch ? 'Tap anywhere to set the hook' : 'Click to set the hook';
         kind = 'danger';
         break;
       case STATES.FIGHTING: {
+        // say what to do, with the control for this input
         const lvl = gauge.level;
-        if (lvl === 2) (text = 'Too much tension!'), (kind = 'danger');
-        else if (lvl === 1) (text = 'Heavy load. Ease the drag'), (kind = 'warn');
-        else if (Number.isFinite(h.fishStamina01) && h.fishStamina01 < 0.25) (text = 'Fish is tiring'), (kind = 'good');
-        else (text = 'Fish on! Keep the rod up'), (kind = 'good');
+        if (lvl === 2) (text = touch ? 'Too much tension! Let go of Reel and tap –' : 'Too much tension! Stop reeling, loosen the drag'), (kind = 'danger');
+        else if (lvl === 1) (text = touch ? 'Heavy load. Tap – to loosen the drag' : 'Heavy load. Loosen the drag: wheel down or ['), (kind = 'warn');
+        else if (Number.isFinite(h.fishStamina01) && h.fishStamina01 < 0.25) (text = 'Fish is tiring. Keep it coming'), (kind = 'good');
+        else (text = touch ? 'Fish on! Drag up on the lake to lift the rod' : 'Fish on! Mouse up to keep the rod high'), (kind = 'good');
         break;
       }
       case STATES.LANDING:
@@ -911,6 +1153,26 @@ export function createUI(ctx = {}) {
     last.prompt = text;
     last.promptKind = kind;
     prompt.hidden = !text;
+    // Steady hints while the float is out or a fish is on (info / good) fade a few seconds after they
+    // appear, so they never sit over the water for long; a new hint shows again, and warnings and
+    // dangers always stay.
+    if (changedText || !text) {
+      clearTimeout(quietTimer);
+      quietTimer = 0;
+      prompt.classList.remove('is-quiet');
+    }
+    if (text && (kind === 'info' || kind === 'good') && (cur.state === STATES.WAITING || cur.state === STATES.FIGHTING)) {
+      if (!quietTimer && !prompt.classList.contains('is-quiet')) {
+        quietTimer = setTimeout(() => {
+          quietTimer = 0;
+          if (last.prompt === text) prompt.classList.add('is-quiet');
+        }, QUIET_AFTER_MS);
+      }
+    } else {
+      clearTimeout(quietTimer);
+      quietTimer = 0;
+      prompt.classList.remove('is-quiet');
+    }
     if (text) {
       promptText.textContent = text;
       prompt.dataset.kind = kind;
@@ -937,6 +1199,11 @@ export function createUI(ctx = {}) {
     if (typeof h.quality === 'string' && h.quality !== cur.quality) applyQuality(h.quality);
     if (typeof h.paused === 'boolean' && h.paused !== cur.pauseOpen) setPaused(h.paused);
     if (h.lureId && h.lureId !== last.lureId) applyLure(h.lureId);
+    if (h.lureId && h.lureId !== noteLure) {
+      const had = noteLure;
+      noteLure = h.lureId;
+      if (had && !cur.titleOpen && cur.state !== STATES.TITLE) showLureNote(h.lureId);
+    }
     if (Number.isFinite(h.hours)) {
       cur.hours = h.hours;
       updateClock(h.hours);
@@ -951,6 +1218,8 @@ export function createUI(ctx = {}) {
     num.fishOn = !!h.fishOn;
     num.fishDistanceM = fin(h.fishDistanceM, NaN);
     refreshReadouts();
+    updateSlack();
+    updateRodMeter(h);
 
     // cast power
     const showPower = cur.state === STATES.CHARGING;
@@ -1045,7 +1314,7 @@ export function createUI(ctx = {}) {
   }
 
   // ---------- toasts ----------
-  function toast(text, kind = 'info') {
+  function toast(text, kind = 'info', ms = 3400) {
     if (!text) return;
     const el = doc.createElement('div');
     el.className = 'toast';
@@ -1057,7 +1326,7 @@ export function createUI(ctx = {}) {
     setTimeout(() => {
       el.classList.add('is-out');
       setTimeout(() => el.remove(), reduced() ? 0 : 340);
-    }, 3400);
+    }, Number.isFinite(ms) && ms > 0 ? ms : 3400);
   }
 
   // Stay in sync if core forgets to call setState.
@@ -1070,12 +1339,16 @@ export function createUI(ctx = {}) {
 
   function dispose() {
     window.removeEventListener('keydown', onKeyDown, true);
+    window.removeEventListener('keyup', onAnyKeyUp, true);
     window.removeEventListener('pointerdown', onAnyPointer, { capture: true });
     window.removeEventListener('blur', releaseAllHolds);
+    window.removeEventListener('resize', relayout);
     doc.removeEventListener('visibilitychange', onVisibility);
+    if (ro) ro.disconnect();
     if (typeof offState === 'function') offState();
     releaseAllHolds();
     clearTimeout(strikeTimer);
+    clearTimeout(quietTimer);
   }
 
   return {
@@ -1093,6 +1366,9 @@ export function createUI(ctx = {}) {
     setLoading,
     setPaused,
     isModalOpen: () => cur.pauseOpen || cur.journalOpen || cur.catchOpen,
+    // The catch card's layout box (DOMRect, viewport CSS px) while it is up, else null. A bottom sheet
+    // when the window is <= 720 px wide or its aspect is <= 0.85, else a side panel on the right.
+    getCatchRect,
     dispose,
   };
 }

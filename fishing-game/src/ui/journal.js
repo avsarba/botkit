@@ -68,16 +68,82 @@ export function renderTotals(sum, units, speciesTotal = SPECIES_IDS.length) {
   return parts.join('');
 }
 
-// info(id) -> { name, latin }
-export function renderJournalBody(records, units, info) {
+// ---------- field tips for species not caught yet (derived from the species data, so they stay true) ----------
+const TIP_TIMES = [
+  ['dawn', 5.75],
+  ['morning', 9],
+  ['noon', 12.5],
+  ['dusk', 19 + 40 / 60],
+  ['night', 22.5],
+];
+const orList = (a) => (a.length <= 1 ? a.join('') : `${a.slice(0, -1).join(', ')} or ${a[a.length - 1]}`);
+
+// sp: a species definition (src/fish/species.js). Returns e.g.
+// { lure: 'Spinner', when: 'dawn or dusk', where: 'deep open water, long casts' } or null.
+export function fieldTip(sp) {
+  if (!sp || typeof sp !== 'object') return null;
+  // best baits: the top one plus any within 0.1 of it (at most two)
+  let lure = '';
+  if (sp.lures && typeof sp.lures === 'object') {
+    const ranked = LURES.map((l) => [l, Number(sp.lures[l.id]) || 0]).sort((a, b) => b[1] - a[1]);
+    if (ranked.length && ranked[0][1] > 0) {
+      const top = ranked.filter(([, v], i) => i < 2 && v >= ranked[0][1] - 0.1).map(([l]) => l.short.toLowerCase());
+      lure = orList(top);
+    }
+  }
+  // best times: preset hours within 12 % of the peak activity
+  let when = '';
+  if (typeof sp.activity === 'function') {
+    const act = TIP_TIMES.map(([label, h]) => {
+      let v = 0;
+      try {
+        v = Number(sp.activity(h)) || 0;
+      } catch {
+        v = 0;
+      }
+      return [label, v];
+    });
+    const max = Math.max(...act.map((x) => x[1]));
+    if (max > 0) when = orList(act.filter(([, v]) => v >= max * 0.88).map(([l]) => l).slice(0, 3));
+  }
+  // where: the cover it likes most; deep open-water fish need long casts past the float's reach
+  let where = '';
+  const hab = sp.habitat || {};
+  const maxDepth = Array.isArray(sp.depthM) ? Number(sp.depthM[1]) || 0 : 0;
+  const best = ['weeds', 'rocks', 'wood', 'open'].reduce((a, k) => ((Number(hab[k]) || 0) > (Number(hab[a]) || 0) ? k : a), 'weeds');
+  if ((Number(hab.open) || 0) >= 0.9 && maxDepth >= 8) where = 'deep open water, long casts';
+  else if (best === 'rocks') where = 'the rocky point to the right';
+  else if (best === 'wood') where = 'the sunken timber';
+  else if (best === 'weeds') where = 'weed edges and lily pads';
+  else if (best === 'open') where = 'open water';
+  if (!lure && !when && !where) return null;
+  return { lure, when, where };
+}
+
+// info(id) -> { name, latin }; species: optional array of species definitions (for field tips)
+export function renderJournalBody(records, units, info, species = null) {
   const sum = summarize(records);
   const ids = SPECIES_IDS.slice();
   for (const id of sum.bySpecies.keys()) if (!ids.includes(id)) ids.push(id);
 
+  const byId = new Map(Array.isArray(species) ? species.filter((x) => x && x.id).map((x) => [x.id, x]) : []);
   let rows = '';
   for (const id of ids) {
     const s = sum.bySpecies.get(id);
     const inf = info(id, s && s.record);
+    let tip = '';
+    if (!s) {
+      const def = byId.get(id);
+      if (def && typeof def.tip === 'string' && def.tip.trim()) {
+        tip = esc(def.tip.trim()); // the fish module's own field note
+      } else {
+        const t = fieldTip(def);
+        if (t) {
+          const parts = [t.lure && `<b>${esc(t.lure)}</b>`, t.when && esc(t.when), t.where && esc(t.where)].filter(Boolean);
+          tip = parts.join(' · ');
+        }
+      }
+    }
     const sp = `<th scope="row" class="j-sp"><span class="j-sp-name">${esc(inf.name)}</span><span class="j-sp-latin">${esc(inf.latin)}</span></th>`;
     if (s) {
       rows +=
@@ -85,7 +151,9 @@ export function renderJournalBody(records, units, info) {
         `<td class="num">${esc(formatWeight(s.maxKg, units))}</td>` +
         `<td class="num c-len">${esc(formatLength(s.maxCm, units))}</td></tr>`;
     } else {
-      rows += `<tr class="uncaught">${sp}<td class="j-none" colspan="3">Not yet caught</td></tr>`;
+      rows += `<tr class="uncaught${tip ? ' has-tip' : ''}">${sp}<td class="j-none" colspan="3">Not yet caught</td></tr>`;
+      // the field tip gets its own full-width line under the species
+      if (tip) rows += `<tr class="j-tip-row"><td colspan="4"><span class="j-tip">${tip}</span></td></tr>`;
     }
   }
   const table =
@@ -97,7 +165,10 @@ export function renderJournalBody(records, units, info) {
   const recent = recentRecords(records, 8);
   let list;
   if (!recent.length) {
-    list = '<p class="j-empty">No fish yet. At dawn, try a worm under the float along the weed edge to the left of the dock.</p>';
+    list =
+      '<p class="j-empty">No fish yet. At dawn, try a worm under the float along the weed edge to the left of the dock. ' +
+      'Spinners and crankbaits need reeling; the topwater walks slowly on the surface at dawn and dusk. ' +
+      'Every species you have not caught yet has a tip in the list.</p>';
   } else {
     list = '<ol class="recent-list">';
     for (const r of recent) {

@@ -13,6 +13,7 @@
 // lures: 0..1 how readily it takes each lure in LURES (config.js).
 // activity(hours): 0..1 feeding activity by time of day.
 // hookWindowS: how long it holds the bait/lure before spitting it. rarity: 0 common .. 1 very rare.
+// tip: a one-line field tip (where / when / what it takes in this lake), e.g. for the journal's uncaught rows.
 import { clamp, smoothstep, makeRng } from '../config.js';
 
 // ---------- time-of-day curve helpers ----------
@@ -84,6 +85,7 @@ export const SPECIES = [
     nibbles: [1, 4],
     spookiness: 0.55,
     fight: { run: 0.8, dive: 0.4, thrash: 0.0, cover: 0.6, circle: 1.0 },
+    tip: 'Worm under a float by the dock or the cove weeds, any time of day.',
     rarityLabel: 'Common',
     bodyDepth: 0.45, // max body depth / total length
     bodyWidth: 0.36, // body width / body depth
@@ -115,6 +117,7 @@ export const SPECIES = [
     nibbles: [1, 3],
     spookiness: 0.45,
     fight: { run: 0.6, dive: 0.6, thrash: 0.0, cover: 0.3, circle: 0.5 },
+    tip: 'Worm or spinner near the bottom off the dock and the timber, morning and late afternoon.',
     rarityLabel: 'Common',
     bodyDepth: 0.27, // max body depth / total length
     bodyWidth: 0.5, // body width / body depth
@@ -132,7 +135,7 @@ export const SPECIES = [
     stamina: 0.6,
     jumpiness: 0.85,
     headshake: 0.45,
-    depthM: [2.0, 11],
+    depthM: [1.5, 11], // deep by day; up to ~1.5 m to feed in low light (see habitatScore in system.js)
     habitat: { weeds: 0.05, rocks: 0.35, wood: 0.1, open: 1.0 },
     lures: { bobber: 0.75, spinner: 0.95, crankbait: 0.35, topwater: 0.15 },
     activity: (h) => 0.18 + 0.82 * Math.max(bump(h, 6.3, 1.5), bump(h, 19.9, 1.5), 0.45 * bump(h, 9.5, 2.2)),
@@ -146,6 +149,7 @@ export const SPECIES = [
     nibbles: [0, 2],
     spookiness: 0.7,
     fight: { run: 1.0, dive: 0.4, thrash: 0.1, cover: 0.0, circle: 0.2 },
+    tip: 'Deep open water well out from the dock: long spinner casts, or a worm on a long float cast at dawn and dusk.',
     rarityLabel: 'Uncommon',
     bodyDepth: 0.24, // max body depth / total length
     bodyWidth: 0.48, // body width / body depth
@@ -177,6 +181,7 @@ export const SPECIES = [
     nibbles: [0, 1],
     spookiness: 0.6,
     fight: { run: 1.0, dive: 0.6, thrash: 0.2, cover: 0.4, circle: 0.3 },
+    tip: 'Rocks and the drop-off on the point: crankbait or topwater, best at dawn and dusk.',
     rarityLabel: 'Uncommon',
     bodyDepth: 0.27, // max body depth / total length
     bodyWidth: 0.5, // body width / body depth
@@ -208,6 +213,7 @@ export const SPECIES = [
     nibbles: [0, 1],
     spookiness: 0.5,
     fight: { run: 0.9, dive: 0.3, thrash: 0.3, cover: 1.0, circle: 0.3 },
+    tip: 'Cove weed edges, the dock and the timber: topwater at dawn and dusk, crankbait by day.',
     rarityLabel: 'Common',
     bodyDepth: 0.29, // max body depth / total length
     bodyWidth: 0.52, // body width / body depth
@@ -239,6 +245,7 @@ export const SPECIES = [
     nibbles: [1, 3],
     spookiness: 0.65,
     fight: { run: 0.5, dive: 1.0, thrash: 0.0, cover: 0.2, circle: 0.2 },
+    tip: 'Rocky drop-off at the point: crankbait or a worm at dawn, dusk and after dark.',
     rarityLabel: 'Uncommon',
     bodyDepth: 0.2, // max body depth / total length
     bodyWidth: 0.62, // body width / body depth
@@ -270,6 +277,7 @@ export const SPECIES = [
     nibbles: [0, 2],
     spookiness: 0.35,
     fight: { run: 0.6, dive: 1.0, thrash: 0.0, cover: 0.7, circle: 0.2 },
+    tip: 'A worm near the bottom by the sunken timber, from evening into the night.',
     rarityLabel: 'Uncommon',
     bodyDepth: 0.19, // max body depth / total length
     bodyWidth: 0.8, // body width / body depth
@@ -301,6 +309,7 @@ export const SPECIES = [
     nibbles: [0, 0],
     spookiness: 0.4,
     fight: { run: 1.0, dive: 0.3, thrash: 1.0, cover: 0.9, circle: 0.2 },
+    tip: 'Weed edges in the cove: spinner, crankbait or topwater, early morning and evening.',
     rarityLabel: 'Common',
     bodyDepth: 0.16, // max body depth / total length
     bodyWidth: 0.68, // body width / body depth
@@ -332,6 +341,7 @@ export const SPECIES = [
     nibbles: [0, 0],
     spookiness: 0.5,
     fight: { run: 1.0, dive: 0.3, thrash: 1.0, cover: 0.6, circle: 0.2 },
+    tip: 'Patrols the cove weed edge. Big lures at first light and dusk; it follows far more than it bites, so pause at the dock.',
     rarityLabel: 'Very rare',
     bodyDepth: 0.17, // max body depth / total length
     bodyWidth: 0.66, // body width / body depth

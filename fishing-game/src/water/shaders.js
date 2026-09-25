@@ -7,6 +7,8 @@
 //            own scattered light, the sun glint, splash foam and fog.
 //
 // Both passes blend in display space (the framebuffer holds tone-mapped sRGB).
+// Quality levels only flip uniforms (uUseRefl / uUseDepth): every path is compiled
+// in, so a runtime quality change never recompiles the water programs.
 // They estimate the radiance under the water (uBedEst) so that
 // dst * M + S reproduces display(bed * T + A) for that estimate; for other bed
 // brightnesses the error is small because the display curve is close to a
@@ -22,6 +24,15 @@ uniform vec4 uWaveB[NW];   // phase, Q, wavelength, -
 uniform vec4 uRingA[MAX_RINGS]; // x, z, age, amplitude (m)
 uniform vec4 uRingB[MAX_RINGS]; // speed, max radius, k, foam (>= 0: impact; -1 - foam: no crater)
 uniform int uRingCount;
+uniform sampler2D tEnvDepth;
+uniform vec4 uEnvDepthXf;   // minX, minZ, 1/width, 1/depth
+uniform float uEnvDepthMode;// 0: R = depth/12 (environment), 1: R = sqrt(depth/12) (fallback)
+
+float envDepthAt(vec2 xz) {
+  vec2 uv = (xz - uEnvDepthXf.xy) * uEnvDepthXf.zw;
+  float r = texture2D(tEnvDepth, clamp(uv, vec2(0.0), vec2(1.0))).r;
+  return uEnvDepthMode > 0.5 ? r * r * 12.0 : r * 12.0;
+}
 `;
 
 export const waterVertex = /* glsl */ `
@@ -30,9 +41,26 @@ ${common}
 #include <fog_pars_vertex>
 #include <logdepthbuf_pars_vertex>
 attribute float aCell;
+uniform vec2 uWindDir;      // unit (x, z): where the wind blows toward
 varying vec3 vWorld;
 varying vec2 vX0;
 varying vec3 vViewPos;
+varying float vLee;
+
+// Sheltered water: with land a short way upwind the wind has had no fetch to raise
+// ripples, and the treeline puts the strip along the windward shore in its wind
+// shadow, so it stays glassy and mirrors the forest. 1 = fully sheltered.
+float landAt(vec2 xz) {
+  return 1.0 - smoothstep(0.03, 0.4, envDepthAt(xz));
+}
+float leeAt(vec2 x0) {
+  vec2 up = -uWindDir;
+  float s = landAt(x0 + up * 16.0);
+  s = max(s, 0.8 * landAt(x0 + up * 40.0));
+  s = max(s, 0.55 * landAt(x0 + up * 75.0));
+  s = max(s, 0.3 * landAt(x0 + up * 120.0));
+  return s;
+}
 
 void main() {
   vec4 wp = modelMatrix * vec4(position, 1.0);
@@ -62,6 +90,7 @@ void main() {
   wp.xyz += disp;
   vWorld = wp.xyz;
   vX0 = x0;
+  vLee = leeAt(x0);
   vec4 mvPosition = viewMatrix * wp;
   vViewPos = mvPosition.xyz;
   gl_Position = projectionMatrix * mvPosition;
@@ -84,7 +113,7 @@ ${common}
 #endif
 
 uniform vec3 uSunDir;
-uniform vec3 uSunRad;       // sun irradiance (colour * intensity), 0 below the horizon
+uniform vec3 uSunRad;       // sun irradiance (colour * intensity * skyline visibility), 0 below the horizon
 uniform vec3 uSkyColor;
 uniform vec3 uHorizonColor;
 uniform vec3 uSigma;        // attenuation (1/m) per channel
@@ -101,45 +130,39 @@ uniform vec4 uDetOff2P;     // scroll offset layer 2 (xy), wind patches (zw)
 uniform float uPatchScale;
 uniform float uRuffle;
 uniform vec2 uResolution;
-uniform sampler2D tEnvDepth;
-uniform vec4 uEnvDepthXf;   // minX, minZ, 1/width, 1/depth
-uniform float uEnvDepthMode;// 0: R = depth/12 (environment), 1: R = sqrt(depth/12) (fallback)
 uniform float uReflClamp;
+uniform float uSpreadCap;   // max mirror blur (radians): light airs cannot smear the treeline much
 
-#ifdef USE_DEPTH_PREPASS
-  uniform sampler2D tSceneDepth;
-  uniform vec2 uDepthTexel;
-  uniform float uCamNear;
-  uniform float uCamFar;
-#endif
+// depth pre-pass (high / medium) or the environment depth map (low)
+uniform float uUseDepth;
+uniform sampler2D tSceneDepth;
+uniform vec2 uDepthTexel;
+uniform float uCamNear;     // near / far of the (range-limited) pre-pass camera
+uniform float uCamFar;
 
-#ifdef USE_REFLECTION
-  uniform sampler2D tRefl;
-  uniform sampler2D tReflDepth;
-  uniform mat4 uTexMatrix;
-  uniform mat4 uReflProjInv;
-  uniform float uReflPxPerRad; // reflection-target pixels per radian
-  uniform vec2 uReflTexel;
-#else
-  uniform vec3 uShoreColor;
-  uniform float uShoreElev;
-#endif
+// planar reflection (high / medium) or the sky with a dark far-shore band (low)
+uniform float uUseRefl;
+uniform sampler2D tRefl;
+uniform sampler2D tReflDepth;
+uniform mat4 uTexMatrix;
+uniform mat4 uReflProjInv;
+uniform mat4 uReflCamWorld;  // mirror camera -> world
+uniform vec4 uReflProjXY;    // mirror projection e0, e5, e8, e9
+uniform float uReflPxPerRad; // reflection-target pixels per radian
+uniform vec2 uReflTexel;
+uniform vec3 uShoreColor;
+uniform float uShoreElev;
 
 varying vec3 vWorld;
 varying vec2 vX0;
 varying vec3 vViewPos;
+varying float vLee;
 
 vec3 toDisplay(vec3 c) {
   #ifdef TONE_MAPPING
     c = toneMapping(c);
   #endif
   return linearToOutputTexel(vec4(c, 1.0)).rgb;
-}
-
-float envDepthAt(vec2 xz) {
-  vec2 uv = (xz - uEnvDepthXf.xy) * uEnvDepthXf.zw;
-  float r = texture2D(tEnvDepth, clamp(uv, vec2(0.0), vec2(1.0))).r;
-  return uEnvDepthMode > 0.5 ? r * r * 12.0 : r * 12.0;
 }
 
 // Slope (dh/dx, dh/dz) of all Gerstner components at the undisplaced point.
@@ -196,7 +219,10 @@ vec2 rippleSlope(vec2 x0, float foot, inout float var, inout float foam) {
     float fo = S.w >= 0.0 ? S.w : -S.w - 1.0;
     if (fo > 0.0) {
       float fr = (0.2 + 0.45 * fo) * (1.0 + 0.9 * age);
-      foam += fo * exp(-age * 0.45) * (1.0 - smoothstep(0.3 * fr, fr, d));
+      // fresh white water is thrown out into a ring around a dark, disturbed
+      // hole; the hole fills in over the first ~0.3 s
+      float hole = mix(1.0, smoothstep(0.2 * fr, 0.7 * fr, d), exp(-age * 3.0));
+      foam += fo * exp(-age * 0.45) * (1.0 - smoothstep(0.3 * fr, fr, d)) * hole;
     }
     float x = d - rf;
     float wdt = x > 0.0 ? 0.5 * lam : lam * (1.0 + 2.0 * age); // trailing crests
@@ -220,7 +246,6 @@ float smithG1(float ndx, float a2) {
   return c < 1.6 ? (3.535 * c + 2.181 * c * c) / (1.0 + 2.276 * c + 2.577 * c * c) : 1.0;
 }
 
-#ifndef USE_REFLECTION
 vec3 skyFallback(vec3 R) {
   vec3 c;
   #ifdef ENVMAP_TYPE_CUBE_UV
@@ -232,7 +257,77 @@ vec3 skyFallback(vec3 R) {
   float band = 1.0 - smoothstep(uShoreElev * 0.3, uShoreElev, R.y);
   return mix(c, uShoreColor, band * 0.92);
 }
-#endif
+
+// NaN / Inf by bit pattern: a fast-math shader compiler may fold isnan() to
+// false and let min / max / clamp pass NaN through as 0 or NaN, but it cannot
+// reason integer bit tests away.
+bool nanBits(float x) {
+  uint u = floatBitsToUint(x);
+  return (u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0u;
+}
+bool anyNaN(vec3 c) {
+  return nanBits(c.r) || nanBits(c.g) || nanBits(c.b) || any(isnan(c));
+}
+// clamp to [0, hi]; +Inf -> hi, -Inf -> 0 (NaN excluded by the caller)
+float finiteClamp(float x, float hi) {
+  uint u = floatBitsToUint(x);
+  if ((u & 0x7f800000u) == 0x7f800000u) return (u >> 31u) != 0u ? 0.0 : hi;
+  return clamp(x, 0.0, hi);
+}
+vec3 finiteClamp(vec3 c, float hi) {
+  return vec3(finiteClamp(c.r, hi), finiteClamp(c.g, hi), finiteClamp(c.b, hi));
+}
+
+// The mirror is rendered from one camera below the surface, so a texel whose
+// mirror ray crosses the water plane over land looks up through the (single-
+// sided) terrain from inside and shows sky or haze. Taps land there when rough
+// facets near a shore tilt the reflected ray down: the true ray from the facet
+// hits the bank and the trunks at the waterline, not the sky. Without this the
+// blur lifts a pale band along every far shore.
+bool mirrorThroughLand(vec2 uv) {
+  if (textureLod(tReflDepth, uv, 0.0).r < 0.99999) return false; // something was drawn: a real image
+  vec2 ndc = uv * 2.0 - 1.0;
+  vec3 d = mat3(uReflCamWorld) * vec3((ndc.x + uReflProjXY.z) / uReflProjXY.x, (ndc.y + uReflProjXY.w) / uReflProjXY.y, -1.0);
+  vec3 o = uReflCamWorld[3].xyz;
+  if (d.y <= 1e-6 || o.y >= 0.0) return true; // never reaches the surface in front of the mirror camera
+  vec2 hit = o.xz + d.xz * (-o.y / d.y);
+  return envDepthAt(hit) < 0.05;
+}
+
+// One tap of the mirror image. A NaN texel (a broken normal somewhere in the
+// scene, spread into a block by the mip chain and the blur) is dropped instead
+// of being shown; Inf (half-float overflow at the sun disc) and anything
+// brighter than the clamp read as the brightest allowed value.
+void reflTap(vec2 uv, float lod, float w, inout vec3 acc, inout float wsum) {
+  uv = clamp(uv, vec2(0.001), vec2(0.999));
+  vec3 c = textureLod(tRefl, uv, lod).rgb;
+  if (anyNaN(c)) return;
+  c = finiteClamp(c, uReflClamp);
+  if (mirrorThroughLand(uv)) c = uShoreColor;
+  acc += c * w;
+  wsum += w;
+}
+
+// Real glints are thousands of times brighter than a screen; clipped per
+// channel after the tone curve they turn into flat white shapes. Compress the
+// brightest channel with a soft knee (in exposure-scaled units) and scale all
+// channels together, so the core keeps the key light's hue (gold at dusk,
+// silver under the moon) and the lobe keeps its falloff. The peak follows the
+// key light's own display level: sun glitter tops out near white (~0.93 after
+// ACES), the moon path at a softer silver instead of a floodlight.
+vec3 glintKnee(vec3 g) {
+  float ex = 1.0;
+  #ifdef TONE_MAPPING
+    ex = toneMappingExposure;
+  #endif
+  float key = max(max(uSunRad.r, uSunRad.g), uSunRad.b) * ex;
+  float km = clamp(1.3 * key, 0.7, 2.6); // asymptotic peak
+  float kt = 0.35 * km;                  // untouched below this
+  float m = max(max(g.r, g.g), g.b) * ex;
+  if (!(m > kt)) return g;
+  float mk = kt + (km - kt) * (1.0 - exp(-(m - kt) / (km - kt)));
+  return g * (mk / m);
+}
 
 void main() {
   #include <logdepthbuf_fragment>
@@ -244,10 +339,13 @@ void main() {
   // ---- surface normal ------------------------------------------------------
   float var = 0.0; // slope variance the pixel cannot resolve (grows with distance)
   float windPatch = texture2D(tDetail, vX0 * uPatchScale + uDetOff2P.zw).a;
-  // wind patches ("cat's paws") and sheltered shallows vary the roughness
-  float calm = mix(0.25, 1.3, smoothstep(0.25, 0.75, windPatch)) * mix(0.25, 1.0, smoothstep(0.15, 1.4, envDepthAt(vX0)));
+  // wind patches ("cat's paws"), sheltered shallows and the lee of the windward
+  // shore vary the roughness
+  float lee = clamp(vLee, 0.0, 1.0);
+  float calm = mix(0.25, 1.3, smoothstep(0.25, 0.75, windPatch)) * mix(0.25, 1.0, smoothstep(0.15, 1.4, envDepthAt(vX0)))
+             * (1.0 - 0.8 * lee);
   float ruffle = uRuffle * calm;
-  vec2 sl = gerstnerSlope(vX0, foot, calm * calm, var);
+  vec2 sl = gerstnerSlope(vX0, foot, calm * calm, var) * (1.0 - 0.6 * lee);
   sl += detailSlope(vX0, uDet0, uDetOff01.xy, ruffle, var);
   sl += detailSlope(vX0, uDet1, uDetOff01.zw, ruffle, var);
   sl += detailSlope(vX0, uDet2, uDetOff2P.xy, ruffle, var);
@@ -267,7 +365,7 @@ void main() {
   float cosI = clamp(V.y, 0.02, 1.0);
   float cosT = sqrt(1.0 - (1.0 - cosI * cosI) / 1.7689); // refracted ray (n = 1.33)
   float dv;
-  #ifdef USE_DEPTH_PREPASS
+  if (uUseDepth > 0.5) {
     vec2 suv = gl_FragCoord.xy / uResolution;
     float z0 = texture2D(tSceneDepth, suv + vec2(-0.5, -0.5) * uDepthTexel).r;
     float z1 = texture2D(tSceneDepth, suv + vec2(0.5, -0.5) * uDepthTexel).r;
@@ -275,14 +373,16 @@ void main() {
     float z3 = texture2D(tSceneDepth, suv + vec2(0.5, 0.5) * uDepthTexel).r;
     float zmax = max(max(z0, z1), max(z2, z3)); // thickest wins: no clear halos at silhouettes
     if (zmax > 0.9999999) {
-      dv = envDepthAt(vX0) + 0.5; // nothing under-water registered here
+      // nothing under water registered here (or beyond the pre-pass range, where
+      // Fresnel leaves only a few percent of transmission anyway)
+      dv = envDepthAt(vX0) + 0.5;
     } else {
       float sceneDist = -perspectiveDepthToViewZ(zmax, uCamNear, uCamFar) * dist / max(-vViewPos.z, 1e-3);
       dv = max(cosI * (sceneDist - dist), 0.0);
     }
-  #else
+  } else {
     dv = envDepthAt(vX0);
-  #endif
+  }
   float Lv = dv / cosT;
   vec3 T = exp(-uSigma * (Lv + dv * uDownK));
   // Soft edge where the water meets land. It only matters close by (the seam
@@ -291,9 +391,14 @@ void main() {
 
   float foamC = 0.0;
   if (foam > 0.001) {
-    // aerated water: clumpy, with bubbles; breaks up as it fades
-    float fn = texture2D(tDetail, vX0 * 3.1 + vec2(0.37, 0.11)).a * 0.65 + texture2D(tDetail, vX0 * 0.83).a * 0.35;
-    foamC = smoothstep(0.08, 0.6, foam * (0.35 + 1.1 * fn));
+    // aerated water: bubble clumps at three scales under a high-contrast mask.
+    // Fresh foam covers most of its patch; as it fades the covered fraction
+    // shrinks into scattered clumps instead of the whole patch dimming.
+    float fn = texture2D(tDetail, vX0 * 3.1 + vec2(0.37, 0.11)).a * 0.5
+             + texture2D(tDetail, vX0 * 0.83).a * 0.3
+             + texture2D(tDetail, vX0 * 9.7 + vec2(0.71, 0.29)).a * 0.2;
+    float thr = 0.74 - 0.36 * clamp(foam, 0.0, 1.0);
+    foamC = smoothstep(thr - 0.07, thr + 0.07, fn) * smoothstep(0.03, 0.35, foam);
   }
 
   vec3 Teff = mix(vec3(1.0), (1.0 - F) * T * (1.0 - foamC), shore);
@@ -321,7 +426,7 @@ void main() {
   R.y = max(R.y, 0.004);
   R = normalize(R);
   vec3 refl;
-  #ifdef USE_REFLECTION
+  if (uUseRefl > 0.5) {
     // Offset the mirror lookup by how far the tilted facet turns the reflected
     // ray, at the distance of what is mirrored there (reflection depth): near
     // posts wobble gently, the far treeline breaks up more.
@@ -341,22 +446,26 @@ void main() {
     if (pa.w > 0.01 && pb.w > 0.01) ruv += pa.xy / pa.w - pb.xy / pb.w;
     // Unresolved ripples blur the mirror image. Facets tilt the reflected ray
     // mostly up/down in a grazing view, so the blur is a vertical streak.
-    float spreadV = 0.85 * sqrt(var) * uReflPxPerRad;           // ~1 sigma, target pixels
+    float spreadV = min(0.85 * sqrt(var), uSpreadCap) * uReflPxPerRad; // ~1 sigma, target pixels
     float spreadH = spreadV * clamp(V.y * 4.0, 0.12, 1.0);
     float lod = log2(max(1.0, max(spreadH, spreadV * 0.4)));
     vec2 uvc = clamp(ruv, vec2(0.001), vec2(0.999));
     vec2 dy = vec2(0.0, spreadV * uReflTexel.y);
-    refl = textureLod(tRefl, uvc, lod).rgb * 0.36
-         + (textureLod(tRefl, clamp(uvc + dy, vec2(0.001), vec2(0.999)), lod).rgb
-          + textureLod(tRefl, clamp(uvc - dy, vec2(0.001), vec2(0.999)), lod).rgb) * 0.24
-         + (textureLod(tRefl, clamp(uvc + 2.0 * dy, vec2(0.001), vec2(0.999)), lod).rgb
-          + textureLod(tRefl, clamp(uvc - 2.0 * dy, vec2(0.001), vec2(0.999)), lod).rgb) * 0.08;
-  #else
+    vec3 acc = vec3(0.0);
+    float wsum = 0.0;
+    reflTap(uvc, lod, 0.36, acc, wsum);
+    reflTap(uvc + dy, lod, 0.24, acc, wsum);
+    reflTap(uvc - dy, lod, 0.24, acc, wsum);
+    reflTap(uvc + 2.0 * dy, lod, 0.08, acc, wsum);
+    reflTap(uvc - 2.0 * dy, lod, 0.08, acc, wsum);
+    refl = wsum > 0.0 ? acc / wsum : uHorizonColor;
+  } else {
     refl = skyFallback(R);
-  #endif
-  // The sun disc comes from the glint term; a half-float sky can also hold Inf/NaN there.
-  if (!(dot(refl, vec3(1.0)) < 60000.0)) refl = vec3(uReflClamp);
-  refl = min(refl, vec3(uReflClamp));
+  }
+  // A NaN never turns into a white slab; Inf (half-float sky at the sun disc) is
+  // the brightest allowed value. The sun itself comes from the glint term.
+  if (anyNaN(refl)) refl = uHorizonColor;
+  refl = finiteClamp(refl, uReflClamp);
 
   // ---- sun glint (Beckmann lobe; roughness = unresolved slope variance) -----
   vec3 L = uSunDir;
@@ -370,7 +479,7 @@ void main() {
   float D = exp((c2 - 1.0) / (c2 * a2)) / (PI * a2 * c2 * c2);
   float FH = 0.02 + 0.98 * pow(1.0 - VdH, 5.0);
   float G = smithG1(NdV, a2) * smithG1(clamp(NdL, 0.0, 1.0), a2);
-  vec3 glint = NdL > 0.0 ? uSunRad * (FH * D * G / (4.0 * max(NdV, 0.05))) : vec3(0.0);
+  vec3 glint = NdL > 0.0 ? glintKnee(uSunRad * (FH * D * G / (4.0 * max(NdV, 0.05)))) : vec3(0.0);
 
   vec3 inscat = uBodyRad * (vec3(1.0) - T);
   vec3 A = F * shore * refl
@@ -382,7 +491,8 @@ void main() {
   gl_FragColor = vec4(max(S, vec3(0.0)), 1.0);
   #ifdef WATER_DEBUG
     // Integration aid (compile-time only): 1 reflection, 2 depth of water over the
-    // visible under-water point (1 = 5 m), 3 transmittance, 4 normal, 5 glint.
+    // visible under-water point (1 = 5 m), 3 transmittance, 4 normal, 5 glint,
+    // 6 lee (r) / calm (g) / unresolved slope (b).
     #if WATER_DEBUG == 1
       gl_FragColor.rgb = toDisplay(refl);
     #elif WATER_DEBUG == 2
@@ -391,6 +501,8 @@ void main() {
       gl_FragColor.rgb = T;
     #elif WATER_DEBUG == 4
       gl_FragColor.rgb = N * 0.5 + 0.5;
+    #elif WATER_DEBUG == 6
+      gl_FragColor.rgb = vec3(lee, clamp(calm / 1.3, 0.0, 1.0), clamp(sqrt(var) * 4.0, 0.0, 1.0));
     #else
       gl_FragColor.rgb = toDisplay(glint);
     #endif

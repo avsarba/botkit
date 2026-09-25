@@ -25,6 +25,12 @@
 //   turnRate      yaw rate in rad/s about local +Y (positive = turning toward +X, the fish's left); bends the body.
 //   exhaustion01  0 fresh .. 1 spent: slows everything, flares the gills and rolls the fish onto its side (~75 deg).
 //
+// Also exported (used by the fish system for the hooked fish; all optional):
+//   fishAssetsReady(species, { detail, quality })            are that model's textures / geometry already built?
+//   prepareFishAssets(species, { detail, quality, renderer }) build them a few ms per frame: job.step(budgetMs)
+//   createFishProgramKeeper({ quality })                      1-px stand-in with the 'high' materials (shader warm-up)
+// The last two showcase / hooked-fish asset sets stay cached (LRU); population atlases are always cached.
+//
 // Swimming is a traveling body wave in the vertex shader (onBeforeCompile) whose amplitude grows toward the tail,
 // plus pectoral sculling, median-fin ripple, caudal-fin flex, gill pulse and barbel sway. All textures are
 // painted procedurally on Canvas2D (no network assets); geometry is lofted from species-specific profiles.
@@ -270,12 +276,13 @@ const APPEARANCE = {
 
   channel_catfish: {
     style: 'catfish',
+    // broad, flat head (half width well above the dorsal height, boxy sections) that rises into the humped nape
     profile: [
-      [0.0, 0.015, 0.011, 0.032, 0.9, 0.8],
-      [0.03, 0.029, 0.022, 0.05, 0.85, 0.7],
-      [0.09, 0.046, 0.035, 0.068, 0.8, 0.65],
-      [0.17, 0.066, 0.048, 0.08, 0.9, 0.7],
-      [0.26, 0.084, 0.066, 0.077, 1.0, 0.8],
+      [0.0, 0.013, 0.011, 0.034, 0.85, 0.8],
+      [0.03, 0.025, 0.021, 0.055, 0.78, 0.68],
+      [0.09, 0.04, 0.034, 0.074, 0.74, 0.62],
+      [0.17, 0.061, 0.047, 0.083, 0.85, 0.68],
+      [0.26, 0.084, 0.066, 0.078, 1.0, 0.8],
       [0.38, 0.091, 0.078, 0.066, 1.1, 0.9],
       [0.5, 0.084, 0.076, 0.053, 1.15, 1.0],
       [0.62, 0.069, 0.063, 0.04, 1.2, 1.1],
@@ -285,7 +292,7 @@ const APPEARANCE = {
     ],
     nose: 0.026,
     tailRound: 0.01,
-    eye: { s: 0.085, y: 0.026, r: 0.011, up: 0.35, fwd: 0.15, iris: '#8a7a50', irisOut: '#3a3424', ring: '#b4a472', pupil: 0.16, irisEnd: 0.32 },
+    eye: { s: 0.085, y: 0.021, r: 0.011, up: 0.3, fwd: 0.15, iris: '#8a7a50', irisOut: '#3a3424', ring: '#b4a472', pupil: 0.16, irisEnd: 0.32 },
     mouth: { y0: -0.004, sJaw: 0.05, yJaw: -0.004, sag: 0.0, depth: 0.1, wide: true },
     gill: { s: 0.215, r0: -0.1, k: 0.06, step: 0.03 },
     lateral: [0.35, 0.0, 0.05],
@@ -301,11 +308,14 @@ const APPEARANCE = {
       pelvic: { base: [[0.49, -0.86], [0.515, -0.95]], len: 0.075, shape: [0.9, 1.0, 0.9, 0.72, 0.5], out: 0.32, down: 0.95, spread: 0.72, rays: 8 },
     },
     finLook: { membrane: '#5e666f', ray: '#373d45', base: '#58606a', aBase: 0.94, aTip: 0.7, pectoral: { membrane: '#666e76', ray: '#3a4048' }, pelvic: { membrane: '#848a92', ray: '#50565e' }, anal: { membrane: '#7c838a', ray: '#474e56' } },
+    // [x lateral, y, s along the body]. The long maxillary pair flares out from the corners of the mouth and
+    // droops below the head, so it reads in silhouette side-on and fans out seen from above; the nasal pair is
+    // short; the four chin barbels hang down under the jaw and are pale (dark maxillary, whitish chin barbels).
     barbels: [
-      { a: [0.03, 0.004, 0.035], b: [0.075, 0.0, 0.06], c: [0.09, -0.02, 0.2], r: 0.0058 },
-      { a: [0.016, 0.022, 0.028], b: [0.02, 0.035, 0.035], c: [0.026, 0.04, 0.065], r: 0.0026 },
-      { a: [0.02, -0.018, 0.035], b: [0.03, -0.03, 0.05], c: [0.036, -0.047, 0.1], r: 0.003 },
-      { a: [0.008, -0.02, 0.03], b: [0.012, -0.033, 0.045], c: [0.015, -0.05, 0.085], r: 0.0026 },
+      { a: [0.03, 0.004, 0.035], b: [0.09, -0.01, 0.07], c: [0.13, -0.052, 0.19], r: 0.0068 },
+      { a: [0.016, 0.022, 0.028], b: [0.022, 0.036, 0.034], c: [0.03, 0.042, 0.062], r: 0.0028 },
+      { a: [0.02, -0.018, 0.035], b: [0.03, -0.04, 0.045], c: [0.04, -0.064, 0.08], r: 0.0035, pale: true },
+      { a: [0.008, -0.02, 0.03], b: [0.012, -0.042, 0.038], c: [0.016, -0.06, 0.066], r: 0.0035, pale: true },
     ],
     mat: { rough: 0.3, clearcoat: 0.7, irid: 0.08, silver: 0.26 },
   },
@@ -1164,13 +1174,23 @@ function layerLike(canvas, transform) {
   g.setTransform(...transform);
   return { c, g };
 }
-function stamp(target, L, { blur = 0, alpha = 1, op = 'source-over', x = 0, y = 0 } = {}) {
+// rect: optional [x, y, w, h] (layer pixels) that holds everything drawn on the layer; only that part is
+// composited (and blurred), which is much cheaper for small markings on a 2k layer. Pad it by ~3x the blur.
+function stamp(target, L, { blur = 0, alpha = 1, op = 'source-over', x = 0, y = 0, rect = null } = {}) {
   target.save();
   target.setTransform(1, 0, 0, 1, 0, 0);
   target.globalAlpha = alpha;
   target.globalCompositeOperation = op;
   if (blur > 0.3) target.filter = `blur(${blur.toFixed(2)}px)`;
-  target.drawImage(L.c, x, y);
+  if (rect) {
+    const W = L.c.width;
+    const H = L.c.height;
+    const x0 = clamp(Math.floor(rect[0]), 0, W);
+    const y0 = clamp(Math.floor(rect[1]), 0, H);
+    const x1 = clamp(Math.ceil(rect[0] + rect[2]), 0, W);
+    const y1 = clamp(Math.ceil(rect[1] + rect[3]), 0, H);
+    if (x1 > x0 && y1 > y0) target.drawImage(L.c, x0, y0, x1 - x0, y1 - y0, x + x0, y + y0, x1 - x0, y1 - y0);
+  } else target.drawImage(L.c, x, y);
   target.restore();
 }
 
@@ -1566,8 +1586,30 @@ function scaleSprites() {
   return _scaleSprites;
 }
 
+// Canvas 2D defers drawing until the canvas is read: reading one pixel makes the pending work happen now, so
+// each build step pays for its own painting instead of piling it onto the step that first reads the canvas.
+function flush(...ctxs) {
+  for (const c of ctxs) {
+    if (!c) continue;
+    try {
+      c.getImageData(0, 0, 1, 1);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// Run a step generator to completion (synchronous build) and return its value.
+function drain(gen) {
+  let r = gen.next();
+  while (!r.done) r = gen.next();
+  return r.value;
+}
+
 // Paint the body skin into rect R of context g (colour), optionally the height (relief) map into hg (rect HR).
-function paintSkin(g, R, model, app, rng, hg, HR) {
+// A generator: it yields between phases (never while a pooled scratch layer is checked out) so the hooked-fish
+// assets can be painted a few milliseconds per frame; drain() runs it in one go.
+function* paintSkinGen(g, R, model, app, rng, hg, HR) {
   const W = R.w;
   const H = R.h;
   const sB = model.sB;
@@ -1594,7 +1636,13 @@ function paintSkin(g, R, model, app, rng, hg, HR) {
   HL.g.fillStyle = hgr;
   HL.g.fillRect(0, 0.2, K.gillS, 0.9);
   stamp(n, HL, { blur: 6 * res, alpha: 0.8 });
-  if (style.N) style.N(n, K, TN);
+  flush(n);
+  yield 'skin:base';
+  if (style.N) {
+    style.N(n, K, TN);
+    flush(n);
+    yield 'skin:styleN';
+  }
   // large-scale mottling (soft-light noise)
   const nz = noiseCanvas(48, 10, rng);
   n.save();
@@ -1604,6 +1652,8 @@ function paintSkin(g, R, model, app, rng, hg, HR) {
   n.filter = `blur(${(5 * res).toFixed(1)}px)`;
   n.drawImage(nz, 0, 0, W, hN);
   n.restore();
+  flush(n);
+  yield 'skin:noise';
   // --- 2) warp the normalized canvas onto the iso (true surface distance) layout, column by column
   g.save();
   g.setTransform(1, 0, 0, 1, 0, 0);
@@ -1611,6 +1661,10 @@ function paintSkin(g, R, model, app, rng, hg, HR) {
   const half = hN / 2;
   const yMid = R.y + H / 2;
   for (let px = 0; px < W; px++) {
+    if (px > 0 && (px & 255) === 0) {
+      flush(g);
+      yield 'skin:warp';
+    }
     const s = ((px + 0.5) / W) * sB;
     const yT = yMid - (model.aTop(s) / C) * H;
     const yB = yMid + (model.aBot(s) / C) * H;
@@ -1621,6 +1675,8 @@ function paintSkin(g, R, model, app, rng, hg, HR) {
     g.drawImage(N, px, half, 1, half, x, yMid, 1, Math.max(0.5, yB - yMid));
   }
   g.restore();
+  flush(g);
+  yield 'skin:warped';
   // --- 3) iso painting
   const TI = [W / sB, 0, 0, -H / C, R.x, R.y + H / 2];
   g.save();
@@ -1643,6 +1699,8 @@ function paintSkin(g, R, model, app, rng, hg, HR) {
     // iso layers are made relative to the canvas origin, so give them the full transform
     style.I(g, K, TI);
   }
+  flush(g);
+  yield 'skin:styleI';
   const eye = app.eye;
   const mouth = app.mouth;
   const gl = app.gill;
@@ -1671,6 +1729,10 @@ function paintSkin(g, R, model, app, rng, hg, HR) {
     const drawHeight = hg && (Ls / sB) * HR.w >= 3;
     if (drawColour) g.globalAlpha = sc.color;
     for (let ci = cols; ci >= 0; ci--) {
+      if (ci !== cols && ci % 12 === 0) {
+        flush(g, hg);
+        yield 'skin:scales';
+      }
       const s = ci * Ls;
       if (s > sB - 0.004) continue;
       const aT = model.aTop(s);
@@ -1708,6 +1770,8 @@ function paintSkin(g, R, model, app, rng, hg, HR) {
     }
     g.globalAlpha = 1;
     if (hg) hg.globalAlpha = 1;
+    flush(g, hg);
+    yield 'skin:scales-done';
   } else {
     // scaleless (catfish): fine skin grain
     const nz3 = noiseCanvas(512, 128, rng);
@@ -1767,6 +1831,8 @@ function paintSkin(g, R, model, app, rng, hg, HR) {
     hg.restore();
   }
 
+  flush(g, hg);
+  yield 'skin:lateral';
   // gill cover (opercle) margin + preopercle
   const opPath = (ctx, ds) => {
     ctx.beginPath();
@@ -1821,18 +1887,36 @@ function paintSkin(g, R, model, app, rng, hg, HR) {
     const LJ = layerLike(g.canvas, TI);
     LJ.g.fillStyle = mixHex(app.shade[0][1], '#ffffff', 0.25);
     LJ.g.beginPath();
+    let sMax = 0;
+    let aMin = Infinity;
+    let aMax = -Infinity;
+    const pt = (s, a) => {
+      LJ.g.lineTo(s, a);
+      sMax = Math.max(sMax, s);
+      aMin = Math.min(aMin, a);
+      aMax = Math.max(aMax, a);
+    };
     for (let i = 0; i <= 24; i++) {
       const s = lerp(0.0, mouth.sJaw * 1.05, i / 24);
-      LJ.g.lineTo(s, model.aFromY(s, mouthY(mouth, s) - 0.003));
+      pt(s, model.aFromY(s, mouthY(mouth, s) - 0.003));
     }
     for (let i = 24; i >= 0; i--) {
       const s = lerp(0.0, gl.s - 0.05, i / 24);
-      LJ.g.lineTo(s, -model.aBot(s) - 0.01);
+      pt(s, -model.aBot(s) - 0.01);
     }
     LJ.g.closePath();
     LJ.g.fill();
-    stamp(g, LJ, { blur: 14 * res, alpha: mouth.wide ? 0.2 : 0.38 });
+    // only the jaw's corner of the layer is blurred and composited (a small part of a 2k skin)
+    const blurPx = 14 * res;
+    const pad = blurPx * 3 + 2;
+    const px0 = R.x - pad;
+    const px1 = R.x + (sMax * W) / sB + pad;
+    const py0 = R.y + H / 2 - (aMax * H) / C - pad;
+    const py1 = R.y + H / 2 - (aMin * H) / C + pad;
+    stamp(g, LJ, { blur: blurPx, alpha: mouth.wide ? 0.2 : 0.38, rect: [px0, py0, px1 - px0, py1 - py0] });
   }
+  flush(g);
+  yield 'skin:jaw';
   g.strokeStyle = 'rgba(18,14,10,0.8)';
   g.lineWidth = mouth.wide ? 0.004 : 0.0034;
   mouthPath(g, 0);
@@ -1919,7 +2003,7 @@ function paintSkin(g, R, model, app, rng, hg, HR) {
 
 // Roughness (G) / metalness (B) map for the showcase body, derived from the painted skin: the pale lower
 // flanks and the gill cover carry guanine "silvering" (metallic sheen); pigment and the back stay dielectric.
-function paintRoughMetal(skinCanvas, model, app, w, h) {
+function* paintRoughMetalGen(skinCanvas, model, app, w, h) {
   const c = makeCanvas(w, h);
   const g = c.getContext('2d');
   g.drawImage(skinCanvas, 0, 0, w, h);
@@ -1939,6 +2023,7 @@ function paintRoughMetal(skinCanvas, model, app, w, h) {
     aB[x] = Math.max(1e-4, model.aBot(s));
   }
   for (let y = 0; y < h; y++) {
+    if (y > 0 && (y & 127) === 0) yield 'roughmetal';
     const a = (0.5 - (y + 0.5) / h) * C;
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 4;
@@ -1959,7 +2044,7 @@ function paintRoughMetal(skinCanvas, model, app, w, h) {
   return c;
 }
 
-function heightToNormal(hc, strength) {
+function* heightToNormalGen(hc, strength) {
   const w = hc.width;
   const h = hc.height;
   const src = hc.getContext('2d').getImageData(0, 0, w, h).data;
@@ -1969,6 +2054,7 @@ function heightToNormal(hc, strength) {
   const d = img.data;
   const H = (x, y) => src[(clamp(y, 0, h - 1) * w + clamp(x, 0, w - 1)) * 4] / 255;
   for (let y = 0; y < h; y++) {
+    if (y > 0 && (y & 127) === 0) yield 'normal';
     for (let x = 0; x < w; x++) {
       const dx = (H(x + 1, y) - H(x - 1, y)) * strength;
       const dy = (H(x, y + 1) - H(x, y - 1)) * strength;
@@ -2034,12 +2120,20 @@ function paintFin(g, R, name, spec, app, rng, minAlpha) {
   const aB = Math.max(minAlpha, look.aBase);
   const aT = Math.max(minAlpha, look.aTip);
   if (name === 'barbel') {
-    const gr = g.createLinearGradient(0, 0, 1, 0);
-    gr.addColorStop(0, '#1e2124');
-    gr.addColorStop(0.5, '#474b4f');
-    gr.addColorStop(1, '#1e2124');
+    // u across the tube. Left half: dark barbels (darker than the slate head so they read against it);
+    // right half: pale chin barbels (read against dark water under the head).
+    const gr = g.createLinearGradient(0, 0, 0.5, 0);
+    gr.addColorStop(0, '#0c0d0f');
+    gr.addColorStop(0.5, '#2a2d31');
+    gr.addColorStop(1, '#0c0d0f');
     g.fillStyle = gr;
-    g.fillRect(-0.1, -0.1, 1.2, 1.2);
+    g.fillRect(-0.1, -0.1, 0.6, 1.2);
+    const gp = g.createLinearGradient(0.5, 0, 1, 0);
+    gp.addColorStop(0, '#8d8f8a');
+    gp.addColorStop(0.5, '#dcdad0');
+    gp.addColorStop(1, '#8d8f8a');
+    g.fillStyle = gp;
+    g.fillRect(0.5, -0.1, 0.6, 1.2);
     g.restore();
     return;
   }
@@ -2290,7 +2384,11 @@ function buildFins(B, model, app, cfg, uvFor) {
     if (f.pelvic) addPairedFin(B, model, f.pelvic, side, uvFor('pelvic'), Math.max(3, nt >> 2), Math.max(1, nr - 1), 2, side > 0 ? 0.4 : 1.3);
   }
   if (app.barbels) {
-    for (const side of [1, -1]) for (const bspec of app.barbels) addBarbel(B, bspec, side, uvFor('barbel'), cfg.bar[0], cfg.bar[1]);
+    // dark barbels use the left half of the barbel slot, pale ones the right half (see paintFin)
+    const uv = uvFor('barbel');
+    const dark = (u, v, o) => uv(0.04 + u * 0.42, v, o);
+    const pale = (u, v, o) => uv(0.54 + u * 0.42, v, o);
+    for (const side of [1, -1]) for (const bspec of app.barbels) addBarbel(B, bspec, side, bspec.pale ? pale : dark, cfg.bar[0], cfg.bar[1]);
   }
 }
 
@@ -2307,12 +2405,16 @@ function makeTexture(canvas, color) {
   return t;
 }
 
-function buildAssets(appId, detail, quality) {
+// Build the geometry + textures for one species / detail / quality. A generator that yields between steps of a
+// few milliseconds each (skin phases, relief, roughness, each fin, each geometry) so hooked-fish assets can be
+// prepared over several frames (prepareFishAssets); buildAssets() runs it synchronously.
+function* buildAssetsGen(appId, detail, quality) {
   const app = APPEARANCE[appId];
   const cfg = DETAIL_CFG[detail][quality];
   const model = buildModel(app);
   const rng = makeRng(hashString(appId) ^ 0x9e3779b9);
   const out = { model, geos: [], textures: [] };
+  yield 'model';
 
   if (detail === 'high') {
     // colour skin + relief (normal map at half resolution)
@@ -2320,9 +2422,13 @@ function buildAssets(appId, detail, quality) {
     const bh = bw / 2;
     const bodyC = makeCanvas(bw, bh);
     const hC = makeCanvas(bw / 2, bh / 2);
-    paintSkin(bodyC.getContext('2d'), { x: 0, y: 0, w: bw, h: bh }, model, app, rng, hC.getContext('2d'), { x: 0, y: 0, w: bw / 2, h: bh / 2 });
-    const nC = heightToNormal(hC, 1.7);
-    const rmC = paintRoughMetal(bodyC, model, app, bw / 2, bh / 2);
+    yield* paintSkinGen(bodyC.getContext('2d'), { x: 0, y: 0, w: bw, h: bh }, model, app, rng, hC.getContext('2d'), { x: 0, y: 0, w: bw / 2, h: bh / 2 });
+    flush(bodyC.getContext('2d'), hC.getContext('2d'));
+    yield 'skin-done';
+    const nC = yield* heightToNormalGen(hC, 1.7);
+    yield 'normal-done';
+    const rmC = yield* paintRoughMetalGen(bodyC, model, app, bw / 2, bh / 2);
+    yield 'roughmetal-done';
     const fw = cfg.fin;
     const finC = makeCanvas(fw, fw);
     const fg = finC.getContext('2d');
@@ -2330,6 +2436,8 @@ function buildAssets(appId, detail, quality) {
     const pad = Math.max(2, fw / 256);
     for (const name of ['caudal', 'dorsal1', 'dorsal2', 'anal', 'pectoral', 'pelvic', 'adipose', 'barbel']) {
       paintFin(fg, slotRect(area, name, pad), name, app.fins[name] || null, app, rng, 0.02);
+      flush(fg);
+      yield 'fin';
     }
     const ew = cfg.eyeTex;
     const eyeC = makeCanvas(ew, ew / 2);
@@ -2341,16 +2449,18 @@ function buildAssets(appId, detail, quality) {
     out.eyeMap = makeTexture(eyeC, true);
     out.eyeMap.wrapS = THREE.RepeatWrapping;
     out.textures.push(out.bodyMap, out.bodyNormal, out.bodyRM, out.finMap, out.eyeMap);
+    yield 'textures';
 
     const bodyB = new GeoBuilder();
     const uvBody = rectUV({ x: 0, y: 0, w: bw, h: bh }, bw, bh);
     buildBody(bodyB, model, app, cfg.ring, cfg.seg, uvBody);
+    out.bodyGeo = bodyB.build();
+    yield 'body-geo';
     const finB = new GeoBuilder();
     buildFins(finB, model, app, cfg, (name) => rectUV(slotRect(area, name, pad + 1), fw, fw));
     const eyeB = new GeoBuilder();
     const uvEye = rectUV({ x: 0, y: 0, w: ew, h: ew / 2 }, ew, ew / 2);
     for (const side of [1, -1]) addEye(eyeB, model, app.eye, side, uvEye, cfg.eyeLat, cfg.eyeLon);
-    out.bodyGeo = bodyB.build();
     out.finGeo = finB.build();
     out.eyeGeo = eyeB.build();
     out.geos.push(out.bodyGeo, out.finGeo, out.eyeGeo);
@@ -2360,7 +2470,9 @@ function buildAssets(appId, detail, quality) {
     const atlasC = makeCanvas(S, S);
     const ag = atlasC.getContext('2d');
     const bodyR = { x: 0, y: 0, w: S, h: S / 2 };
-    paintSkin(ag, bodyR, model, app, rng, null, null);
+    yield* paintSkinGen(ag, bodyR, model, app, rng, null, null);
+    flush(ag);
+    yield 'atlas-skin-done';
     const area = { x: 0, y: S / 2, w: S, h: S / 2 };
     const pad = Math.max(2, S / 128);
     for (const name of ['caudal', 'dorsal1', 'dorsal2', 'anal', 'pectoral', 'pelvic', 'adipose', 'barbel']) {
@@ -2369,6 +2481,7 @@ function buildAssets(appId, detail, quality) {
     paintEye(ag, slotRect(area, 'eye', pad), app.eye);
     out.atlas = makeTexture(atlasC, true);
     out.textures.push(out.atlas);
+    yield 'atlas';
     const B = new GeoBuilder();
     // keep body UVs half a texel inside the rect
     buildBody(B, model, app, cfg.ring, cfg.seg, rectUV({ x: 0.5, y: 0.5, w: S - 1, h: S / 2 - 1 }, S, S));
@@ -2382,14 +2495,43 @@ function buildAssets(appId, detail, quality) {
   return out;
 }
 
+// Recently used showcase / hooked-fish (non-'low') asset sets stay cached (LRU) so a repeat catch of the same
+// species does not repaint 2k textures; older ones are freed with their last fish. Population atlases ('low')
+// are always kept.
+const LRU_KEEP = 2;
+const _recent = [];
+function touchRecent(e) {
+  if (e.placeholder || e.key.split('|')[1] === 'low') return;
+  const i = _recent.indexOf(e);
+  if (i >= 0) _recent.splice(i, 1);
+  _recent.push(e);
+  e.keep = true;
+  while (_recent.length > LRU_KEEP) {
+    const old = _recent.shift();
+    old.keep = false;
+    if (old.refs === 0) disposeEntry(old);
+  }
+}
+
+const _jobs = new Map(); // key -> incremental build in progress (see prepareFishAssets)
+
+function registerEntry(key, detail, data) {
+  const e = { key, refs: 0, keep: detail === 'low', data };
+  _assets.set(key, e);
+  touchRecent(e);
+  return e;
+}
+
 function acquireAssets(appId, detail, quality) {
   const key = `${appId}|${detail}|${quality}`;
   let e = _assets.get(key);
   if (!e) {
-    // population atlases (256-512 px) stay cached; showcase / hooked-fish assets are freed with their last fish
-    e = { key, refs: 0, keep: detail === 'low', data: buildAssets(appId, detail, quality) };
-    _assets.set(key, e);
-  }
+    const job = _jobs.get(key);
+    if (job) job.finishNow(); // a build already in progress: finish it now instead of starting over
+    e = _assets.get(key);
+    // population atlases (256-512 px) stay cached; showcase / hooked-fish assets follow the LRU above
+    if (!e) e = registerEntry(key, detail, drain(buildAssetsGen(appId, detail, quality)));
+  } else touchRecent(e);
   e.refs++;
   return e;
 }
@@ -2400,9 +2542,29 @@ function releaseAssets(e) {
 function disposeEntry(e) {
   if (e.disposed) return;
   e.disposed = true;
+  const i = _recent.indexOf(e);
+  if (i >= 0) _recent.splice(i, 1);
   for (const g of e.data.geos) g.dispose();
   for (const t of e.data.textures) t.dispose();
   if (_assets.get(e.key) === e) _assets.delete(e.key);
+}
+
+// Stand-in assets with the same material slots as the 'high' detail (1-px textures, one triangle per mesh):
+// createFishProgramKeeper() uses them to compile the hooked-fish shader programs ahead of time.
+function placeholderEntry() {
+  const tex = (color) => makeTexture(makeCanvas(2, 2), color);
+  const tri = () => {
+    const B = new GeoBuilder();
+    B.vert(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0);
+    B.vert(0, 0.02, -0.02, 1, 0, 0, 0, 1, 0, 0, 0);
+    B.vert(0, -0.02, -0.02, 1, 0, 0, 1, 0, 0, 0, 0);
+    B.idx.push(0, 1, 2);
+    return B.build();
+  };
+  const data = { bodyMap: tex(true), bodyNormal: tex(false), bodyRM: tex(false), finMap: tex(true), eyeMap: tex(true), bodyGeo: tri(), finGeo: tri(), eyeGeo: tri() };
+  data.textures = [data.bodyMap, data.bodyNormal, data.bodyRM, data.finMap, data.eyeMap];
+  data.geos = [data.bodyGeo, data.finGeo, data.eyeGeo];
+  return { key: 'placeholder', refs: 0, keep: false, placeholder: true, data };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2509,7 +2671,7 @@ export function createFishMesh(species, lengthCm, opts = {}) {
   const quality = opts.quality === 'medium' || opts.quality === 'low' ? opts.quality : 'high';
   const girth = clamp(Number.isFinite(opts.girth) ? opts.girth : 1, 0.8, 1.25);
   const rng = makeRng(Number.isFinite(opts.seed) ? opts.seed : (Math.random() * 0xffffffff) >>> 0);
-  const entry = acquireAssets(appId, detail, quality);
+  const entry = opts.programKeeper && detail === 'high' ? placeholderEntry() : acquireAssets(appId, detail, quality);
   const A = entry.data;
   const U = makeSwimUniforms(app);
   const materials = [];
@@ -2696,7 +2858,8 @@ export function createFishMesh(species, lengthCm, opts = {}) {
     disposed = true;
     if (object3d.parent) object3d.parent.remove(object3d);
     for (const m of materials) m.dispose();
-    releaseAssets(entry);
+    if (entry.placeholder) disposeEntry(entry);
+    else releaseAssets(entry);
   }
 
   update(0, 0, 0, 0);
@@ -2717,5 +2880,173 @@ export function prewarmFishMeshes(speciesIds = SPECIES_IDS, opts = {}) {
 
 // Free every cached geometry / texture. Fish still alive keep rendering (three re-uploads on demand).
 export function disposeFishMeshCache() {
+  for (const job of [..._jobs.values()]) job.cancel();
   for (const e of [..._assets.values()]) disposeEntry(e);
+}
+
+const _now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
+function assetKeyFor(species, detail, quality) {
+  const rawId = species && typeof species.id === 'string' ? species.id : typeof species === 'string' ? species : '';
+  const appId = resolveAppearanceId(rawId, species && species.name);
+  const d = detail === 'low' || detail === 'medium' ? detail : 'high';
+  const q = quality === 'medium' || quality === 'low' ? quality : 'high';
+  return { appId, detail: d, quality: q, key: `${appId}|${d}|${q}` };
+}
+
+// Are the assets createFishMesh(species, _, { detail, quality }) needs already built (no paint on create)?
+export function fishAssetsReady(species, opts = {}) {
+  const k = assetKeyFor(species, opts && opts.detail, opts && opts.quality);
+  return _assets.has(k.key);
+}
+
+// Build the assets for createFishMesh(species, _, { detail, quality }) a few milliseconds at a time, so a hooked
+// fish can be upgraded to the high-detail model without a hitch at the hookset. Returns a job:
+//   { key, speciesId, done, step(budgetMs = 4) -> done, finishNow(), cancel() }
+// step() runs whole build steps until the budget is used up (at least one), then, when opts.renderer is given,
+// uploads one texture per step (renderer.initTexture) so the first frame that draws the fish has nothing left to
+// do. createFishMesh() on the same key while a job is running finishes the job synchronously. The finished assets
+// enter the LRU cache (the two most recent showcase / hooked-fish species stay built).
+export function prepareFishAssets(species, opts = {}) {
+  opts = opts || {};
+  const k = assetKeyFor(species, opts.detail, opts.quality);
+  const running = _jobs.get(k.key);
+  if (running) {
+    if (opts.renderer && !running.renderer) running.renderer = opts.renderer;
+    return running;
+  }
+  const renderer = opts.renderer || null;
+  let gen = null;
+  let uploads = null;
+  let entry = null;
+  const job = {
+    key: k.key,
+    speciesId: k.appId,
+    detail: k.detail,
+    quality: k.quality,
+    done: false,
+    cancelled: false,
+    failed: false,
+    renderer,
+    maxStepMs: 0,
+    maxStepLabel: '',
+    label: '',
+    steps: 0,
+    get phase() {
+      return job.done ? 'done' : uploads ? 'upload' : 'build';
+    },
+    step(budgetMs = 4) {
+      if (job.done || job.cancelled) return job.done;
+      const t0 = _now();
+      do {
+        const t1 = _now();
+        try {
+          advance();
+        } catch (err) {
+          console.warn('[fish-mesh] asset build failed', err);
+          job.failed = true;
+          job.cancel();
+        }
+        job.steps++;
+        const ms = _now() - t1;
+        if (ms > job.maxStepMs) {
+          job.maxStepMs = ms;
+          job.maxStepLabel = job.label;
+        }
+      } while (!job.done && !job.cancelled && _now() - t0 < budgetMs);
+      return job.done;
+    },
+    finishNow() {
+      // everything but the texture uploads (the renderer does those on first use)
+      while (!job.done && !job.cancelled && !uploads) advance();
+      if (!job.done && !job.cancelled) finish();
+    },
+    cancel() {
+      if (job.done || job.cancelled) return;
+      job.cancelled = true;
+      if (gen) {
+        try {
+          gen.return();
+        } catch {
+          /* ignore */
+        }
+      }
+      gen = null;
+      if (_jobs.get(job.key) === job) _jobs.delete(job.key);
+    },
+  };
+  function finish() {
+    job.done = true;
+    gen = null;
+    uploads = null;
+    if (_jobs.get(job.key) === job) _jobs.delete(job.key);
+  }
+  function advance() {
+    if (!uploads) {
+      if (_assets.has(job.key)) {
+        // built meanwhile by a synchronous createFishMesh
+        const e = _assets.get(job.key);
+        touchRecent(e);
+        entry = e;
+        uploads = job.renderer ? e.data.textures.slice() : [];
+        if (gen) {
+          try {
+            gen.return();
+          } catch {
+            /* ignore */
+          }
+          gen = null;
+        }
+        return;
+      }
+      if (!gen) gen = buildAssetsGen(k.appId, k.detail, k.quality);
+      const r = gen.next();
+      job.label = r.done ? 'finish' : r.value;
+      if (r.done) {
+        gen = null;
+        const e = registerEntry(job.key, k.detail, r.value);
+        entry = e;
+        uploads = job.renderer ? e.data.textures.slice() : [];
+        if (!uploads.length) finish();
+      }
+      return;
+    }
+    if (!entry || entry.disposed) {
+      finish(); // evicted meanwhile: nothing left to upload
+      return;
+    }
+    const t = uploads.shift();
+    job.label = 'upload';
+    if (t && job.renderer && typeof job.renderer.initTexture === 'function') {
+      try {
+        job.renderer.initTexture(t);
+      } catch (err) {
+        console.warn('[fish-mesh] texture upload failed', err);
+      }
+    }
+    if (!uploads.length) finish();
+  }
+  if (_assets.has(k.key)) {
+    // already built (and uploaded by whoever drew it)
+    job.done = true;
+    touchRecent(_assets.get(k.key));
+    return job;
+  }
+  _jobs.set(k.key, job);
+  return job;
+}
+
+// A tiny stand-in fish with exactly the materials of a 'high' detail fish (body with clearcoat / iridescence /
+// normal + roughness-metalness maps, translucent fins, glossy eyes, swim-deformed shadow depth materials) on
+// 1-px textures. Add it to the scene for a few rendered frames (frustumCulled is off) so every pass compiles the
+// hooked-fish shader programs up front, and keep it (hidden, not disposed) so the programs stay alive.
+// Returns { object3d, dispose }.
+export function createFishProgramKeeper(opts = {}) {
+  opts = opts || {};
+  const h = createFishMesh({ id: 'largemouth_bass' }, 30, { detail: 'high', quality: opts.quality, castShadow: opts.castShadow !== false, seed: 1, programKeeper: true });
+  h.object3d.name = 'fish-program-keeper';
+  h.object3d.traverse((o) => {
+    o.frustumCulled = false;
+    o.layers.disable(LAYERS.UNDERWATER);
+  });
+  return { object3d: h.object3d, dispose: h.dispose };
 }

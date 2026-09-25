@@ -12,7 +12,7 @@ export function createView(camera) {
   const yawLim = PLAYER.yawLimitDeg * DEG;
   const pMin = PLAYER.pitchMinDeg * DEG;
   const pMax = PLAYER.pitchMaxDeg * DEG;
-  const v = { yaw: 0, pitch: DEFAULT_PITCH, tYaw: 0, tPitch: DEFAULT_PITCH, rateX: 0, rateY: 0 };
+  const v = { yaw: 0, pitch: DEFAULT_PITCH, tYaw: 0, tPitch: DEFAULT_PITCH, rateX: 0, rateY: 0, follow: false };
   camera.rotation.order = 'YXZ';
 
   function clampTargets() {
@@ -49,17 +49,38 @@ export function createView(camera) {
   }
 
   // Aim targets toward a world point (pitchBias raises the view; pitchScale softens looking down).
+  // The angler can't turn past +-yawLim, so a point behind them (e.g. a fish bulldogging under the deck)
+  // pins the view to the limit on the side it is already turned toward. Re-clamping atan2 every frame
+  // would flip the target between +lim and -lim whenever the point crosses the centre line behind the
+  // eye and whip the camera (and the camera-mounted rod) ~200 degrees across the lake.
   function aimAt(p, pitchScale = 0.75, pitchBias = 0) {
     const dx = p.x - eye.x;
     const dz = p.z - eye.z;
     const h = Math.hypot(dx, dz);
-    if (h > 0.05) v.tYaw = Math.atan2(-dx, -dz);
+    if (h > 0.05) {
+      let t = Math.atan2(-dx, -dz);
+      if (Math.abs(t) > yawLim) {
+        // already turned well to one side: stay there; else take the nearer limit
+        const side = Math.abs(v.tYaw) > 0.35 * yawLim ? Math.sign(v.tYaw) : Math.sign(t) || 1;
+        t = side * yawLim;
+      }
+      v.tYaw = t;
+    }
     v.tPitch = Math.atan2(p.y - eye.y, Math.max(h, 0.3)) * pitchScale + pitchBias;
     clampTargets();
+    v.follow = true;
   }
 
+  // Following a world point (aimAt) turns the view no faster than this, so when a fish comes back into
+  // the arc on the far side the view sweeps across instead of snapping (pointer / touch aim is not capped).
+  const FOLLOW_YAW_RATE = 150 * DEG;
   function update(dt, lambda = 14) {
-    v.yaw = damp(v.yaw, v.tYaw, lambda, dt);
+    const yaw = damp(v.yaw, v.tYaw, lambda, dt);
+    if (v.follow) {
+      const maxStep = FOLLOW_YAW_RATE * dt;
+      v.yaw = clamp(yaw, v.yaw - maxStep, v.yaw + maxStep);
+      v.follow = false;
+    } else v.yaw = yaw;
     v.pitch = damp(v.pitch, v.tPitch, lambda, dt);
     apply();
   }

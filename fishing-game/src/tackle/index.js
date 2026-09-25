@@ -6,7 +6,7 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { TACKLE, LURES, STATES, LAYERS, DOCK, G, clamp, lerp, damp, smoothstep, makeRng } from '../config.js';
 import { createRod, ROD } from './rod.js';
 import { createLureModels } from './lures.js';
-import { createRope } from './rope.js';
+import { createRope, enhanceLineMaterial } from './rope.js';
 import { createHand } from './hand.js';
 
 // The view model is drawn at half scale around the eye: identical on screen (projection is
@@ -23,6 +23,11 @@ const WIND_MPS = 7; // env.windStrength 1 -> 7 m/s
 const LEADER_SEGS = 10;
 const WALK_PERIOD = 0.4; // topwater walk-the-dog cadence while reeling (s)
 const FLOAT_RIDE = 0.003; // float center above the surface at rest (m)
+// line segment lengths grow away from the rod tip (far segment = 1 + SEG_GROW times the first):
+// resolution where the line is close to the eye, and new line in flight is not all added at the tip
+const SEG_GROW = 3;
+const TIP_SEGS = 6; // in flight the first few segments off the tip-top stay short ...
+const TIP_REST = 0.1; // ... at most this long (m), so paid-out line cannot fold up under the tip
 
 const PHYS = {
   // pxSize: characteristic silhouette size used for the screen-space minimum size (m)
@@ -115,31 +120,39 @@ export function createTackle(ctx) {
   rod.object.add(hand.object);
 
   // ------------------------------------------------------------------ line
-  const LINE_COLOR = new THREE.Color('#d2ec52'); // hi-vis chartreuse 12 lb mono
+  // Colours are per point (rope tints, linear RGB); the material only carries the lighting.
+  const LINE_COLOR = new THREE.Color('#cce366'); // hi-vis yellow-green 12 lb mono
+  const LEADER_COLOR = new THREE.Color('#8c9e94'); // clear fluorocarbon leader under the float
+  const LINE_ALPHA = 0.92;
+  const LEADER_ALPHA = 0.45;
   const lineMat = new LineMaterial({
     color: 0xffffff,
-    linewidth: 1.7,
+    linewidth: 1.2, // CSS px (Line2 sizes against the CSS viewport)
     worldUnits: false,
     vertexColors: true,
     transparent: true,
-    opacity: 0.9,
+    opacity: 1,
     depthWrite: false,
     fog: true,
   });
+  const lineLook = enhanceLineMaterial(lineMat);
   const nPts = quality === 'high' ? 64 : quality === 'medium' ? 56 : 44;
   const iterations = quality === 'high' ? 18 : quality === 'medium' ? 14 : 10;
-  const rope = createRope(nPts, lineMat);
+  const rope = createRope(nPts, lineMat, { subdiv: quality === 'low' ? 2 : 3 });
   rope.line.name = 'fishing-line';
   scene.add(rope.line);
   const F1 = nPts - LEADER_SEGS - 2; // float top clip
   const F2 = F1 + 1; // float bottom clip
-  const tail = createRope(12, lineMat);
+  const tail = createRope(12, lineMat, { subdiv: 2 });
   tail.line.name = 'fishing-line-tail';
   tail.line.visible = false;
   scene.add(tail.line);
   const inRod = createRope(8, lineMat, { renderOrder: 13 });
   inRod.line.name = 'fishing-line-guides';
   rod.object.add(inRod.line);
+  rope.setTint(0, nPts - 1, LINE_COLOR, LINE_ALPHA);
+  tail.setTint(0, tail.n - 1, LINE_COLOR, LINE_ALPHA);
+  inRod.setTint(0, inRod.n - 1, LINE_COLOR, 1);
 
   vmRoot.traverse((o) => {
     o.layers.enable(LAYERS.NO_REFLECT);
@@ -231,6 +244,11 @@ export function createTackle(ctx) {
   let lureYaw = 0;
   let lurePitch = 0;
   let floatLostVisible = false;
+  let tipCap01 = 0; // 1 while the line pays out in flight (short segments just off the tip)
+  let dipT = 99; // seconds since the last nibble (display dip of the float)
+  let dipAmp = 0;
+  const dipDir = new THREE.Vector3(1, 0, 0);
+  let rigHidden = false; // CAUGHT: line and terminal tackle are out of the picture
 
   // reel animation
   let handleAngle = 2.4;
@@ -1043,12 +1061,19 @@ export function createTackle(ctx) {
   }
 
   // ------------------------------------------------------------------ line update
+  let tintedBobber = null;
   function configureRope() {
     // pins + rest lengths for the current mode
     const n = nPts;
     rope.clearPins();
     rope.sinks.fill(0);
     if (mode === 'lost') return;
+    if (tintedBobber !== isBobber) {
+      // hi-vis main line; the float rig's leader is clear fluorocarbon (reads faintly, as it should)
+      tintedBobber = isBobber;
+      rope.setTint(0, n - 1, LINE_COLOR, LINE_ALPHA);
+      if (isBobber) rope.setTint(F2, n - 1, LEADER_COLOR, LEADER_ALPHA);
+    }
     rope.setPinned(0, true);
     rope.setPinned(n - 1, true);
     if (isBobber) {
@@ -1058,9 +1083,37 @@ export function createTackle(ctx) {
     }
   }
 
+  // Rest lengths of `count` segments from index `from` (0 = at the rod tip) totalling `total`:
+  // they grow linearly away from the tip; in flight the first TIP_SEGS are capped (tipCap01).
+  function spread(r, from, count, total) {
+    if (count <= 0) return;
+    if (count === 1) {
+      r[from] = total;
+      return;
+    }
+    const wsum = count * (1 + SEG_GROW / 2);
+    for (let j = 0; j < count; j++) r[from + j] = (total * (1 + (SEG_GROW * j) / (count - 1))) / wsum;
+    if (tipCap01 > 0.001 && count > TIP_SEGS + 2) {
+      let excess = 0;
+      for (let j = 0; j < TIP_SEGS; j++) {
+        const v = lerp(r[from + j], Math.min(r[from + j], TIP_REST), tipCap01);
+        excess += r[from + j] - v;
+        r[from + j] = v;
+      }
+      if (excess > 0) {
+        let rem = 0;
+        for (let j = TIP_SEGS; j < count; j++) rem += r[from + j];
+        const k = rem > 1e-9 ? 1 + excess / rem : 1;
+        for (let j = TIP_SEGS; j < count; j++) r[from + j] *= k;
+      }
+    }
+  }
+
   function setRest(dt) {
     const n = nPts;
     const r = rope.rest;
+    // flight pays line out through the tip-top: keep the stretch next to the tip short; ease back after
+    tipCap01 = mode === 'flying' || mode === 'launch' ? 1 : damp(tipCap01, 0, 2.5, dt);
     if (mode === 'fish') {
       const chord = isBobber ? tip.distanceTo(F) : tip.distanceTo(L);
       const target = isBobber ? Math.max(0.05, lineOut - leader) : lineOut;
@@ -1068,22 +1121,22 @@ export function createTackle(ctx) {
       const slack = slackMax * (1 - smoothstep(0.4, 3, fightTension));
       const main = chord + slack;
       if (isBobber) {
-        for (let i = 0; i < F1; i++) r[i] = main / F1;
+        spread(r, 0, F1, main);
         r[F1] = models.bobber.topClip.distanceTo(models.bobber.bottomClip) * models.bobber.object.scale.x;
         const leadLen = Math.max(0.05, F.distanceTo(L) * 1.02);
         for (let i = F2; i < n - 1; i++) r[i] = leadLen / (n - 1 - F2);
       } else {
-        for (let i = 0; i < n - 1; i++) r[i] = main / (n - 1);
+        spread(r, 0, n - 1, main);
       }
       return;
     }
     if (isBobber) {
       const main = Math.max(0.03, lineOut - leader);
-      for (let i = 0; i < F1; i++) r[i] = main / F1;
+      spread(r, 0, F1, main);
       r[F1] = models.bobber.topClip.distanceTo(models.bobber.bottomClip) * models.bobber.object.scale.x;
       for (let i = F2; i < n - 1; i++) r[i] = leader / (n - 1 - F2);
     } else {
-      for (let i = 0; i < n - 1; i++) r[i] = lineOut / (n - 1);
+      spread(r, 0, n - 1, lineOut);
     }
     // deep lure: the last stretch of line follows it under the surface
     if (!isBobber && mode === 'water') {
@@ -1155,6 +1208,12 @@ export function createTackle(ctx) {
         rope.straighten(0, F1, t);
         rope.straighten(F2, nPts - 1, mode === 'fish' ? t : 0.25);
       } else rope.straighten(0, nPts - 1, t);
+      if (mode === 'flying') {
+        // line streaming out through the tip-top leaves it under spool/guide drag, heading for the
+        // lure: the first stretch runs straight instead of folding up under the tip (the verlet
+        // points do not carry the along-line flow of real line)
+        rope.straighten(0, isBobber ? F1 : nPts - 1, 1 - Math.exp(-30 * dt), 0.3);
+      }
       if (rope.hasNaN()) ropeNeedsLay = true;
       rope.write();
     }
@@ -1215,10 +1274,21 @@ export function createTackle(ctx) {
       }
       const sc = mode === 'home' || mode === 'launch' ? 1 : minSizeScale(F, ph.pxSize, ph.minPx);
       m.object.scale.setScalar(sc);
-      if (sc > 1 && (mode === 'water' || mode === 'fish' || mode === 'lost') && !biteHold) {
-        // keep the same waterline on an upscaled (distant) float
+      if (sc > 1 && (mode === 'water' || mode === 'fish' || mode === 'lost')) {
+        // keep the same waterline on an upscaled (distant) float; once it is pulled under (a bite, a
+        // fish below it) sink the drawn float by its extra size so it disappears like the real one
         const sF = water.getHeight(F.x, F.z);
-        if (F.y > sF - 0.02) m.object.position.y += FLOAT_RIDE * (sc - 1);
+        const under = smoothstep(-0.004, -0.06, F.y - sF);
+        m.object.position.y += FLOAT_RIDE * (sc - 1) * (1 - under) - m.radius * 1.4 * (sc - 1) * under;
+      }
+      if (mode === 'water' && dipT < 0.9) {
+        // nibble: drawn dip + a small sideways jiggle, scaled with the drawn size
+        const e = floatDip(dipT);
+        const D = 2 * m.radius * Math.max(0.4, sc - 0.6);
+        m.object.position.y -= dipAmp * D * e;
+        const lat = dipAmp * D * 0.2 * Math.max(0, e) * Math.sin(dipT * 40);
+        m.object.position.x += dipDir.x * lat;
+        m.object.position.z += dipDir.z * lat;
       }
       m.object.updateMatrixWorld();
       // bait hangs from the leader; the worm turns slowly
@@ -1306,6 +1376,13 @@ export function createTackle(ctx) {
       m.update(modelInfo);
     }
   }
+  // nibble dip envelope: quick pull down (60 ms), spring back with a small overshoot, gone by 0.9 s
+  function floatDip(t) {
+    if (!(t >= 0) || t >= 0.9) return 0;
+    if (t < 0.06) return Math.sin((t / 0.06) * Math.PI * 0.5);
+    const u = t - 0.06;
+    return Math.exp(-u * 7) * Math.cos(u * 12);
+  }
   function dampAngle(a, b, lambda, dt) {
     let d = b - a;
     while (d > Math.PI) d -= Math.PI * 2;
@@ -1348,14 +1425,114 @@ export function createTackle(ctx) {
     }
   }
 
-  function updateLineLight() {
+  // The line is lit in scene-referred units like everything else (the renderer's exposure and tone
+  // mapping do the rest): the key light (sun, or the moon at night) by the angle between it and each
+  // segment, plus sky fill. Night comes out ~16x darker than noon instead of glowing.
+  const LN_K_SUN = 0.28; // thin cylinder: ~0.64/pi of the key light, averaged over sin(angle)
+  const LN_K_SKY = 0.6;
+  const LN_K_GLINT = 0.5;
+  const _lnSunDir = new THREE.Vector3();
+  const _lnSunCol = new THREE.Color();
+  const _lnSky = new THREE.Color();
+  function updateLineLight(state) {
+    const u = lineLook.uniforms;
     const sd = env.sunDirection;
-    const sunUp = smoothstep(-0.05, 0.3, sd && Number.isFinite(sd.y) ? sd.y : 0.5);
-    const si = finite(env.sunIntensity, 2.2);
-    const sky = env.skyColor;
-    const skyL = sky ? 0.2126 * sky.r + 0.7152 * sky.g + 0.0722 * sky.b : 0.5;
-    const light = clamp(0.08 + 0.6 * sunUp * Math.min(1.3, si / 2.2) + 0.5 * skyL, 0.06, 1.2);
-    lineMat.color.copy(LINE_COLOR).multiplyScalar(light);
+    const sdOk = vfinite(sd);
+    const sunY = sdOk ? sd.y : 0.5;
+    const sl = env.sunLight;
+    // sunLight / sunIntensity carry the live key intensity (moon at night; env folds in how much of
+    // the disc clears the hills and treeline, env.sunVisibility)
+    const sunI = Math.max(0, sl && Number.isFinite(sl.intensity) ? sl.intensity : finite(env.sunIntensity, 2.2));
+    const up = smoothstep(-0.03, 0.05, sunY);
+    const sc = sl && sl.color ? sl.color : env.sunColor;
+    if (sc && Number.isFinite(sc.r)) _lnSunCol.copy(sc);
+    else _lnSunCol.setRGB(1, 1, 1);
+    const sky = env.skyRadiance;
+    if (sky && Number.isFinite(sky.r) && Number.isFinite(sky.g) && Number.isFinite(sky.b)) _lnSky.copy(sky);
+    else _lnSky.setRGB(0.25, 0.3, 0.38);
+    u.uLnAmb.value.copy(_lnSky).multiplyScalar(LN_K_SKY);
+    u.uLnAmb.value.r += 0.004;
+    u.uLnAmb.value.g += 0.004;
+    u.uLnAmb.value.b += 0.004;
+    u.uLnSun.value.copy(_lnSunCol).multiplyScalar(LN_K_SUN * sunI * up);
+    u.uLnGlint.value.copy(_lnSunCol).multiplyScalar(LN_K_GLINT * sunI * up);
+    u.uLnGlintA.value = clamp((sunI * up) / 1.5, 0, 1) * 0.85;
+    if (sdOk) _lnSunDir.copy(sd).transformDirection(camera.matrixWorldInverse);
+    else _lnSunDir.set(0, 1, 0);
+    u.uLnSunDir.value.copy(_lnSunDir);
+    // fades toward a faint thread with distance; a little more presence while a fish is on
+    const fightish = state === STATES.FIGHTING || state === STATES.LANDING;
+    u.uLnFade.value.set(4.5, fightish ? 0.35 : 0.22);
+    // ~1.2 CSS px, never under ~1 device pixel (thinner lines break up into dots)
+    const dpr = renderer.getPixelRatio ? finite(renderer.getPixelRatio(), 1) : 1;
+    lineMat.linewidth = Math.max(1.2, 1.05 / Math.max(0.25, dpr));
+    if (lineLook.patched) lineMat.color.setRGB(1, 1, 1);
+    else {
+      // unpatched fallback: average lighting through the material colour
+      lineMat.color.copy(u.uLnAmb.value).add(_lnSunCol.multiplyScalar(LN_K_SUN * sunI * up * 0.785));
+    }
+  }
+
+  function hideRig() {
+    rope.line.visible = false;
+    tail.line.visible = false;
+    for (let i = 0; i < modelList.length; i++) {
+      const m = modelList[i];
+      m.object.visible = false;
+      if (m.bait) m.bait.visible = false;
+      if (m.shot) m.shot.visible = false;
+    }
+  }
+
+  // ------------------------------------------------------------------ cast preview
+  // Where the tip-top sits in the READY pose, in camera space (the forward stroke releases about there).
+  const restTipLocal = new THREE.Vector3(0.28, 0.72, -1.75);
+  function updateRestTip(state) {
+    if (mode !== 'home' || castT < 1.5 || !(state === STATES.READY || state === STATES.TITLE)) return;
+    _v.subVectors(tip, camPos).applyQuaternion(_q.copy(camQuat).invert());
+    if (vfinite(_v) && _v.lengthSq() < 16) restTipLocal.lerp(_v, 0.2);
+  }
+
+  // Predicted landing point of a cast with this power along `direction` (horizontal; default the
+  // view direction): same launch speed calibration, air drag and wind as the real flight.
+  // Returns `target` (world position where the lure/float would come down) or null.
+  const _pp = new THREE.Vector3();
+  const _pv = new THREE.Vector3();
+  const _pd = new THREE.Vector3();
+  function predictLanding(power01, direction, target) {
+    const out = target || new THREE.Vector3();
+    const cfg = LURES[lureIdx];
+    const R = lerp(2.4, finite(cfg.maxCastM, TACKLE.maxCastM), clamp(finite(power01, 0.5), 0, 1));
+    const v0 = speedForRange(ph.drag, R);
+    if (direction && Number.isFinite(direction.x) && Number.isFinite(direction.z)) _pd.set(direction.x, 0, direction.z);
+    else _pd.set(0, 0, -1).applyQuaternion(camQuat).setY(0);
+    if (_pd.lengthSq() < 1e-8) return null;
+    _pd.normalize();
+    _pp.copy(restTipLocal).applyQuaternion(camQuat).add(camPos).addScaledVector(_pd, 0.06);
+    _pp.y -= 0.05;
+    _pv.copy(_pd).multiplyScalar(v0 * Math.cos(LAUNCH_ELEV));
+    _pv.y = v0 * Math.sin(LAUNCH_ELEV);
+    const h = 1 / 240;
+    const k = ph.drag;
+    for (let i = 0; i < 2400; i++) {
+      const rx = _pv.x - wind.x;
+      const ry = _pv.y - wind.y;
+      const rz = _pv.z - wind.z;
+      const sp = Math.hypot(rx, ry, rz);
+      _pv.x += (-k * sp * rx - LINE_DRAG * _pv.x) * h;
+      _pv.y += (-G - k * sp * ry - LINE_DRAG * _pv.y) * h;
+      _pv.z += (-k * sp * rz - LINE_DRAG * _pv.z) * h;
+      _pp.addScaledVector(_pv, h);
+      if (_pp.y < 1.6 && _pv.y < 0) {
+        if (env.isWater(_pp.x, _pp.z)) {
+          if (_pp.y <= 0.02) return out.set(_pp.x, water.getHeight(_pp.x, _pp.z), _pp.z);
+        } else {
+          const g = env.getTerrainHeight(_pp.x, _pp.z);
+          if (_pp.y <= g + ph.radius) return out.set(_pp.x, g, _pp.z);
+        }
+      }
+    }
+    return vfinite(_pp) ? out.copy(_pp) : null;
   }
 
   // ------------------------------------------------------------------ public API
@@ -1366,6 +1543,7 @@ export function createTackle(ctx) {
     reelT += dt;
     snapT += dt;
     biteLoadT += dt;
+    dipT += dt;
     const state = (frame && frame.state) || STATES.READY;
     const input = (frame && frame.input) || EMPTY_INPUT;
     frameState = state;
@@ -1385,7 +1563,11 @@ export function createTackle(ctx) {
     updateTerminal(dt, state);
     updateModels(dt);
     updateLine(dt, state);
-    updateLineLight();
+    updateLineLight(state);
+    // the catch is in the angler's hands: no line, float or lure hanging in front of the showcase
+    rigHidden = state === STATES.CAUGHT;
+    if (rigHidden) hideRig();
+    updateRestTip(state);
     writeSnapshot();
   }
 
@@ -1412,6 +1594,8 @@ export function createTackle(ctx) {
     walkLat = 0;
     walkLatPrev = 0;
     floatLostVisible = false;
+    tipCap01 = 0;
+    dipT = 99;
     lineOut = homeLine();
     if (!tipInit) {
       updatePose(0, STATES.READY, EMPTY_INPUT);
@@ -1448,6 +1632,7 @@ export function createTackle(ctx) {
     rope.layStraight();
     ropeNeedsLay = false;
     rope.write();
+    if (rigHidden) hideRig();
     writeSnapshot();
   }
 
@@ -1499,6 +1684,8 @@ export function createTackle(ctx) {
           F.copy(L);
           goHome(false);
           ropeNeedsLay = true;
+          // netted -> CAUGHT this frame: take the rig out of the picture before it renders
+          if (frameState === STATES.LANDING || frameState === STATES.CAUGHT) hideRig();
         } else {
           // fish came off: the lure is free in the water where the fish was
           const s = water.getHeight(L.x, L.z);
@@ -1567,6 +1754,12 @@ export function createTackle(ctx) {
       FV.x += (rng() - 0.5) * 0.06 * s;
       FV.z += (rng() - 0.5) * 0.06 * s;
       tapTip(4 + 6 * s);
+      // the physical dip is a few mm; the drawn float (min-size scaled) dips by a share of its own
+      // drawn height so a tap reads at any distance (see floatDip in updateModels)
+      dipT = 0;
+      dipAmp = 0.28 + 0.2 * s;
+      const a = rng() * Math.PI * 2;
+      dipDir.set(Math.cos(a), 0, Math.sin(a));
     } else if (mode === 'water') {
       tapTip(10 + 22 * s);
       LV.x += (rng() - 0.5) * 0.1;
@@ -1680,6 +1873,7 @@ export function createTackle(ctx) {
     biteDown,
     snap,
     resetToHome,
+    predictLanding, // extra (not in the contract): cast preview for an aim ring
     object: vmRoot,
     dispose() {
       for (const off of offs) if (typeof off === 'function') off();

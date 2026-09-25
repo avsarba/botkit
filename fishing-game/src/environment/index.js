@@ -1,7 +1,7 @@
 // Environment: sky, sun / moon, lights, fog, exposure, terrain (land + lake bed), time of day.
 // See CONTRACT.md "Environment".
 import * as THREE from 'three';
-import { DAY, clamp, lerp, smoothstep } from '../config.js';
+import { DAY, DOCK, PLAYER, clamp, lerp, smoothstep } from '../config.js';
 import { createTerrainField } from './terrainField.js';
 import { createTerrain } from './terrainMesh.js';
 import { createSkySystem, SkyModel, toneMapACES } from './sky.js';
@@ -21,6 +21,13 @@ const MOON_E = 0.2; // moonlight key (with the night exposure boost)
 const MOON_COLOR = new THREE.Color(0.6, 0.71, 1.0);
 const SHADOW_HALF = 25; // meters around the dock
 const SHADOW_TARGET = new THREE.Vector3(0, 0, 7);
+const SHADOW_SIZE = { high: 2048, medium: 1024, low: 512 };
+// skyline (terrain + treeline elevation seen from the dock) for sun / moon occlusion
+const SKY_BINS = 1440; // 0.25 deg azimuth bins; azimuth = atan2(x, -z) (0 = out over the lake)
+const EYE_Y = DOCK.deckY + PLAYER.eyeHeight;
+const SUN_RADIUS = 0.265 * DEG;
+const MOON_RADIUS = 0.62 * DEG; // the rendered moon disc (sky.js uMoonSize)
+const CANOPY_EST = 16; // fallback canopy height (m) on forested land when scenery gives no profile
 
 // piecewise-linear table lookup on sorted [x, y] pairs
 function table(t, x) {
@@ -65,6 +72,7 @@ const WIND = [
 export function createEnvironment(ctx) {
   const { renderer, scene, camera } = ctx;
   const quality = ctx.quality || 'high';
+  let runtimeQuality = quality; // follows frame.quality (adaptive / manual changes at runtime)
   const tStart = performance.now();
 
   // ---------------- terrain ----------------
@@ -73,6 +81,15 @@ export function createEnvironment(ctx) {
   const cloudRT = bakeCloudNoise(renderer);
   const terrain = createTerrain({ field, quality, detailTexture: detailRT.texture });
   for (const m of terrain.meshes) scene.add(m);
+  const tuLift = terrain.uniforms;
+  // cull the main-view terrain tiles against the main camera just before three builds its render
+  // list (scene.onBeforeRender runs after the matrices update, before projection); other passes
+  // (reflection, depth pre-pass) draw their own proxy / wet tiles with three's culling
+  const prevSceneBeforeRender = scene.onBeforeRender;
+  scene.onBeforeRender = function (r, s, cam, rt) {
+    if (cam === camera) terrain.cull(cam);
+    if (typeof prevSceneBeforeRender === 'function') prevSceneBeforeRender.call(this, r, s, cam, rt);
+  };
 
   const lakeBounds = outlineBounds(14);
   const depthMap = createDepthMap(field, lakeBounds, quality === 'low' ? 256 : 512);
@@ -101,10 +118,13 @@ export function createEnvironment(ctx) {
   sunLight.shadow.normalBias = 0.035;
   scene.add(sunLight);
   scene.add(sunLight.target);
+  // castShadow stays on at every level: toggling it changes the light / shadow counts in every
+  // lit program's cache key and recompiles ~two dozen programs mid-play. 'low' instead uses a
+  // small map that is re-rendered every other frame (the casters are the static dock plus fish).
+  let throttleShadow = false;
   function applyShadowQuality(q) {
-    const on = q !== 'low';
-    sunLight.castShadow = on;
-    const size = q === 'high' ? 2048 : 1024;
+    sunLight.castShadow = true;
+    const size = SHADOW_SIZE[q] || SHADOW_SIZE.high;
     if (sunLight.shadow.mapSize.x !== size) {
       sunLight.shadow.mapSize.set(size, size);
       if (sunLight.shadow.map) {
@@ -112,6 +132,9 @@ export function createEnvironment(ctx) {
         sunLight.shadow.map = null;
       }
     }
+    throttleShadow = q === 'low';
+    sunLight.shadow.autoUpdate = !throttleShadow;
+    sunLight.shadow.needsUpdate = true;
     sc.updateProjectionMatrix();
   }
   applyShadowQuality(quality);
@@ -179,6 +202,84 @@ export function createEnvironment(ctx) {
   let nightF = 0;
   let windBase = 0.25;
   const cloudDrift = new THREE.Vector2(0.13, 0.71);
+
+  // ---------------- skyline: how much of the sun / moon disc clears the hills + treeline ----------
+  // Scenery hands over the elevation profile of what it actually built (canopy shell, trees,
+  // ridges, ground) via setSkylineProfile(); until then (or without scenery) each azimuth bin is
+  // marched lazily over the terrain with an estimated canopy on forested land.
+  let skyProfile = null;
+  let skyProfileD = null;
+  const skyMarched = new Float32Array(SKY_BINS).fill(NaN);
+  const skyMarchedD = new Float32Array(SKY_BINS).fill(1000);
+  const lcS = {};
+  function marchSkyline(bin) {
+    const az = ((bin + 0.5) / SKY_BINS) * Math.PI * 2 - Math.PI;
+    const sx = Math.sin(az);
+    const sz = -Math.cos(az);
+    let best = -Math.PI / 2;
+    for (let R = 12; R < 2400; R *= 1.05) {
+      const x = sx * R;
+      const z = sz * R;
+      const h = field.height(x, z);
+      let top = h;
+      if (h > 0.4) top += CANOPY_EST * field.landCover(x, z, h, 0.95, lcS, field.lastDistance).forest;
+      const el = Math.atan2(top - EYE_Y, R);
+      if (el > best) {
+        best = el;
+        skyMarchedD[bin] = R;
+      }
+    }
+    return best;
+  }
+  const wrapBin = (i) => ((i % SKY_BINS) + SKY_BINS) % SKY_BINS;
+  function skyBin(i) {
+    const k = wrapBin(i);
+    if (skyProfile) return skyProfile[k];
+    if (Number.isNaN(skyMarched[k])) skyMarched[k] = marchSkyline(k);
+    return skyMarched[k];
+  }
+  // distance (m) from the dock to the occluder that forms the skyline at this azimuth
+  function skyDistAt(az) {
+    const k = wrapBin(Math.floor(((az + Math.PI) / (Math.PI * 2)) * SKY_BINS));
+    skyBin(k);
+    return skyProfile ? skyProfileD[k] : skyMarchedD[k];
+  }
+  function skylineAt(az) {
+    const u = ((az + Math.PI) / (Math.PI * 2)) * SKY_BINS - 0.5;
+    const i = Math.floor(u);
+    const t = u - i;
+    return skyBin(i) * (1 - t) + skyBin(i + 1) * t;
+  }
+  // Fraction of a disc of angular radius r around `dir` that is above the skyline (5 columns).
+  const DISC_COLS = [-0.8, -0.4, 0, 0.4, 0.8];
+  function discVisibility(dir, r) {
+    const el = Math.asin(clamp(dir.y, -1, 1));
+    if (el < -0.2) return 0;
+    const az = Math.atan2(dir.x, -dir.z);
+    const ce = Math.max(0.05, Math.cos(el));
+    let vis = 0;
+    let wsum = 0;
+    for (let c = 0; c < DISC_COLS.length; c++) {
+      const o = DISC_COLS[c];
+      const half = r * Math.sqrt(1 - o * o);
+      const sky = skylineAt(az + (o * r) / ce);
+      vis += clamp((el + half - sky) / (2 * half), 0, 1) * half;
+      wsum += half;
+    }
+    return vis / wsum;
+  }
+  let keyVisibility = 1;
+  let keyOpenIntensity = SUN_E0; // key light before the skyline
+  // Treeline occluder toward the key light, for shaders that re-light what stands above the
+  // dock's shadow (tree crowns, hillsides): x = occluder top height (m), y = its distance from the
+  // dock along the light's azimuth (m), z = light elevation (rad), w = disc radius (rad).
+  const sunOccluder = new THREE.Vector4(0, 1000, 1, SUN_RADIUS);
+  function updateOccluder(dir, r) {
+    const el = Math.asin(clamp(dir.y, -1, 1));
+    const az = Math.atan2(dir.x, -dir.z);
+    const d = skyDistAt(az);
+    sunOccluder.set(EYE_Y + d * Math.tan(skylineAt(az)), d, el, r);
+  }
 
   function transmittance(elDeg, haze, out) {
     const e = Math.max(elDeg, 0);
@@ -288,17 +389,28 @@ export function createEnvironment(ctx) {
     moonRGB.copy(MOON_COLOR).multiplyScalar(moonI);
 
     // ---- key light: the sun by day, the moon at night ----
+    // Direct light (and so the water glint, caustics, tackle and showcase lighting that read
+    // sunIntensity) fades while the disc sinks behind the far hills / treeline seen from the dock;
+    // the sky and clouds keep the unoccluded sun.
     const sunKey = sunEl > -3;
     if (sunKey) {
       sunDirection.copy(trueSunDirection);
+      keyVisibility = discVisibility(trueSunDirection, SUN_RADIUS);
+      updateOccluder(trueSunDirection, SUN_RADIUS);
       const m = Math.max(sunRGB.r, sunRGB.g, sunRGB.b, 1e-6);
       sunColor.setRGB(sunRGB.r / m, sunRGB.g / m, sunRGB.b / m);
-      api.sunIntensity = m;
+      keyOpenIntensity = m;
     } else {
       sunDirection.copy(moonDirection);
+      keyVisibility = discVisibility(moonDirection, MOON_RADIUS);
+      updateOccluder(moonDirection, MOON_RADIUS);
       sunColor.copy(MOON_COLOR);
-      api.sunIntensity = moonI;
+      keyOpenIntensity = moonI;
     }
+    api.sunIntensity = keyOpenIntensity * keyVisibility;
+    tuLift.uSunOpen.value.copy(sunColor).multiplyScalar(keyOpenIntensity);
+    tuLift.uSunOcc.value.copy(sunOccluder);
+    tuLift.uSunVisEye.value = keyVisibility;
     sunLight.color.copy(sunColor);
     sunLight.intensity = api.sunIntensity;
     sunLight.position.copy(SHADOW_TARGET).addScaledVector(sunDirection, 160);
@@ -345,7 +457,7 @@ export function createEnvironment(ctx) {
     scene.environmentIntensity = lerp(1.0, 2.0, nightF);
 
     // ---- caustics follow direct sun on the water ----
-    terrain.uniforms.uCaustic.value = smoothstep(4, 35, sunEl) * 0.9;
+    terrain.uniforms.uCaustic.value = smoothstep(4, 35, sunEl) * 0.9 * (sunKey ? keyVisibility : 0);
 
     // ---- stars, milky way, moon ----
     const starVis = smoothstep(-5, -13, sunEl) * (1 - 0.3 * moonUp);
@@ -372,7 +484,7 @@ export function createEnvironment(ctx) {
     cm.uCumulus.value = 1 - streaky;
     cm.uCoverage.value = lerp(lerp(0.75, 0.56, streaky), 0.84, nightF);
     cm.uSoft.value = lerp(0.16, 0.13, streaky);
-    cm.uStretch.value = lerp(1.0, 4.5, streaky);
+    cm.uStretch.value = lerp(1.4, 4.5, streaky); // cumulus drift into loose streets along the wind
     cm.uThick.value = lerp(750, 160, streaky);
     cm.uTopErode.value = lerp(0.12, 0.04, streaky);
     cm.uOpacity.value = lerp(lerp(0.97, 0.78, streaky), 0.65, nightF);
@@ -392,11 +504,12 @@ export function createEnvironment(ctx) {
     cm.uForward.value = 1 - nightF;
 
     // ---- mist ----
-    const mistAmt = (1 - smoothstep(6.9, 8.5, hours)) * smoothstep(3.5, 5.0, hours) * (quality === 'low' ? 0.7 : 1);
+    const mistAmt = (1 - smoothstep(6.9, 8.5, hours)) * smoothstep(3.5, 5.0, hours) * (runtimeQuality === 'low' ? 0.7 : 1);
     mist.group.visible = mistAmt > 0.002;
     mist.uniforms.uAmount.value = mistAmt * 0.8;
     mist.uniforms.uAmb.value.copy(horizonRadiance).multiplyScalar(0.92);
-    mist.uniforms.uSun.value.copy(sunRGB).multiplyScalar(0.06);
+    // the low sheets lie in the treeline's shadow once the sun is behind it
+    mist.uniforms.uSun.value.copy(sunRGB).multiplyScalar(0.06 * (sunKey ? lerp(0.3, 1, keyVisibility) : 0.3));
     mist.uniforms.uSunDir.value.copy(trueSunDirection);
 
     windBase = table(WIND, hours);
@@ -418,15 +531,24 @@ export function createEnvironment(ctx) {
     maybeBake();
   }
 
-  let lastQuality = quality;
+  // Runtime quality (adaptive or manual): only cheap switches, no shader recompiles. The shadow
+  // map size / refresh rate, the dense terrain ring's 1 m <-> 2 m index, and the mist layer count.
+  function applyRuntimeQuality(q) {
+    runtimeQuality = q;
+    applyShadowQuality(q);
+    terrain.setDetail(q === 'high' ? 'fine' : 'coarse');
+    const layers = q === 'high' ? 3 : q === 'medium' ? 2 : 1;
+    mist.group.children.forEach((m, i) => (m.visible = i < layers));
+    if (Number.isFinite(currentHours)) applyTime(currentHours);
+  }
+  let shadowTick = 0;
   function update(frame) {
     const dt = frame && frame.dt > 0 ? Math.min(frame.dt, 0.1) : 0;
     const time = frame && Number.isFinite(frame.time) ? frame.time : 0;
     maybeBake();
-    if (frame && frame.quality && frame.quality !== lastQuality) {
-      lastQuality = frame.quality;
-      applyShadowQuality(lastQuality);
-    }
+    const fq = frame && frame.quality;
+    if ((fq === 'high' || fq === 'medium' || fq === 'low') && fq !== runtimeQuality) applyRuntimeQuality(fq);
+    if (throttleShadow && (shadowTick++ & 1) === 0) sunLight.shadow.needsUpdate = true;
     // wind: slow gusts and a gently veering direction
     const gust = 0.06 * Math.sin(time * 0.21) * Math.sin(time * 0.057 + 1.3) + 0.03 * Math.sin(time * 0.73 + 0.4);
     api.windStrength = clamp(windBase + gust, 0, 1);
@@ -535,10 +657,44 @@ export function createEnvironment(ctx) {
     get exposure() {
       return exposure;
     },
+    // 0..1: share of the sun's (by night the moon's) disc above the terrain + treeline skyline
+    // seen from the dock. Already folded into sunIntensity / sunLight.intensity.
+    get sunVisibility() {
+      return keyVisibility;
+    },
+    // extras for shaders that re-light tall things above the dock-level treeline shadow
+    get sunOpenIntensity() {
+      return keyOpenIntensity;
+    },
+    sunOccluder,
+    // skyline elevation (radians above the eye's horizontal) at azimuth atan2(x, -z)
+    skylineElevationAt: (az) => (Number.isFinite(az) ? skylineAt(az) : 0),
+    // Scenery hands over the skyline of what it built: { bins, elevation: Float32Array } with
+    // bin k covering azimuths [-pi + 2 pi k / bins, ...). Resampled to SKY_BINS if needed.
+    setSkylineProfile(p) {
+      const src = p && p.elevation;
+      if (!src || !src.length) return;
+      const n = src.length;
+      const dsrc = p.distance && p.distance.length === n ? p.distance : null;
+      const out = new Float32Array(SKY_BINS);
+      const outD = new Float32Array(SKY_BINS);
+      for (let k = 0; k < SKY_BINS; k++) {
+        const s = Math.min(n - 1, Math.floor(((k + 0.5) / SKY_BINS) * n));
+        const v = src[s];
+        out[k] = Number.isFinite(v) ? v : -Math.PI / 2;
+        const d = dsrc ? dsrc[s] : 1000;
+        outD[k] = Number.isFinite(d) && d > 1 ? d : 1000;
+      }
+      skyProfile = out;
+      skyProfileD = outD;
+      if (Number.isFinite(currentHours)) applyTime(currentHours);
+    },
+    terrain,
     stats: null,
     dispose() {
       renderer.domElement.removeEventListener('webglcontextrestored', onContextRestored);
       for (const m of terrain.meshes) scene.remove(m);
+      scene.onBeforeRender = prevSceneBeforeRender;
       scene.remove(skySys.group, mist.group, sunLight, sunLight.target, hemiLight);
       terrain.dispose();
       skySys.dispose();
@@ -572,6 +728,9 @@ export function createEnvironment(ctx) {
     terrainBuildMs: Math.round(terrain.buildMs),
     sdfMs: Math.round(field.buildMs),
     terrainTriangles: terrain.triangles,
+    get terrain() {
+      return terrain.stats();
+    },
     get envBakes() {
       return bakeCount;
     },

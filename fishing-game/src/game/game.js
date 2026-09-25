@@ -6,8 +6,8 @@
 // audio.update -> ui.update -> render.
 import * as THREE from 'three';
 import { STATES, LURES, TACKLE, DAY, DOCK, clamp, damp, formatWeight } from '../config.js';
-import { createFightModel } from './fight.js';
-import { makeRecord, catchFlags, writeSave, sanitizeRecords } from './records.js';
+import { createFightModel, FIGHT } from './fight.js';
+import { makeRecord, catchFlags, writeSave, loadSave, sanitizeRecords, mergeRecords, SAVE_KEY } from './records.js';
 import { createShowcase } from './showcase.js';
 import { createInput } from './input.js';
 import { createView, DEFAULT_PITCH } from './view.js';
@@ -16,6 +16,21 @@ import { createQualityManager } from './quality.js';
 const DEG = Math.PI / 180;
 const LURE_BY_ID = Object.fromEntries(LURES.map((l) => [l.id, l]));
 const QUALITIES = ['high', 'medium', 'low'];
+// A click this soon after a nibble on the float is an early strike (the bait is yanked away).
+const EARLY_STRIKE_S = 0.6;
+// A lure hit while the angler keeps reeling sets itself after this long (a "reel set").
+const REEL_SET_S = 0.12;
+// The game clock only runs while the angler is fishing (not while netting, admiring a catch,
+// re-tying or watching a fish swim off); pause and the journal stop the whole simulation.
+const CLOCK_STATES = new Set([STATES.READY, STATES.CHARGING, STATES.CASTING, STATES.WAITING, STATES.STRIKE, STATES.FIGHTING]);
+// Coaching prompts during the angler's first few fights.
+const HINT_FIGHTS = 3;
+// Retrieve advice per lure while it is in the water: [mouse / keyboard, touch].
+const LURE_PROMPTS = {
+  spinner: ['Steady, medium retrieve: hold Shift and reel', 'Hold to reel steadily \u00b7 pause now and then'],
+  crankbait: ['Hold to crank it down \u00b7 pause now and then', 'Hold to crank it down \u00b7 pause now and then'],
+  topwater: ['Shift + hold for a slow walk \u00b7 pause now and then', 'Short pulls and pauses walk it'],
+};
 const LOGGED_EVENTS = [
   'cast', 'lure:landed', 'lure:home', 'fish:interest', 'fish:nibble', 'fish:bite', 'fish:swirl', 'fish:missed',
   'fish:spooked', 'fish:jump', 'strike', 'hooked', 'tackle:snap', 'escaped', 'catch', 'state',
@@ -39,10 +54,49 @@ export function createGame(opts) {
   let drag01 = Number.isFinite(settings.drag01) ? clamp(settings.drag01, 0, 1) : TACKLE.dragDefault01;
   let hours = Number.isFinite(hot.hours) ? wrap24(hot.hours) : DAY.startHours;
   let manualQuality = QUALITIES.includes(settings.quality) ? settings.quality : null;
+  // fights started so far (all sessions): the first few get coaching prompts
+  let fightsSeen = Number.isFinite(settings.fights) ? Math.max(0, Math.floor(settings.fights)) : 0;
 
-  function persist() {
-    writeSave({ v: 1, records, settings: { units, muted, lureId, drag01, quality: manualQuality } });
+  // Another tab of the same artifact may have logged catches since this one loaded: merge the stored
+  // log in before every write so neither tab's catches are lost (last writer no longer wins).
+  function mergeStored() {
+    const stored = loadSave();
+    const merged = mergeRecords(records, sanitizeRecords(stored.records));
+    if (merged !== records) records = merged;
   }
+  let persistTimer = 0;
+  function persist() {
+    if (persistTimer) {
+      clearTimeout(persistTimer);
+      persistTimer = 0;
+    }
+    mergeStored();
+    writeSave({ v: 1, records, settings: { units, muted, lureId, drag01, quality: manualQuality, fights: fightsSeen } });
+  }
+  // Settings changes (a drag step per wheel tick, lure, mute, units) are debounced: one write after
+  // the last change instead of re-serialising the whole log on every step.
+  function persistSoon() {
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => {
+      persistTimer = 0;
+      persist();
+    }, 400);
+  }
+  function flushPersist() {
+    if (persistTimer) persist();
+  }
+  window.addEventListener('pagehide', flushPersist);
+  window.addEventListener('storage', (e) => {
+    if (e.key !== SAVE_KEY || !e.newValue) return;
+    let data = null;
+    try {
+      data = JSON.parse(e.newValue);
+    } catch {
+      return;
+    }
+    const merged = mergeRecords(records, sanitizeRecords(data && data.records));
+    if (merged !== records) records = merged; // the HUD / journal pick it up on the next update
+  });
 
   // ---------------------------------------------------------------- modules (attached after the staged build)
   let ui = null;
@@ -96,6 +150,8 @@ export function createGame(opts) {
   let charge = 0;
   let reel01 = 0;
   let lastNibbleT = -99;
+  let lastJumpT = -99;
+  let fightHints = false; // coach this fight (one of the angler's first few)
   let bite = null;
   let catchRec = null;
   let userPaused = false;
@@ -176,8 +232,9 @@ export function createGame(opts) {
         setState(STATES.CHARGING);
         break;
       case STATES.WAITING: {
+        // a strike right on top of a nibble yanks the bait away from the fish
         const L = lure();
-        if (L && LURE_BY_ID[L.id] && LURE_BY_ID[L.id].kind === 'bait' && L.inWater && frame.time - lastNibbleT < 1.3) earlyStrike();
+        if (L && LURE_BY_ID[L.id] && LURE_BY_ID[L.id].kind === 'bait' && L.inWater && frame.time - lastNibbleT < EARLY_STRIKE_S) earlyStrike();
         break;
       }
       case STATES.STRIKE:
@@ -190,6 +247,11 @@ export function createGame(opts) {
 
   function actionUp(source, cancel = false) {
     if (!held.delete(source)) return;
+    // a lure hit while the angler was reeling: letting go of the reel and sweeping the rod sets the hook
+    if (state === STATES.STRIKE && bite && bite.reelSet && !cancel && held.size === 0) {
+      hookset();
+      return;
+    }
     if (held.size > 0 || state !== STATES.CHARGING) return;
     if (cancel || userPaused || chargeT < 0.12) {
       setState(STATES.READY); // a click, or the window lost focus mid-charge: no cast
@@ -234,6 +296,9 @@ export function createGame(opts) {
     const lo = Number.isFinite(lineOutM) ? clamp(lineOutM, d - 0.5, d + 0.3) : d;
     fight.begin(hf, _tip, lo);
     frame.hooked = hf;
+    fightHints = fightsSeen < HINT_FIGHTS;
+    fightsSeen++;
+    persistSoon();
     setState(STATES.FIGHTING);
     events.emit('hooked', { fish: hf });
     tackle.setFight(true, { fishPosition: hf.position, tensionN: 0, lineOutM: fight.lineOutM });
@@ -249,13 +314,16 @@ export function createGame(opts) {
     setState(STATES.SNAPPED);
   }
 
-  function endFightEscape(reason) {
+  function endFightEscape(reason, pulled = false) {
     fish.releaseHooked('escaped');
     fight.end();
     frame.hooked = null;
     tackle.setFight(false);
     events.emit('escaped', { reason });
-    toast(reason === 'headshake' ? 'It shook its head and threw the hook' : 'Slack line. The hook fell out', 'bad');
+    let msg = 'Slack line. The hook fell out';
+    if (pulled) msg = 'The hook pulled out. Keep the rod up to cushion head shakes and jumps';
+    else if (reason === 'headshake') msg = 'It shook its head on a slack line and threw the hook';
+    toast(msg, 'bad');
     setState(STATES.ESCAPED);
   }
 
@@ -340,22 +408,22 @@ export function createGame(opts) {
     if (force && state !== STATES.READY && state !== STATES.TITLE) resetToReady();
     lureId = id;
     tackle.setLure(id);
-    persist();
+    persistSoon();
     return true;
   }
   function setDrag(d01) {
     drag01 = Math.round(clamp(d01, 0, 1) * 1000) / 1000;
     frame.dragN = dragNFor(drag01);
-    persist();
+    persistSoon();
   }
   function setMuted(m) {
     muted = !!m;
     if (audio) audio.setMuted(muted);
-    persist();
+    persistSoon();
   }
   function setUnits(u) {
     units = normUnits(u);
-    persist();
+    persistSoon();
   }
   function setHours(h) {
     if (!Number.isFinite(h)) return;
@@ -368,11 +436,17 @@ export function createGame(opts) {
     needsRender = true;
   }
   function setQualityManual(q) {
-    if (!QUALITIES.includes(q)) return;
-    manualQuality = q;
-    qm.setManual(q);
+    if (q === 'auto') {
+      // back to adaptive quality (it starts from the current level and may climb back up)
+      manualQuality = null;
+      qm.setAuto(true);
+    } else {
+      if (!QUALITIES.includes(q)) return;
+      manualQuality = q;
+      qm.setManual(q);
+    }
     frame.quality = qm.quality;
-    persist();
+    persistSoon();
     needsRender = true;
   }
   function setUserPause(p) {
@@ -494,11 +568,27 @@ export function createGame(opts) {
     lastNibbleT = frame.time;
   });
   events.on('fish:bite', (e) => {
-    if (state !== STATES.WAITING || !e) return;
+    if (!e) return;
+    // The fish system opens bites whenever the lure is in the water. That includes ESCAPED (the lure
+    // drops back in after a fish throws the hook): take those too. Any other state can't take a bite:
+    // close it (after the other listeners ran) so the fish, the float and the sound agree.
+    if (state !== STATES.WAITING && state !== STATES.ESCAPED) {
+      const id = e.biteId;
+      if (fish && state !== STATES.STRIKE) queueMicrotask(() => fish.missBite(id, 'ignored'));
+      return;
+    }
     if (timeScale > 1) timeScale = 1; // debug fast-forward: drop to real time so a hookset can land
-    bite = { biteId: e.biteId, windowS: e.windowS || 1, t: 0 };
+    const L = lure();
+    const def = LURE_BY_ID[(L && L.id) || lureId];
+    // a moving lure hit while the angler is reeling: keep reeling (a reel set) or let go to set the
+    // hook. The float rig always needs a strike (a fresh click / tap).
+    const reelSet = held.size > 0 && !!def && def.kind === 'lure';
+    bite = { biteId: e.biteId, windowS: e.windowS || 1, t: 0, reelSet };
     setState(STATES.STRIKE);
     if (ui) ui.strikeCue();
+  });
+  events.on('fish:jump', () => {
+    if (state === STATES.FIGHTING) lastJumpT = frame.time;
   });
   events.on('fish:missed', (e) => {
     if (state !== STATES.STRIKE) return;
@@ -588,7 +678,8 @@ export function createGame(opts) {
     inp.charge01 = state === STATES.CHARGING ? charge : 0;
 
     // reel
-    const canReel = state === STATES.WAITING || state === STATES.FIGHTING || state === STATES.ESCAPED;
+    // (a lure hit mid-retrieve keeps coming while the angler reels through the strike)
+    const canReel = state === STATES.WAITING || state === STATES.FIGHTING || state === STATES.ESCAPED || (state === STATES.STRIKE && !!bite && bite.reelSet);
     const wantReel = canReel && (held.size > 0 || debugReel);
     const target = wantReel ? (input.shift && state !== STATES.FIGHTING ? 0.5 : 1) : 0;
     reel01 = damp(reel01, target, 10, dt);
@@ -622,7 +713,7 @@ export function createGame(opts) {
     const out = fight.advance(dt, fightInp);
     if (out) {
       if (out.type === 'snap' || out.type === 'spooled') endFightSnap(out.tensionN || TACKLE.lineBreakN, out.type === 'spooled');
-      else if (out.type === 'escape') endFightEscape(out.reason);
+      else if (out.type === 'escape') endFightEscape(out.reason, !!out.pulled);
       return;
     }
     if (fight.canLand(hf, view.eye)) startLanding();
@@ -638,8 +729,8 @@ export function createGame(opts) {
     // input (camera, rod, reel)
     processInput(dt);
 
-    // hours
-    if (state !== STATES.TITLE) hours = wrap24(hours + (dt * DAY.gameMinutesPerSecond) / 60);
+    // hours (the clock stands still while netting, on the catch card, re-tying, after an escape)
+    if (CLOCK_STATES.has(state)) hours = wrap24(hours + (dt * DAY.gameMinutesPerSecond) / 60);
     frame.hours = hours;
     env.setTimeOfDay(hours);
     env.update(frame);
@@ -701,6 +792,11 @@ export function createGame(opts) {
       case STATES.STRIKE:
         if (bite) {
           bite.t += dt;
+          // reel set: the angler kept cranking through the hit and the fish loaded the rod
+          if (bite.reelSet && held.size > 0 && bite.t >= REEL_SET_S) {
+            hookset();
+            break;
+          }
           if (bite.t > bite.windowS + 1.5) {
             bite = null;
             setState(STATES.WAITING);
@@ -749,6 +845,11 @@ export function createGame(opts) {
     paused: false,
     quality: 'high',
     fishStamina01: NaN,
+    // rod handling during a fight (for an optional rod-angle indicator): lift / side as the angler holds
+    // it, and how little cushion it gives (0 = well bent, 1 = pointed straight at the fish)
+    rodLift01: 0.4,
+    rodSide: 0,
+    rodStiff01: 0,
   };
   function updateHud() {
     const L = lure();
@@ -768,24 +869,71 @@ export function createGame(opts) {
     hud.fishOn = (state === STATES.FIGHTING || state === STATES.LANDING) && !!hf;
     hud.fishDistanceM = hud.fishOn ? Math.hypot(hf.position.x - view.eye.x, hf.position.z - view.eye.z) : NaN;
     hud.fishStamina01 = hf ? hf.stamina01 : NaN;
+    hud.rodLift01 = frame.input.rodLift01;
+    hud.rodSide = frame.input.rodSide;
+    hud.rodStiff01 = state === STATES.FIGHTING ? fight.state.stiff01 : 0;
     hud.paused = userPaused;
-    hud.quality = qm.quality;
+    hud.quality = qm.auto ? 'auto' : qm.quality; // the pause menu shows the setting
     // prompts the UI can't derive on its own (null = let the UI derive them)
+    const touch = input.lastType === 'touch';
     let prompt = null;
     let kind = 'info';
     if (state === STATES.WAITING && L) {
       const def = LURE_BY_ID[L.id];
-      if (L.state === 'land') prompt = input.lastType === 'touch' ? 'On the bank. Hold to reel it in' : 'On the bank. Hold to reel it in';
-      else if (def && def.kind === 'lure') {
-        prompt = input.lastType === 'touch' ? 'Hold to reel. Pause now and then' : 'Hold to reel · Shift for a slow retrieve';
-      }
-    } else if (state === STATES.FIGHTING && fight.state.slipping && frame.input.reeling && frame.slipMps > 0.25 && frame.tension01 < 0.7) {
-      prompt = 'Drag is slipping. Let it run';
-      kind = 'warn';
+      if (L.state === 'land') prompt = 'On the bank. Hold to reel it in';
+      else if (def && def.kind === 'bait') {
+        if (L.state === 'water') {
+          if (frame.time - lastNibbleT < 1.2) prompt = 'Nibble\u2026 wait for it';
+          else prompt = touch ? 'Watch the float \u00b7 tap when it goes under \u00b7 hold to reel in' : 'Watch the float \u00b7 click when it goes under \u00b7 hold to reel in';
+        }
+      } else if (def && def.kind === 'lure') prompt = LURE_PROMPTS[def.id] ? LURE_PROMPTS[def.id][touch ? 1 : 0] : touch ? 'Hold to reel. Pause now and then' : 'Hold to reel \u00b7 Shift for a slow retrieve';
+    } else if (state === STATES.STRIKE && bite && bite.reelSet) {
+      prompt = 'Keep reeling!';
+      kind = 'danger';
+    } else if (state === STATES.FIGHTING && hf) {
+      const fp = fightPrompt(hf, touch);
+      prompt = fp[0];
+      kind = fp[1];
     }
     hud.prompt = prompt;
     hud.promptKind = kind;
     if (ui) ui.update(hud);
+  }
+
+  // Fight prompts, most urgent first. null leaves the UI's own tension / tiring / "Fish on" prompts.
+  const _fp = [null, 'info'];
+  function fightPrompt(hf, touch) {
+    const fs = fight.state;
+    const t01 = frame.tension01;
+    const reeling = frame.input.reeling;
+    _fp[0] = null;
+    _fp[1] = 'info';
+    const say = (text, kind = 'warn') => {
+      _fp[0] = text;
+      _fp[1] = kind;
+      return _fp;
+    };
+    if (t01 >= 0.85) return _fp; // UI: "Too much tension!"
+    if (fs.exposed01 > 0.3) return say(hf.isJumping || frame.time - lastJumpT < 0.8 ? 'Jump! Rod up, cushion it' : 'Head shakes! Lift the rod to cushion them', 'danger');
+    if (fs.twist > FIGHT.twistWarn && reeling && fs.slipping) return say('Line twisting! Stop cranking while it runs');
+    if (t01 >= 0.7) return _fp; // UI: "Heavy load. Ease the drag"
+    if (fs.slackT > 0.8 && !fs.slipping) return say('Slack line! Reel and lift the rod');
+    if (frame.time - lastJumpT < 1.2) return say('Jump! Keep it tight');
+    if (fs.slipping && reeling && frame.slipMps > 0.25) return say('Drag is slipping. Let it run');
+    if (fs.stiff01 > 0.6 && hf.weightKg >= FIGHT.smallFishKg) return say(touch ? 'Rod pointed at the fish: drag up to lift it' : 'Rod pointed at the fish: mouse up to lift it');
+    if (!fightHints) return _fp;
+    // coaching for the angler's first few fights
+    const ft = fs.t;
+    if (ft < 4) return say(touch ? 'Fish on! Hold to reel \u00b7 drag up to lift the rod' : 'Fish on! Hold to reel \u00b7 mouse up lifts the rod', 'good');
+    const lat = hf.velocity.x * fightInp.rightX + hf.velocity.z * fightInp.rightZ; // + = running right
+    if (Math.abs(lat) > 0.6 && frame.input.rodSide * Math.sign(lat) > -0.3) {
+      const dir = lat > 0 ? 'left' : 'right';
+      const run = lat > 0 ? 'right' : 'left';
+      return say(touch ? `Running ${run}: drag ${dir} for side pressure` : `Running ${run}: mouse ${dir} (${lat > 0 ? 'A' : 'D'}) for side pressure`, 'info');
+    }
+    if (ft > 8 && ft < 13) return say('Pump it: lift the rod, then reel as you lower it', 'info');
+    if (ft > 16 && ft < 21) return say(touch ? 'The \u2212 / + buttons set the drag' : 'Scroll or [ ] sets the drag \u00b7 keep it out of the red', 'info');
+    return _fp;
   }
 
   // ---------------------------------------------------------------- render
@@ -848,7 +996,13 @@ export function createGame(opts) {
   if (typeof ResizeObserver === 'function' && canvas.parentElement) new ResizeObserver(resize).observe(canvas.parentElement);
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && ready && state !== STATES.TITLE) setUserPause(true);
+    if (document.hidden) flushPersist();
     lastNow = 0;
+  });
+  // Clicking outside the game (e.g. the chat beside the artifact) releases every hold; with a fish
+  // on, pause so it isn't lost while the angler is looking elsewhere. (Idle states keep running.)
+  window.addEventListener('blur', () => {
+    if (ready && (state === STATES.STRIKE || state === STATES.FIGHTING || state === STATES.LANDING)) setUserPause(true);
   });
 
   // ---------------------------------------------------------------- hot reload snapshot
@@ -985,6 +1139,9 @@ export function createGame(opts) {
         hf.toLanding(landTarget, 0.2);
       }
       enterCaught();
+      // straight from FIGHTING the tackle still thinks a fish is on and would leave the bait in the
+      // lake behind the catch card (real play always nets through LANDING, which reels the rig home)
+      if (state === STATES.CAUGHT && tackle && tackle.getLure().state !== 'home') tackle.resetToHome();
       return state;
     },
     stats() {

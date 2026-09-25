@@ -5,7 +5,7 @@
 //   node tools/harness.mjs [--file dist/index.html] [--out out/run] [--size 1280x720]
 //                          [--mobile] [--wait 4000] [--shots 3000,6000]
 //                          [--scenario tools/scenarios/foo.mjs] [--eval "js expr"]
-//                          [--timeout 120000] [--quiet]
+//                          [--timeout 120000] [--quiet] [--xr]
 //
 // A scenario module exports `default async function ({ page, shot, sleep, log, game })`.
 //   shot(name)          -> saves out/<run>/<name>.png
@@ -43,6 +43,10 @@ const scenario = arg('--scenario', null);
 const evalExpr = arg('--eval', null);
 const timeout = Number(arg('--timeout', '900000')); // per Playwright action; software-rendered frames can take seconds
 const quiet = has('--quiet');
+// --xr installs IWER (Meta's Immersive Web Emulation Runtime, a dev-only WebXR emulator) as navigator.xr
+// before any page script runs, emulating a Meta Quest 3 with two controllers. Scenarios drive it through
+// window.__xrDevice (see node_modules/iwer/lib/device/XRDevice.d.ts / XRController.d.ts).
+const xr = has('--xr');
 
 const ROOT = resolve('.');
 const THREE_DIR = join(ROOT, 'node_modules/three');
@@ -80,6 +84,20 @@ const context = await browser.newContext({
   hasTouch: mobile,
 });
 const page = await context.newPage();
+if (xr) {
+  const iwerSrc = await readFile(join(ROOT, 'node_modules/iwer/build/iwer.min.js'), 'utf8');
+  await page.addInitScript({
+    content: `${iwerSrc}
+;(function () {
+  try {
+    const dev = new IWER.XRDevice(IWER.metaQuest3);
+    dev.installRuntime({ forceInstall: true });
+    window.__xrDevice = dev;
+    window.__IWER = IWER;
+  } catch (e) { console.error('[harness] IWER install failed', e); }
+})();`,
+  });
+}
 page.setDefaultTimeout(timeout);
 
 await page.route('**/*', async (route) => {

@@ -29,7 +29,7 @@ const normQ = (q) => (q === 'low' || q === 'medium' ? q : 'high');
 
 // Optical properties of a clear-ish, slightly tea-stained northern lake (Secchi ~3 m):
 // red is absorbed first, blue by dissolved organics, green travels furthest.
-const SIGMA = [0.4, 0.27, 0.62]; // 1/m
+const SIGMA = [0.26, 0.2, 0.46]; // 1/m (core: slightly clearer than first tuned, see the report)
 const DOWN_K = 1.15; // light reaching the bed travels ~1.15x its depth
 const BODY = [0.0026, 0.0078, 0.0066]; // radiance of optically deep water per unit irradiance
 const BED_EST = 0.055; // typical sand/mud/weed radiance per unit irradiance

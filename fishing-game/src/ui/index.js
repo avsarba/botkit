@@ -65,7 +65,7 @@ function nullUI() {
   return {
     showTitle: noop, hideTitle: noop, setState: noop, update: noop, strikeCue: noop,
     showCatch: noop, hideCatch: noop, toast: noop, openJournal: noop, closeJournal: noop,
-    setPaused: noop, isModalOpen: () => false, dispose: noop,
+    setLoading: noop, setPaused: noop, isModalOpen: () => false, dispose: noop,
   };
 }
 
@@ -338,10 +338,20 @@ export function createUI(ctx = {}) {
     cur.titleOpen = false;
     syncHud();
   }
-  startBtn.disabled = false;
-  startBtn.textContent = 'Start fishing';
+  // Loading state (core builds the lake in stages): Start stays disabled and shows progress until
+  // setLoading(1). config.loading === true starts in that state.
+  let loading = false;
+  function setLoading(p01, label) {
+    const p = clamp(fin(p01, 1), 0, 1);
+    loading = p < 1;
+    startBtn.disabled = loading;
+    startBtn.setAttribute('aria-busy', loading ? 'true' : 'false');
+    startBtn.style.setProperty('--p', p.toFixed(3));
+    startBtn.textContent = loading ? `${label || 'Preparing the lake'}… ${Math.round(p * 100)}%` : 'Start fishing';
+  }
+  setLoading(config.loading === true ? 0 : 1);
   startBtn.addEventListener('click', () => {
-    if (!cur.titleOpen) return;
+    if (!cur.titleOpen || loading) return;
     call('onStart'); // from the click itself so audio can start
     hideTitle();
   });
@@ -1080,6 +1090,7 @@ export function createUI(ctx = {}) {
     openJournal,
     closeJournal,
     // extras (not in the contract; safe to ignore)
+    setLoading,
     setPaused,
     isModalOpen: () => cur.pauseOpen || cur.journalOpen || cur.catchOpen,
     dispose,

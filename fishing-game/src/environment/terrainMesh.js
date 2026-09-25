@@ -218,12 +218,12 @@ const SPLAT = /* glsl */ `
   bedSand = mix( bedSand, vec3( 0.07, 0.075, 0.04 ), smoothstep( 0.6, 0.85, dC.r ) * 0.5 );
   vec3 silt = mix( vec3( 0.06, 0.055, 0.032 ), vec3( 0.095, 0.085, 0.05 ), n1 );
   vec3 muckC = mix( vec3( 0.03, 0.03, 0.017 ), vec3( 0.035, 0.05, 0.018 ), smoothstep( 0.4, 0.7, n2 ) );
-  float siltW = smoothstep( 0.7, 2.9, depth + ( nMid - 0.5 ) * 1.6 );
+  float siltW = smoothstep( 1.5, 3.8, depth + ( nMid - 0.5 ) * 1.6 ); // sandy shelf around the dock, silt deeper
   vec3 bed = mix( bedSand, silt, siltW );
   bed = mix( bed, muckC, muck );
   bed = mix( bed, granite * 0.75, rockW );
-  // light reaching the bed is filtered by the water column (tea-stained northern lake)
-  bed *= exp( -depth * vec3( 0.2, 0.11, 0.16 ) );
+  // (the light's path down to the bed and back is absorbed by the Water shader, which knows the
+  //  true water thickness; darkening it here as well made the shallows beside the dock read black)
 
   // wet band at the waterline and just above it
   float wet = 1.0 - smoothstep( 0.02, 0.28 + 0.1 * n1, h );

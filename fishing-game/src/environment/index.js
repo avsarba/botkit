@@ -195,7 +195,6 @@ export function createEnvironment(ctx) {
   // scratch
   const _c = new THREE.Color();
   const _c2 = new THREE.Color();
-  const _fwd = new THREE.Vector3();
   const pole = new THREE.Vector3(...CELESTIAL_POLE);
   const sunRGB = new THREE.Color(); // scene-referred direct sun (color * intensity)
   const moonRGB = new THREE.Color();
@@ -204,6 +203,20 @@ export function createEnvironment(ctx) {
   const T = [1, 1, 1];
   const fogDisp = { sun: new THREE.Color(), mid: new THREE.Color(), side: new THREE.Color(), away: new THREE.Color() };
   const fogSunXZ = new THREE.Vector2(1, 0);
+  // Directional fog shared by the far scenery and the water (the terrain's own uniforms, by reference): each fragment
+  // blends sun / mid / side / away horizon colors by the azimuth of its own view ray relative to the sun, so the haze on
+  // a ridge is a property of the ridge, not of where the head (or the desktop camera) happens to point.
+  const tuF = terrain.uniforms;
+  const fogUniforms = { uFogSunDir: tuF.uFogSunDir, uFogSun: tuF.uFogSun, uFogMid: tuF.uFogMid, uFogSide: tuF.uFogSide, uFogAway: tuF.uFogAway };
+  // the same blend for one horizontal direction (x, z)
+  function fogToward(x, z, out) {
+    const l = Math.hypot(x, z);
+    const cs = l > 1e-4 ? (x * fogSunXZ.x + z * fogSunXZ.y) / l : 0;
+    if (cs > 0.7071) out.copy(fogDisp.mid).lerp(fogDisp.sun, smoothstep(0.7071, 1, cs));
+    else if (cs > 0) out.copy(fogDisp.side).lerp(fogDisp.mid, smoothstep(0, 0.7071, cs));
+    else out.copy(fogDisp.side).lerp(fogDisp.away, -cs);
+    return out;
+  }
 
   let currentHours = NaN;
   let exposure = 1;
@@ -464,6 +477,13 @@ export function createEnvironment(ctx) {
     tu.uFogMid.value.copy(fogDisp.mid);
     tu.uFogSide.value.copy(fogDisp.side);
     tu.uFogAway.value.copy(fogDisp.away);
+    // scene.fog.color and horizonColor are world-fixed: the horizon out over the lake (-Z, the dock's view). Every
+    // far surface (terrain, scenery, water) fogs per fragment with the directional colors above; fog.color is left to
+    // the near things (dock, tackle, fish), where the fog is slight, and horizonColor to whole-lake terms (the water
+    // body's sky light). Neither follows the view: turning the head never recolors the world.
+    fogToward(0, -1, _c);
+    horizonColor.copy(_c);
+    fog.color.copy(_c);
     toneMapACES(skyRadiance, exposure, skyColor);
 
     // ---- hemisphere fill ----
@@ -593,18 +613,7 @@ export function createEnvironment(ctx) {
     skySys.starMaterial.uniforms.uSize.value = 2.0 * renderer.getPixelRatio();
     terrain.uniforms.uTime.value = time;
 
-    // fog color follows the horizon in the view direction
-    const cam = (frame && frame.camera) || camera;
-    if (cam) {
-      cam.getWorldDirection(_fwd);
-      const l = Math.hypot(_fwd.x, _fwd.z);
-      const cs = l > 1e-4 ? (_fwd.x * fogSunXZ.x + _fwd.z * fogSunXZ.y) / l : 0;
-      if (cs > 0.7071) _c.copy(fogDisp.mid).lerp(fogDisp.sun, smoothstep(0.7071, 1, cs));
-      else if (cs > 0) _c.copy(fogDisp.side).lerp(fogDisp.mid, smoothstep(0, 0.7071, cs));
-      else _c.copy(fogDisp.side).lerp(fogDisp.away, -cs);
-      horizonColor.copy(_c);
-      fog.color.copy(_c);
-    }
+    // (fog.color / horizonColor: world-fixed, set with the time of day; the far scenery fogs per fragment)
   }
 
   // ---------------- queries ----------------
@@ -655,6 +664,8 @@ export function createEnvironment(ctx) {
     sunIntensity: SUN_E0,
     skyColor,
     horizonColor,
+    // extra: the directional fog uniforms ({ uFogSunDir, uFogSun, uFogMid, uFogSide, uFogAway }, shared by reference)
+    fogUniforms,
     envMap: null,
     windStrength: 0.25,
     windDirection,

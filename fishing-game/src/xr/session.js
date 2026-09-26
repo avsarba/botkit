@@ -7,6 +7,11 @@
 //  - The session ends from exit(), the headset's system UI or a lost device: three.js' own 'sessionend' (dispatched
 //    after it restored the canvas size / pixel ratio) runs onEnd, once, and every listener this module added is removed,
 //    so entering and leaving can repeat without leaks.
+//  - A session that three.js cannot start (it ended during the start-up, a reference space refused, a layer that
+//    could not be made) leaves nothing behind: the drawing buffer's size / pixel ratio come back, `session` is cleared
+//    so Enter VR works again, and onStartFailed lets the game resize once.
+import { Vector2 } from 'three';
+
 export const XR_REQUIRED_FEATURES = ['local-floor'];
 export const XR_OPTIONAL_FEATURES = ['bounded-floor', 'hand-tracking', 'layers'];
 export const LOCAL_STANDING_HEIGHT_M = 1.6;
@@ -34,10 +39,11 @@ export function detectXR() {
   }
 }
 
-export function createXRSession({ renderer, onStart, onEnd, onVisibility, onReset, onAvailability }) {
+export function createXRSession({ renderer, onStart, onEnd, onVisibility, onReset, onAvailability, onStartFailed }) {
   let session = null; // the live session (from requestSession until its end)
   let started = false; // onStart ran for `session`
-  let starting = false;
+  let starting = false; // enter() is in progress (the request may still be pending: a permission prompt)
+  let granted = false; // the browser granted the session; three.js is starting it (it noted the size / pixel ratio)
   let referenceSpaceType = null;
   let available = false;
   let detectP = null;
@@ -104,6 +110,7 @@ export function createXRSession({ renderer, onStart, onEnd, onVisibility, onRese
     }
     refSpace = null;
     session = null;
+    granted = false;
     const was = started;
     started = false;
     if (was) call(onEnd);
@@ -137,14 +144,36 @@ export function createXRSession({ renderer, onStart, onEnd, onVisibility, onRese
       )
       .then(async ({ s, type }) => {
         session = s;
+        granted = true;
         referenceSpaceType = type;
         renderer.xr.setReferenceSpaceType(type);
         if (Number.isFinite(opts.framebufferScale)) renderer.xr.setFramebufferScaleFactor(opts.framebufferScale);
         if (Number.isFinite(opts.foveation)) renderer.xr.setFoveation(opts.foveation);
+        // three.js changes the pixel ratio / size as it starts the session and restores them in its own session-end
+        // handler, which cannot run (it throws) if the session ends before three has finished starting it
+        const pr = renderer.getPixelRatio();
+        const sz = renderer.getSize(new Vector2());
         try {
           await renderer.xr.setSession(s);
         } catch (err) {
-          // e.g. the reference space was refused after all: end what was started and give up
+          // e.g. the session ended during the start-up, or the reference space was refused after all: nothing of
+          // it stays behind, and Enter VR works again
+          if (session === s) {
+            session = null;
+            referenceSpaceType = null;
+            started = false;
+          }
+          granted = false;
+          try {
+            if (!renderer.xr.isPresenting) {
+              if (renderer.getPixelRatio() !== pr) renderer.setPixelRatio(pr);
+              const now = renderer.getSize(new Vector2());
+              if (now.x !== sz.x || now.y !== sz.y) renderer.setSize(sz.x, sz.y, false);
+            }
+          } catch {
+            /* ignore */
+          }
+          call(onStartFailed);
           try {
             await s.end();
           } catch {
@@ -152,7 +181,10 @@ export function createXRSession({ renderer, onStart, onEnd, onVisibility, onRese
           }
           throw err;
         }
-        if (session !== s) return false; // ended while it was starting
+        if (session !== s) {
+          granted = false;
+          return false; // ended while it was starting
+        }
         s.addEventListener('visibilitychange', onSessionVisibility);
         refSpace = renderer.xr.getReferenceSpace();
         if (refSpace && typeof refSpace.addEventListener === 'function') refSpace.addEventListener('reset', onRefReset);
@@ -209,6 +241,10 @@ export function createXRSession({ renderer, onStart, onEnd, onVisibility, onRese
     },
     get starting() {
       return starting;
+    },
+    // granted and being started by three.js, not yet presenting (the page may blur / hide as the headset takes over)
+    get settingUp() {
+      return granted && !started;
     },
     get session() {
       return session;

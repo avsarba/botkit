@@ -420,7 +420,11 @@ export function createSkySystem({ quality, cloudNoise }) {
   sky.material.fragmentShader = frag;
   sky.material.needsUpdate = true;
   followCamera(sky);
-  sky.renderOrder = -100;
+  // Drawn AFTER the opaque scenery (terrain, forest, dock, lake bed; all at renderOrder 0), not first: the dome sits on
+  // the far plane (three's Sky vertex shader puts z = w) with the depth test on, so early-Z rejects every pixel the
+  // scenery already covers and the full sky shader only runs where the sky shows (in VR: both eyes, every frame).
+  // Stars, moon and clouds are transparent and draw after all opaques whatever their order.
+  sky.renderOrder = 5;
   group.add(sky);
 
   // A second dome that shares the material, for the environment-map bake (origin-centred).

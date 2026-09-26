@@ -1,6 +1,7 @@
 // VR menu (pause): the DOM pause menu's look (glass panel, stencil "Paused", uppercase labels, segmented
 // buttons, the hi-vis primary button) with what a player needs inside the headset: Resume, the lure
-// picker (the same painted lure icons), time presets, sound, units, rod hand, the journal and Exit VR.
+// picker (the same painted lure icons), time presets, sound, units, rod hand, the journal and Exit VR, and the
+// controls (the DOM's pause-menu Controls section for the controllers, naming the hands; it follows the rod hand).
 // Everything is a big ray target (>= 5 cm tall at ~1 m).
 import { LURES, formatClock } from '../../config.js';
 import { LURE_ICONS } from '../../ui/icons.js';
@@ -9,7 +10,7 @@ import { createPanel } from './panel.js';
 import { setFont, text, box, wrap } from './draw.js';
 
 const W = 1024;
-const H = 900;
+const H = 1090;
 const WIDTH_M = 0.74; // at ~1 m: ~1380 px / m is about one headset pixel per canvas pixel
 const PAD = 48;
 const LABEL_W = 176;
@@ -179,10 +180,43 @@ export function createMenu(tk, act) {
       panel.addButton({ id: 'resume', x: rx, y: y0, w: rw, h, press: act.resume });
       y = y0 + h;
     }
+    // ---- controls (the XR.md input table, for the hands as set up now)
+    {
+      const rodS = v.rodHand === 'left' ? 'Left' : 'Right';
+      const reelS = v.rodHand === 'left' ? 'Right' : 'Left';
+      const keep = v.rodHand === 'left' ? 'X keeps · Y lets go' : 'A keeps · B lets go';
+      const strike = v.rodHand === 'left' ? 'X' : 'A';
+      const lures = v.rodHand === 'left' ? 'A / B' : 'X / Y';
+      const rows = [
+        ['CAST', `${rodS} trigger: hold, swing, let go`],
+        ['REEL', `${reelS} trigger, or turn the reel`],
+        ['STRIKE', `Sweep the rod up, or ${strike}`],
+        ['DRAG', `${rodS} stick up / down`],
+        ['TURN', `${rodS} stick left / right`],
+        ['LURE', `${lures} (line in)`],
+        ['MENU', `${reelS} stick click`],
+        ['CATCH', keep],
+      ];
+      y += 30;
+      setFont(ctx, 600, 22, F.ui, { spacing: 0.14 });
+      text(ctx, 'CONTROLS', PAD, y + 8, { color: c.muted, baseline: 'middle' });
+      y += 30;
+      const colW2 = (W - 2 * PAD - 28) / 2;
+      const lh = 34;
+      rows.forEach(([k, val], i) => {
+        const x = PAD + (i % 2) * (colW2 + 28);
+        const yy = y + Math.floor(i / 2) * lh + 16;
+        setFont(ctx, 600, 19, F.ui, { spacing: 0.12 });
+        text(ctx, k, x, yy, { color: c['text-soft'], baseline: 'middle', maxWidth: 150 });
+        setFont(ctx, 500, 21, F.ui);
+        text(ctx, val, x + 158, yy, { color: c.text, baseline: 'middle', maxWidth: colW2 - 162 });
+      });
+      y += Math.ceil(rows.length / 2) * lh;
+    }
     setFont(ctx, 500, 19, F.mono);
     const hint = 'Point a controller at a button and pull the trigger';
-    text(ctx, hint, W / 2, y + 40, { color: c.muted, align: 'center', maxWidth: W - 2 * PAD });
-    return Math.min(H, y + 66);
+    text(ctx, hint, W / 2, y + 30, { color: c.muted, align: 'center', maxWidth: W - 2 * PAD });
+    return Math.min(H, y + 56);
   }
 
   const panel = createPanel({ name: 'xr-menu', widthM: WIDTH_M, heightM: (WIDTH_M * H) / W, pxW: W, pxH: H, draw, interactive: true });

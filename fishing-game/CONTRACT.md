@@ -125,7 +125,8 @@ terrain (land + lake bed), and time of day. Returns:
                                  // than once per 2 real seconds.
   sunDirection,                  // THREE.Vector3 (unit, toward the sun), updated in place
   sunColor, sunIntensity,        // THREE.Color (live), number
-  skyColor, horizonColor,        // THREE.Color (live); horizonColor == fog color
+  skyColor, horizonColor,        // THREE.Color (live); horizonColor == fog color (world-fixed: the horizon out over
+                                 // the lake; far surfaces fog per fragment with the directional env.fogUniforms)
   envMap,                        // THREE.Texture | null (PMREM of the sky), property may be replaced; read it each frame
   windStrength,                  // 0..1 (live), gentle breeze by default (~0.25)
   windDirection,                 // THREE.Vector2 unit (live)
@@ -436,7 +437,7 @@ window.__game = {
     landNow(),                                // skip to CAUGHT with the hooked fish
     stats(),                                  // { fps, drawCalls, triangles, geometries, textures, state, hours,
                                               //   lineOutM, tensionN, lure: {...}, hooked: {...} | null }
-    // extras for scenarios: setTimeScale(k), setPixelRatio(p), setAutoQuality(on), setRod(side, lift),
+    // extras for scenarios: setTimeScale(k), setFixedDt(s), setPixelRatio(p), setAutoQuality(on), setRod(side, lift),
     // slack(m), pause(p), action(down), keep(), release(), events(since), records(), fight, modules(), render()
     xr: { available(), enter(), exit(), status(), ... },   // VR: see XR.md "Debug hooks and testing"
   }
@@ -449,11 +450,19 @@ window.__game = {
 - UI: `setXRAvailable(bool)` (the Enter VR buttons), `setXRPresenting(bool)` (the page UI hidden and inert behind the
   headset, with a short note).
 - Tackle: `setXRMode(on, { rodGrip, reelGrip, rodHand })`, `cast(power01, direction, { pitchRad })`,
-  `predictLanding(power01, direction, target, { pitchRad })`, `getRodBase(target)`, `getReelHandle(target)`, `xrMode`.
+  `predictLanding(power01, direction, target, { pitchRad })`, `getRodBase(target)`, `getReelHandle(target)`,
+  `xrTeleported()` (the rig jumped: snap turn / recenter), `xrHold()` (the game is halted while presenting: the line
+  stays on the hand-held tip, no physics), `xrMode`.
 - Showcase: `setXR(on, { holdGrip })` (the landed fish held in the reel hand), `xr`.
-- Environment: `skylineOccluderAt(azimuth, out)` (the water's far-shore band in VR).
-- Quality manager: `enterXR(level)`, `setXRLevel(q)`, `exitXR()`, `inXR`; `createXRAdaptive(...)`.
+- Environment: `skylineOccluderAt(azimuth, out)` (the water's far-shore band in VR); `fogUniforms` ({ uFogSunDir,
+  uFogSun, uFogMid, uFogSide, uFogAway }: the terrain's directional fog, shared by reference with the scenery's patched
+  materials and the water, so nothing far is fogged by the view direction).
+- Quality manager: `enterXR(level)`, `setXRLevel(q)`, `exitXR()`, `inXR`; `createXRAdaptive(...)`. `deviceQuality()` is
+  'low' on a standalone headset.
+- Fight model: `frameTensionN` (the mean over a frame's 120 Hz substeps, which take the rod tip interpolated across the
+  frame): `frame.tensionN`, the rod bend and VR haptics use it, smooth at any frame rate; slip and snap act per substep.
 - `TACKLE.reelTurnsPerS` (config.js): handle turns per second at full retrieve (the reel animation and the VR crank).
+  `XR_ROD_TILT_RAD` (config.js): the rod's tilt above the controller grip's forward axis in VR (0).
 
 ## Testing
 

@@ -9,7 +9,9 @@ import { createPanel } from './panel.js';
 import { setFont, text, box, dot, textWidth } from './draw.js';
 
 const W = 780;
-const H = 540; // 6 px per mm
+const H = 540; // layout units: 6 per mm
+const PX_SCALE = 0.5; // the canvas: 390 x 270 (3 px per mm, still ~2x what a headset's eye buffer resolves at ~40 cm)
+const REDRAW_MS = 100; // <= 10 Hz: the dial changes every frame in a fight
 const AMBER_UP = 0.7;
 const AMBER_DOWN = 0.66;
 const RED_DOWN = 0.85;
@@ -25,9 +27,11 @@ const DEG = Math.PI / 180;
 // +Y up, as the Touch / most controllers tilt the grip ~45 degrees from the ray); the gauge then sits on
 // top of the wrist behind the hand, its face up and tilted back toward the eyes, rolled a little toward
 // the back of the hand. Distances in meters.
+// It sits back along the forearm (toward the elbow), not on the back of the hand: with the reel hand on the reel
+// handle the rod's handle and the rod glove run right over the hand, and would hide the gauge's right half.
 const ALIGN_X = -45 * DEG;
-const POS = { x: 0.012, y: 0.042, z: 0.118 }; // x is toward the back of the hand (mirrored per hand)
-const TILT_X = -52 * DEG; // -90 = face straight up; less tilts the face back toward the eyes
+const POS = { x: 0.014, y: 0.032, z: 0.19 }; // x is toward the back of the hand (mirrored per hand)
+const TILT_X = -56 * DEG; // -90 = face straight up; less tilts the face back toward the eyes
 const ROLL_Z = 16 * DEG; // toward the back of the hand
 
 const forceIn = (n, units) => (units === 'metric' ? n / G : n / (G * KG_PER_LB));
@@ -180,7 +184,7 @@ export function createWristGauge(tk) {
     // value in the middle
     const valueColor = v.level === 2 ? c.red : v.level === 1 || v.pulse > 0.01 || v.slack ? c.amber : c.text;
     setFont(ctx, 500, 70, F.mono);
-    text(ctx, (Math.round(forceIn(v.tensionN, v.units) * 10) / 10).toFixed(1), cx, cy + 4, { color: valueColor, align: 'center', baseline: 'alphabetic' });
+    text(ctx, (Math.round(forceIn(v.tensionN, v.units) * 2) / 2).toFixed(1), cx, cy + 4, { color: valueColor, align: 'center', baseline: 'alphabetic' });
     setFont(ctx, 600, 22, F.ui, { spacing: 0.14 });
     text(ctx, metric ? 'KG' : 'LB', cx, cy + 40, { color: c.muted, align: 'center' });
 
@@ -216,7 +220,7 @@ export function createWristGauge(tk) {
     return H;
   }
 
-  const panel = createPanel({ name: 'xr-wrist', widthM: 0.13, heightM: 0.09, pxW: W, pxH: H, draw });
+  const panel = createPanel({ name: 'xr-wrist', widthM: 0.13, heightM: 0.09, pxW: W, pxH: H, draw, pxScale: PX_SCALE, minMs: REDRAW_MS });
   mount.add(panel.object);
 
   function setHand(reelHand) {
@@ -261,9 +265,11 @@ export function createWristGauge(tk) {
       }
       i++;
     };
+    // (the tension readout to half a pound / kilo and the needle to 1 % of line test: what this 13 cm dial resolves,
+    // so a fight redraws when the reading moves, not on every wobble of the line)
     put(metric ? 1 : 0);
-    put(Math.round(forceIn(v.tensionN, units) * 10));
-    put(Math.round(clamp(v.t01, 0, 1) * 400));
+    put(Math.round(forceIn(v.tensionN, units) * 2));
+    put(Math.round(clamp(v.t01, 0, 1) * 100));
     put(v.level);
     put(Math.round(forceIn(v.dragN, units) * 10));
     put(Math.round(clamp(v.dragN / TACKLE.lineBreakN, 0, 1) * 400));

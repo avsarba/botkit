@@ -127,16 +127,22 @@ export function createHand({ quality = 'high', arm = true, materials = null } = 
   if (!arm) {
     // gloved wrist + cuff (rod-local direction toward the elbow when the rod sits in a VR controller grip)
     // (between a forearm in line with the controller's ray and one held level at the nominal rod pose)
+    // The cuff's end closes in a rounded dome of glove (no flat disc facing the eyes when the reel hand holds a fish
+    // up): the last quarter of its length tapers to a point along a quarter circle (radial normals: it shades like
+    // the sleeve, not like a lit disc).
     const d = new THREE.Vector3(0.12, -0.75, 0.65).normalize();
     const p0 = new THREE.Vector3(0.024, -0.034, 0.005);
     const pts = [];
-    for (let i = 0; i <= 6; i++) pts.push(p0.clone().addScaledVector(d, 0.072 * (i / 6)));
+    const N = 14;
+    for (let i = 0; i <= N; i++) pts.push(p0.clone().addScaledVector(d, 0.086 * (i / N)));
     parts.push({
       geometry: sweepTube(
         pts,
         (i, t) => {
-          const cuff = smoothstep(0.6, 0.8, t);
-          return 0.0228 + 0.003 * t + 0.0035 * cuff;
+          const cuff = smoothstep(0.5, 0.66, t);
+          const r = 0.0228 + 0.003 * t + 0.0035 * cuff;
+          const e = Math.max(0, (t - 0.75) / 0.25);
+          return r * Math.sqrt(Math.max(0.004, 1 - e * e));
         },
         radial + 2,
         { capStart: true, capEnd: true }

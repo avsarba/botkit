@@ -26,9 +26,14 @@ import { createRays } from './panels/rays.js';
 
 const DEG = Math.PI / 180;
 const PRESS_MS = 140;
-const CARD_SIDE_M = 0.24; // catch card centre beside the reel hand
+const CARD_SIDE_M = 0.18; // catch card centre beside the reel hand, on its outer side (away from the rod hand)
 const CARD_MIN_M = 0.62; // ... and this far from the eyes at least
 const CARD_MAX_M = 0.9;
+const CARD_ROD_MARGIN_M = 0.03; // the rod (seen from the eyes) keeps this clear of the card's edge
+const CARD_ROD_SHIFT_MAX_M = 0.45;
+const ROD_BUTT_M = -0.375; // reel seat -> butt (rod-local), and -> tip-top
+const ROD_TIP_M = 1.755;
+const PANEL_ANISOTROPY = 4;
 const PROMPT_KINDS = new Set(['info', 'ready', 'good', 'warn', 'danger']);
 const LURE_BY_ID = Object.freeze(Object.fromEntries(LURES.map((l) => [l.id, l])));
 const normKind = (k) => (k === 'bad' ? 'danger' : k === 'warning' ? 'warn' : PROMPT_KINDS.has(k) ? k : 'info');
@@ -105,6 +110,8 @@ export function createXRHud(ctx = {}) {
   };
   let refs = {};
   let lastHud = null;
+  let lastXin = null; // this frame's controller snapshot (the rod's pose keeps the catch card clear of it)
+  let compiled = false; // panel / ray shader programs compiled (once, when the HUD first goes up)
   let lastNow = 0;
   let built = null;
   let rewrites = vrRewrites('Left trigger');
@@ -121,6 +128,11 @@ export function createXRHud(ctx = {}) {
   const tmp = new THREE.Vector3();
   const cardPos = new THREE.Vector3();
   const cardTarget = new THREE.Vector3();
+  const cardN = new THREE.Vector3();
+  const cardR = new THREE.Vector3();
+  const cardU = new THREE.Vector3();
+  const rodP = new THREE.Vector3();
+  const rodD = new THREE.Vector3();
   let headYaw = 0;
   let headPitch = 0;
   let cardSnap = true;
@@ -208,6 +220,15 @@ export function createXRHud(ctx = {}) {
       interactive: [menu.panel, journal.panel, card.panel],
       panels: [wrist.panel, ...strip.panels, card.panel, menu.panel, journal.panel],
     };
+    // the panels are minified 2-4x in a headset's eye buffer: mipmaps (panel.js) plus a little anisotropy for the
+    // tilted wrist gauge keep thin strokes and small text from crawling as the head and hands move
+    let aniso = 1;
+    try {
+      aniso = renderer && renderer.capabilities && typeof renderer.capabilities.getMaxAnisotropy === 'function' ? renderer.capabilities.getMaxAnisotropy() : 1;
+    } catch {
+      aniso = 1;
+    }
+    for (const p of built.panels) p.texture.anisotropy = Math.max(1, Math.min(PANEL_ANISOTROPY, aniso || 1));
     return built;
   }
 
@@ -244,6 +265,19 @@ export function createXRHud(ctx = {}) {
     b.wrist.setHand(otherHand(cur.rodHand));
     b.rays.attach(refs.rodRay, refs.reelRay);
     if (typeof r.rodHand === 'string') setRodHandLocal(r.rodHand);
+    // compile the panel and ray programs now (entering VR is a transition anyway), not on the frame a panel or the
+    // rays first show (three.js compiles on first draw, synchronously: a stall in the headset)
+    if (!compiled && renderer && typeof renderer.compile === 'function' && camera) {
+      compiled = true;
+      const target = scene || parent;
+      try {
+        renderer.compile(b.root, camera, target);
+        renderer.compile(b.wrist.mount, camera, target);
+        if (refs.rodRay && refs.rodRay.isObject3D) renderer.compile(refs.rodRay, camera, target);
+      } catch (err) {
+        console.warn('[xr-hud] panel shader warm-up failed', err);
+      }
+    }
     if (!cur.active) {
       b.strip.reset();
       cur.lastPaused = null;
@@ -319,18 +353,19 @@ export function createXRHud(ctx = {}) {
   };
   function vrPrompt(state, h) {
     const reelT = cur.rodHand === 'left' ? 'Right trigger' : 'Left trigger';
+    const rodT = cur.rodHand === 'left' ? 'left trigger' : 'right trigger';
     const L = LURE_BY_ID[h.lureId || cur.lureId];
     switch (state) {
       case STATES.READY:
-        return say('Hold the trigger, swing the rod forward and let go to cast', 'ready');
+        return say(`Hold the ${rodT}, swing the rod forward and let go to cast`, 'ready');
       case STATES.CHARGING:
-        return say('Swing forward and let go of the trigger', 'ready');
+        return say(`Swing forward and let go of the ${rodT}`, 'ready');
       case STATES.WAITING:
-        if (!L || L.kind === 'bait') return say('Watch the float · sweep the rod up when it goes under', 'info');
+        if (!L || L.kind === 'bait') return say(`Watch the float · sweep the rod up when it goes under · ${reelT.toLowerCase()} reels in`, 'info');
         if (L.id === 'topwater') return say(`${reelT} in short bursts to walk it · pause now and then`, 'info');
         return say(`${reelT} to reel · light pressure for a slow retrieve`, 'info');
       case STATES.STRIKE:
-        return say('Sweep the rod up to set the hook', 'danger');
+        return say('Strike! Sweep the rod up', 'danger');
       case STATES.FIGHTING: {
         const lvl = built ? built.wrist.level : 0;
         if (lvl === 2) return say('Too much tension! Stop reeling · thumbstick down loosens the drag', 'danger');
@@ -408,6 +443,7 @@ export function createXRHud(ctx = {}) {
       if (cur.journalOpen) b.journal.set(cur.records, cur.units);
     }
     if (xin && (xin.rodHand === 'left' || xin.rodHand === 'right')) setRodHandLocal(xin.rodHand);
+    lastXin = xin && xin.rod ? xin : null;
     // follow the game's pause (edges only, so a core that pauses some other way is never fought)
     if (typeof h.paused === 'boolean') {
       if (cur.lastPaused !== null && h.paused !== cur.lastPaused) {
@@ -429,7 +465,9 @@ export function createXRHud(ctx = {}) {
     b.strip.place(headPos, headYaw, dt);
     const p = promptFor(state, h);
     const kind = p.kind;
-    const text = b.strip.striking ? '' : p.text; // the strike cue carries the message
+    // (not blanked while the STRIKE cue flashes: looking down at the wrist or the reel, the cue can be out of view,
+    // and the strip still says what to do)
+    const text = p.text;
     const quietOk = (kind === 'info' || kind === 'good') && (state === STATES.WAITING || state === STATES.FIGHTING);
     b.strip.setPrompt(text, kind, { eligibleQuiet: quietOk, now, blink: kind === 'danger' && now % 500 >= 250 });
     b.strip.update(now, dt, !modal && playing, state !== STATES.TITLE); // toasts also confirm menu picks
@@ -483,9 +521,9 @@ export function createXRHud(ctx = {}) {
       hand = tmp.setFromMatrixPosition(grip.matrixWorld).applyMatrix4(invRoot);
     }
     if (hand) {
-      // beside the hand, toward the player's midline, and a little beyond it (so the hanging fish never
-      // pokes through the card, and the card never sits closer than ~0.6 m to the eyes)
-      const side = otherHand(cur.rodHand) === 'left' ? 1 : -1;
+      // beside the hand on its outer side (away from the rod hand, the reel and the rod), and a little beyond it
+      // (so the hanging fish never pokes through the card, and the card never sits closer than ~0.6 m to the eyes)
+      const side = otherHand(cur.rodHand) === 'left' ? -1 : 1;
       const rx = Math.cos(headYaw);
       const rz = -Math.sin(headYaw);
       cardTarget.set(hand.x + rx * side * CARD_SIDE_M, hand.y - 0.02, hand.z + rz * side * CARD_SIDE_M);
@@ -494,6 +532,7 @@ export function createXRHud(ctx = {}) {
       const want = Math.min(CARD_MAX_M, Math.max(CARD_MIN_M, d + 0.12));
       cardTarget.copy(headPos).addScaledVector(tmp, want / d);
       cardTarget.y = Math.min(cardTarget.y, headPos.y - 0.06); // not above eye level
+      keepCardClearOfRod();
     } else {
       // no tracked hand: in front of the player, a little to the reel-hand side
       const fx = -Math.sin(headYaw);
@@ -507,6 +546,47 @@ export function createXRHud(ctx = {}) {
     } else cardPos.lerp(cardTarget, 1 - Math.exp(-7 * Math.min(dt, 0.1)));
     obj.position.copy(cardPos);
     faceHead(obj);
+  }
+
+  // The rod held out in front (seen from the eyes) must not cross the card: slide the card away from the rod hand's
+  // side until the rod clears its edge. (Panels keep their depth test: a panel drawn over the player's own nearer
+  // hand or rod would give conflicting stereo depth cues.)
+  function keepCardClearOfRod() {
+    const x = lastXin;
+    if (!x || !x.rod || !x.rod.connected || !built) return;
+    const P = built.card.panel;
+    const w2 = P.widthM / 2 + CARD_ROD_MARGIN_M;
+    const h2 = P.heightUsedM / 2 + CARD_ROD_MARGIN_M;
+    const sigma = cur.rodHand === 'left' ? -1 : 1; // the rod is on this side (card-right, as the viewer sees it)
+    for (let pass = 0; pass < 2; pass++) {
+      cardN.subVectors(headPos, cardTarget);
+      const dist = cardN.length();
+      if (dist < 1e-4) return;
+      cardN.multiplyScalar(1 / dist);
+      cardR.set(cardN.z, 0, -cardN.x); // up x n
+      if (cardR.lengthSq() < 1e-8) return;
+      cardR.normalize();
+      cardU.crossVectors(cardN, cardR);
+      rodD.copy(x.rod.dir).transformDirection(invRoot);
+      let shift = 0;
+      for (let i = 0; i <= 24; i++) {
+        const sM = ROD_BUTT_M + ((ROD_TIP_M - ROD_BUTT_M) * i) / 24;
+        rodP.copy(x.rod.base).applyMatrix4(invRoot).addScaledVector(rodD, sM);
+        // the eye -> rod point ray, extended to the card plane: only points between the eye and the card hide it
+        tmp.subVectors(rodP, headPos);
+        const dn = tmp.dot(cardN);
+        if (dn > -1e-4) continue;
+        const t = -dist / dn;
+        if (t <= 1) continue;
+        tmp.multiplyScalar(t).add(headPos).sub(cardTarget);
+        const cx = tmp.dot(cardR);
+        const cy = tmp.dot(cardU);
+        if (Math.abs(cy) > h2 || Math.abs(cx) > w2) continue;
+        shift = Math.max(shift, w2 - sigma * cx);
+      }
+      if (shift <= 1e-4) return;
+      cardTarget.addScaledVector(cardR, -sigma * Math.min(shift, CARD_ROD_SHIFT_MAX_M));
+    }
   }
 
   function updateHover(hits) {
@@ -692,7 +772,7 @@ export function createXRHud(ctx = {}) {
     const key = cur.rodHand === 'left' ? 'X' : 'A';
     const sub = opts && opts.reelSet ? 'Keep reeling!' : `Sweep the rod up · or press ${key}`;
     readHead();
-    built.strip.strikeCue(sub, headPos, headYaw, clock());
+    built.strip.strikeCue(sub, headPos, headYaw, clock(), headPitch);
   }
   function toast(text, kind = 'info', ms) {
     if (!cur.active || !built || !text) return;

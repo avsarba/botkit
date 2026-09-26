@@ -43,8 +43,13 @@ const STORE_CEIL_MAX_AGE_MS = 3 * 24 * 3600 * 1000;
 const STORE_KEY = 'loonlake.quality.v1';
 const STORE_MAX_AGE_MS = 21 * 24 * 3600 * 1000;
 
-// The level a device starts at without history: phones and small tablets medium, the rest high.
+// The level a device starts at without history: phones and small tablets medium, the rest high. A standalone VR
+// headset (Quest, Pico) builds the lake at 'low': its headset profile is always 'low' and the runtime switch only thins
+// what can be thinned (the forest detail, terrain rings, cloud slices, PMREM size, fish variants and shadow casters are
+// fixed when the lake is built), and the 2D page on the same mobile GPU is better at 'low' too. A level picked by
+// hand still wins (main.js pickInitialQuality), and the auto ceiling there stays at 'low'.
 export function deviceQuality() {
+  if (isStandaloneHeadset()) return 'low';
   let coarse = false;
   try {
     coarse = window.matchMedia('(pointer: coarse)').matches;
@@ -527,8 +532,11 @@ const XR_FLAP_S = 20; // a level-up that is slow this soon is undone and not ret
 const XR_LOCK_S = 120;
 
 // Adaptive quality inside a VR session: slow frames first raise fixed foveation to 1, then step the scene level down
-// (at a calm moment, like the desktop manager); sustained headroom climbs back up to the profile, never above it.
-export function createXRAdaptive({ qm, renderer, getFrameRate }) {
+// (at a calm moment, like the desktop manager), then, with nothing left to shed, the display rate (the lowest one
+// the session supports at or above 72 Hz); sustained headroom climbs back the same way, never above the profile
+// (and never above the rate the session started at, setBaseRate).
+const XR_MIN_HZ = 72;
+export function createXRAdaptive({ qm, renderer, getFrameRate, getFrameRates = null, setFrameRate = null }) {
   let profile = 'medium';
   let foveation = XR_PROFILES.medium.foveation;
   let framebufferScale = XR_PROFILES.medium.framebufferScale;
@@ -543,6 +551,7 @@ export function createXRAdaptive({ qm, renderer, getFrameRate }) {
   let lastDownAt = -1e9;
   let lastUpAt = -1e9;
   let lockUntil = -1;
+  let baseRate = 0; // the display rate the session runs at by choice (0: not set)
   let pending = null; // level waiting for a calm moment
   const calm = () => {
     try {
@@ -571,6 +580,7 @@ export function createXRAdaptive({ qm, renderer, getFrameRate }) {
     pending = null;
     lastDownAt = lastUpAt = -1e9;
     lockUntil = -1;
+    baseRate = 0;
     return { level: profile, framebufferScale, foveation };
   }
   function stop() {
@@ -579,6 +589,22 @@ export function createXRAdaptive({ qm, renderer, getFrameRate }) {
   }
 
   const LV = ['high', 'medium', 'low'];
+  const rates = () => {
+    try {
+      return typeof getFrameRates === 'function' ? (getFrameRates() || []).filter((r) => Number.isFinite(r) && r >= XR_MIN_HZ - 0.5) : [];
+    } catch {
+      return [];
+    }
+  };
+  const nowRate = () => getFrameRate() || XR_MIN_HZ;
+  function setRate(hz) {
+    if (typeof setFrameRate !== 'function') return false;
+    try {
+      return setFrameRate(hz) !== false;
+    } catch {
+      return false;
+    }
+  }
   function stepDown() {
     if (foveation < 1 - 1e-3) {
       setFov(1);
@@ -589,9 +615,19 @@ export function createXRAdaptive({ qm, renderer, getFrameRate }) {
       pending = LV[i + 1];
       return true;
     }
+    // the floor: a lower display rate (never under 72 Hz)
+    const cur = nowRate();
+    const lower = rates().filter((r) => r < cur - 0.5);
+    if (lower.length && setRate(Math.max(...lower))) return true;
     return false;
   }
   function stepUp() {
+    // undo the last thing shed first: the display rate, back toward the one the session started at
+    if (baseRate > 0 && !(lockUntil > clock)) {
+      const cur = nowRate();
+      const higher = rates().filter((r) => r > cur + 0.5 && r <= baseRate + 0.5);
+      if (higher.length && setRate(Math.min(...higher))) return true;
+    }
     const i = LV.indexOf(qm.quality);
     const pi = LV.indexOf(profile);
     if (i > pi && !(lockUntil > clock)) {
@@ -655,8 +691,12 @@ export function createXRAdaptive({ qm, renderer, getFrameRate }) {
     start,
     stop,
     sample,
+    // the display rate the session runs at by choice (the 72 Hz asked for on 'low', else the session's own)
+    setBaseRate(hz) {
+      baseRate = Number.isFinite(hz) && hz > 0 ? hz : 0;
+    },
     get status() {
-      return { profile, level: qm.quality, framebufferScale, foveation, fps: Math.round(fps * 10) / 10, targetFps: getFrameRate(), pending, auto: qm.auto };
+      return { profile, level: qm.quality, framebufferScale, foveation, fps: Math.round(fps * 10) / 10, targetFps: getFrameRate(), baseFps: baseRate || null, pending, auto: qm.auto };
     },
     get profile() {
       return profile;

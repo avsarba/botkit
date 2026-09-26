@@ -17,6 +17,13 @@
 //    with the rod pointed at a pulling fish gains less;
 //  - side pressure against a lateral run and a high rod tire the fish faster.
 // Slack line plus head shakes can throw the hook.
+//
+// The rod tip (and direction) come in once per rendered frame while the model runs 120 Hz substeps: each substep
+// takes them interpolated (by its time within the frame) between last frame's values and this frame's, so the
+// stretch rate (the damping term) stays continuous at any frame rate (at 72 / 90 Hz a frame holds 1 or 2 substeps,
+// and a whole frame's tip move in one substep read as a spike every third frame).
+// The tension reported for the frame (frameTensionN: the HUD, the rod bend, VR haptics) is the mean over its
+// substeps; slip and snap still act on every substep's own value.
 import * as THREE from 'three';
 import { TACKLE, G, clamp, smoothstep, makeRng } from '../config.js';
 
@@ -78,6 +85,8 @@ const HOOK_WEAR = Object.freeze({
 
 const _d = new THREE.Vector3();
 const _pull = new THREE.Vector3();
+const _tipK = new THREE.Vector3();
+const _dirK = new THREE.Vector3();
 
 export function createFightModel(opts = {}) {
   const rng = makeRng(opts.seed ?? ((Math.random() * 1e9) | 0));
@@ -107,8 +116,14 @@ export function createFightModel(opts = {}) {
     twist: 0, // metres of line cranked against a slipping drag (line twist)
     breakN: TACKLE.lineBreakN, // current break strength (line twist lowers it)
     hookHold: 1, // 1 = well set; head shakes on a stiff rod wear it down, 0 = the hook pulls out
+    frameTensionN: 0, // mean tension over the last frame's substeps (what the HUD / rod / haptics show)
     lastOut: null, // the last outcome, for tests
   };
+  // last frame's rod tip / direction (the substeps interpolate from them to this frame's)
+  const prevTip = new THREE.Vector3();
+  const prevDir = new THREE.Vector3(0, 0.7, -0.7);
+  let hasPrevRod = false;
+  const subInp = { hooked: null, rodTip: _tipK, rodDir: _dirK, dragN: 0, reeling: false, reelMps: 0, rodSide: 0, rodLift01: 0.4, rightX: 1, rightZ: 0 };
   const stepInput = { tensionN: 0, pullDir: _pull, rodTip: new THREE.Vector3(), lineOutM: 10 };
 
   let wear = 1;
@@ -137,12 +152,17 @@ export function createFightModel(opts = {}) {
     s.twist = 0;
     s.breakN = TACKLE.lineBreakN;
     s.hookHold = FIGHT.holdMin + (1 - FIGHT.holdMin) * rng();
+    s.frameTensionN = 0;
     s.lastOut = null;
+    prevTip.copy(rodTip);
+    hasPrevRod = false;
   }
 
   function end() {
     s.active = false;
     s.tensionN = 0;
+    s.frameTensionN = 0;
+    hasPrevRod = false;
     s.slipMps = 0;
     s.slipping = false;
     s.exposed01 = 0;
@@ -282,17 +302,42 @@ export function createFightModel(opts = {}) {
     s.prevLift = lift;
     s.acc += dt;
     const step = 1 / FIGHT.hz;
-    let guard = 0;
-    while (s.acc >= step && guard++ < 64) {
+    // this frame's substeps: the rod tip / direction move from last frame's values to this frame's across them
+    let n = 0;
+    for (let acc = s.acc; acc >= step && n < 64; acc -= step) n++;
+    if (!hasPrevRod) {
+      prevTip.copy(inp.rodTip);
+      prevDir.copy(inp.rodDir);
+      hasPrevRod = true;
+    }
+    Object.assign(subInp, inp);
+    subInp.rodTip = _tipK;
+    subInp.rodDir = _dirK;
+    let sumT = 0;
+    let k = 0;
+    let out = null;
+    while (k < n && s.acc >= step) {
       s.acc -= step;
-      const out = substep(step, inp);
+      // where this substep ends within the frame (by time: the accumulator's leftover is simulated time still owed,
+      // so a substep may end a little before the frame does, or in the previous frame's span: a < 0 extrapolates)
+      const a = dt > 1e-6 ? 1 - s.acc / dt : 1;
+      _tipK.lerpVectors(prevTip, inp.rodTip, a);
+      _dirK.lerpVectors(prevDir, inp.rodDir, a);
+      if (_dirK.lengthSq() > 1e-10) _dirK.normalize();
+      else _dirK.copy(inp.rodDir);
+      out = substep(step, subInp);
+      sumT += s.tensionN;
+      k++;
       if (out) {
         s.acc = 0;
         s.lastOut = out;
-        return out;
+        break;
       }
     }
-    return null;
+    if (k > 0) s.frameTensionN = sumT / k;
+    prevTip.copy(inp.rodTip);
+    prevDir.copy(inp.rodDir);
+    return out;
   }
 
   // Landing: short line, fish close to the dock and tired.
@@ -314,6 +359,10 @@ export function createFightModel(opts = {}) {
     },
     get tensionN() {
       return s.tensionN;
+    },
+    // the mean over the last frame's substeps (smooth at any frame rate): what the HUD, the rod bend and haptics show
+    get frameTensionN() {
+      return s.frameTensionN;
     },
     get lineOutM() {
       return s.lineOut;

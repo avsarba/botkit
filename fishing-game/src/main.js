@@ -158,7 +158,9 @@ async function boot(data = {}) {
   // ---- game core + UI first, so the title is interactive-looking and shows progress
   const save = loadSave();
   const quality = pickInitialQuality(save);
-  const game = createGame({ renderer, scene, camera, events, save, hotData: data || {}, quality, species: SPECIES });
+  // (fishProgramKeeper: VR keeps the held fish's shader programs compiled at the headset's level, see src/xr/index.js)
+  const fishProgramKeeper = typeof FishMesh.createFishProgramKeeper === 'function' ? (o) => FishMesh.createFishProgramKeeper(o) : null;
+  const game = createGame({ renderer, scene, camera, events, save, hotData: data || {}, quality, species: SPECIES, fishProgramKeeper });
   const ui = createUI({
     events,
     handlers: game.handlers,

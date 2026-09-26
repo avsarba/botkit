@@ -32,6 +32,36 @@ float sunLiftAt( vec3 wp, vec3 sunDirW ) {
 }
 `;
 
+// Directional fog (the terrain's): the fog / haze color from the azimuth of this fragment's own view ray relative to
+// the sun, blended between the sun / mid / side / away horizon colors (env.fogUniforms, shared by reference). Far
+// scenery keeps its color whichever way the head or the camera turns.
+const DIR_FOG_HEAD = /* glsl */ `
+uniform vec3 uFogSunDir;
+uniform vec3 uFogSun;
+uniform vec3 uFogMid;
+uniform vec3 uFogSide;
+uniform vec3 uFogAway;
+varying vec3 vFogRay;
+vec3 sceneryFogColor( vec3 ray ) {
+  vec2 fxz = ray.xz;
+  float fl = length( fxz );
+  float cs = fl > 1e-4 ? dot( fxz / fl, uFogSunDir.xz ) : 0.0;
+  vec3 c = cs > 0.0 ? mix( uFogSide, uFogMid, smoothstep( 0.0, 0.7071, cs ) ) : mix( uFogSide, uFogAway, -cs );
+  return cs > 0.7071 ? mix( uFogMid, uFogSun, smoothstep( 0.7071, 1.0, cs ) ) : c;
+}
+`;
+const DIR_FOG_FRAGMENT = /* glsl */ `
+vec3 dirFogC = sceneryFogColor( vFogRay );
+#ifdef USE_FOG
+  #ifdef FOG_EXP2
+    float fogFactor = 1.0 - exp( - fogDensity * fogDensity * vFogDepth * vFogDepth );
+  #else
+    float fogFactor = smoothstep( fogNear, fogFar, vFogDepth );
+  #endif
+  gl_FragColor.rgb = mix( gl_FragColor.rgb, dirFogC, fogFactor );
+#endif
+`;
+
 const f = (x) => (Number.isInteger(x) ? x.toFixed(1) : String(x));
 
 const NORMAL_BEGIN_NOFLIP = THREE.ShaderChunk.normal_fragment_begin.replace('normal *= faceDirection;', '');
@@ -49,12 +79,14 @@ const NORMAL_BEGIN_NOFLIP = THREE.ShaderChunk.normal_fragment_begin.replace('nor
 //   bump: glsl expr        height function of vSWorld -> perturbs the normal
 //   fragHeader: glsl       extra functions/uniforms for the fragment shader
 //   wrap: 0.2              normal-independent share of sunlight (foliage multiple scattering)
-//   haze: true             custom aerial perspective: mix toward uHazeColor by uHaze
+//   haze: true             custom aerial perspective: mix toward the directional fog color by uHaze
+// Every patched material fogs with the directional fog when `shared` carries env.fogUniforms (else three's own).
 //   sunLift: true          tall things (crowns, far hills) keep the low sun that the treeline
 //                          already hides from the dock: adds the missing direct + foliage light
 //   extraUniforms: {}      additional uniforms (shared by reference)
 export function patchMaterial(material, shared, opts = {}) {
-  const key = JSON.stringify(opts, (k, v) => (k === 'extraUniforms' ? Object.keys(v) : v));
+  const dirFog = !!(shared && shared.uFogSun && shared.uFogSunDir);
+  const key = JSON.stringify(opts, (k, v) => (k === 'extraUniforms' ? Object.keys(v) : v)) + (dirFog ? '|dirfog' : '');
   material.customProgramCacheKey = () => key;
   material.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, shared);
@@ -76,7 +108,11 @@ export function patchMaterial(material, shared, opts = {}) {
       fHead += 'uniform sampler2D uImpNormal;\nvarying vec3 vImpR;\nvarying vec3 vImpU;\nvarying vec3 vImpF;\n';
     }
     if (opts.sway && opts.sway.flutter) vHead += 'attribute float aSway;\n';
-    if (opts.haze) fHead += 'uniform float uHaze;\nuniform vec3 uHazeColor;\n';
+    if (opts.haze) fHead += dirFog ? 'uniform float uHaze;\n' : 'uniform float uHaze;\nuniform vec3 uHazeColor;\n';
+    if (dirFog) {
+      vHead += 'varying vec3 vFogRay;\n';
+      fHead += DIR_FOG_HEAD;
+    }
 
     vs = vs.replace('#include <common>', '#include <common>\n' + vHead);
     fs = fs.replace('#include <common>', '#include <common>\n' + fHead);
@@ -103,6 +139,7 @@ export function patchMaterial(material, shared, opts = {}) {
 }\n`;
     }
     if (opts.worldPos || opts.fragColor || opts.bump || opts.sunLift) proj += 'vSWorld = (modelMatrix * mvPosition).xyz;\n';
+    if (dirFog) proj += 'vFogRay = (modelMatrix * mvPosition).xyz - cameraPosition;\n';
     proj += 'mvPosition = modelViewMatrix * mvPosition;\ngl_Position = projectionMatrix * mvPosition;\n';
     if (opts.impostor) {
       proj += `{
@@ -208,7 +245,9 @@ export function patchMaterial(material, shared, opts = {}) {
 `;
     }
     if (lights) fs = fs.replace('#include <lights_fragment_end>', '#include <lights_fragment_end>\n' + lights);
-    if (opts.haze) {
+    if (dirFog) {
+      fs = fs.replace('#include <fog_fragment>', DIR_FOG_FRAGMENT + (opts.haze ? 'gl_FragColor.rgb = mix(gl_FragColor.rgb, dirFogC, uHaze);\n' : ''));
+    } else if (opts.haze) {
       fs = fs.replace('#include <fog_fragment>', '#include <fog_fragment>\ngl_FragColor.rgb = mix(gl_FragColor.rgb, uHazeColor, uHaze);');
     }
     shader.vertexShader = vs;

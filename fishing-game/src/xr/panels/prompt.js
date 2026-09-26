@@ -4,7 +4,8 @@
 //   never jerks) once the head has turned more than 35 degrees away from it.
 // - Toasts stack above the horizon on the same anchor (the DOM's top-of-screen lane).
 // - The STRIKE cue flashes above the horizon straight ahead of where the head points at that moment,
-//   clear of the float, world-fixed for its ~1.2 s (the DOM cue's timing and motion).
+//   clear of the float, world-fixed for its ~1.2 s (the DOM cue's timing and motion). Looking down (at the wrist
+//   gauge, the reel) it comes down with the gaze and stays a little above the view centre, inside the view.
 // The prompt fades like the DOM prompt: steady info / good hints while waiting or fighting fade after
 // 4 s; warnings and dangers stay.
 import * as THREE from 'three';
@@ -22,6 +23,7 @@ const FADE_MS = 400;
 const TOAST_MAX = 3;
 const TOAST_EL = 12 * DEG; // top of the toast stack, above the horizon
 const STRIKE_EL = 7 * DEG;
+const STRIKE_ABOVE_GAZE = 18 * DEG; // at most this far above where the head points (a headset shows ~45 deg up)
 const STRIKE_DIST = 1.75;
 const STRIKE_MS = 1150;
 
@@ -209,11 +211,15 @@ export function createPromptStrip(tk) {
     target = t && !quiet ? 1 : 0;
   }
 
-  function strikeCue(sub, headPos, headYaw, now = performance.now()) {
+  function strikeCue(sub, headPos, headYaw, now = performance.now(), headPitch = 0) {
     sv.sub = sub || '';
     strike.invalidate();
     strikeGroup.position.copy(headPos);
     strikeGroup.rotation.set(0, headYaw, 0);
+    // 7 deg above the horizon while looking out at the lake (above the float); looking down, just above the gaze
+    const el = Math.min(STRIKE_EL, (Number.isFinite(headPitch) ? headPitch : 0) + STRIKE_ABOVE_GAZE);
+    strike.object.position.set(0, STRIKE_DIST * Math.sin(el), -STRIKE_DIST * Math.cos(el));
+    strike.object.rotation.x = el;
     strikeAt = now;
     strikeCutAt = -1;
     striking = true;

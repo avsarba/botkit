@@ -40,7 +40,60 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
   const input = createXRInput({ rig });
   // (pulses address a role, 'rod' | 'reel', or a physical hand, 'left' | 'right': the HUD uses the latter)
   const haptics = createHaptics({ events, getGamepad: (who) => (who === 'left' || who === 'right' ? input.hands[who].gamepad : input.gamepad(who)) });
-  const adaptive = createXRAdaptive({ qm, renderer, getFrameRate: () => session.frameRate });
+  const adaptive = createXRAdaptive({ qm, renderer, getFrameRate: () => session.frameRate, getFrameRates: () => supportedRates(), setFrameRate: (hz) => requestFrameRate(hz) });
+
+  // The display rate (XR.md "Rendering while presenting"): a standalone headset on the 'low' profile asks for 72 Hz
+  // (a Quest 3 runs WebXR at 90 by default: 11.1 ms a frame that 'low' may not hold); the adaptive quality judges
+  // frames against the session's rate and, with nothing else left to shed, can step it down to the lowest rate >= 72.
+  function supportedRates() {
+    const s = session.session;
+    let r = null;
+    try {
+      r = s && s.supportedFrameRates;
+    } catch {
+      r = null;
+    }
+    return r && r.length ? Array.from(r).filter((x) => Number.isFinite(x) && x > 0) : [];
+  }
+  function requestFrameRate(hz) {
+    const s = session.session;
+    if (!s || typeof s.updateTargetFrameRate !== 'function' || !supportedRates().includes(hz)) return false;
+    try {
+      const p = s.updateTargetFrameRate(hz);
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Shader programs for the fish held in the hand (showcase.setXR draws it in the lake scene at the XR level): a
+  // stand-in with the same materials, compiled against the lake at session start (and for each new XR level), and
+  // kept for the whole session so its materials hold the programs. Without it every catch in VR compiles (and hide()
+  // releases again) the held fish's programs: a stall at the moment the player looks at the fish.
+  const fishKeepers = new Map(); // level -> keeper handle | null
+  function warmFish(level) {
+    if (!level || fishKeepers.has(level)) return;
+    const { fishKeeper } = mods();
+    let k = null;
+    try {
+      if (typeof fishKeeper === 'function') k = fishKeeper({ quality: level, castShadow: level !== 'low' });
+      if (k && k.object3d && typeof renderer.compile === 'function') renderer.compile(k.object3d, camera, scene);
+    } catch (err) {
+      console.warn('[xr] fish program warm-up failed', err);
+    }
+    fishKeepers.set(level, k);
+  }
+  function dropFishKeepers() {
+    for (const k of fishKeepers.values()) {
+      try {
+        if (k && typeof k.dispose === 'function') k.dispose();
+      } catch {
+        /* ignore */
+      }
+    }
+    fishKeepers.clear();
+  }
 
   // comfort fade: a dark shell around the head, drawn over everything
   const fadeMat = new THREE.MeshBasicMaterial({ color: 0x05080a, transparent: true, opacity: 0, depthTest: false, depthWrite: false, side: THREE.BackSide, fog: false, toneMapped: false });
@@ -142,7 +195,10 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
       visibility = 'visible';
       haptics.setActive(true);
       attachModules(true);
+      if (adaptive.profile === 'low' && session.frameRate > 72 + 0.5) requestFrameRate(72);
+      adaptive.setBaseRate(adaptive.profile === 'low' ? 72 : session.frameRate);
       if (typeof hooks.onStart === 'function') hooks.onStart({ referenceSpaceType, level: adaptive.profile });
+      warmFish(qm && qm.quality);
     },
     onEnd() {
       haptics.setActive(false);
@@ -159,6 +215,7 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
       if (typeof hooks.onCameraRestored === 'function') hooks.onCameraRestored();
       camera.updateMatrixWorld(true);
       attachModules(false);
+      dropFishKeepers();
       input.unbindSession();
       input.reset();
       adaptive.stop();
@@ -175,6 +232,11 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
     },
     onAvailability(ok) {
       if (typeof hooks.onAvailability === 'function') hooks.onAvailability(ok);
+    },
+    // the session was granted but three.js could not start it (the size / pixel ratio are back): resize once
+    onStartFailed() {
+      adaptive.stop();
+      if (typeof hooks.onStartFailed === 'function') hooks.onStartFailed();
     },
   });
 
@@ -204,6 +266,22 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
     rig.position.x = _h.x + _v.x;
     rig.position.z = _h.z + _v.z;
     rig.rotation.y += angle;
+  }
+
+  // the rig jumped: the rod tip's move this frame is not a swing (no fling of the hanging rig, no bend spike)
+  function tackleTeleported() {
+    if (tackleXR) call(mods().tackle, 'xrTeleported');
+  }
+  // The game ran again after a halt (pause, journal) or a session start: the rod moved with the hand meanwhile, so
+  // the tip's move since the last simulated frame is not a swing, for the input's velocity history (casts, hooksets)
+  // and for the tackle (no whip of the line, no bend spike). Call after this frame's beginFrame.
+  function markDiscontinuity() {
+    input.teleported();
+    tackleTeleported();
+  }
+  // While the game is halted: keep the line on the hand-held rod (the tackle does no physics meanwhile).
+  function holdTackle() {
+    if (tackleXR) call(mods().tackle, 'xrHold');
   }
 
   function routeSelect(role, xin) {
@@ -267,6 +345,7 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
     const dt = Math.max(0, Math.min(0.05, ctx.dt || 0));
     input.updateSources(xrFrame, renderer.xr.getReferenceSpace(), session.session);
     refreshPoses();
+    let jumped = false;
     if (needRecenter) {
       const cams = renderer.xr.getCamera().cameras;
       if (cams && cams.length) {
@@ -276,12 +355,19 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
         needRecenter = false;
         refreshPoses();
         input.teleported();
+        tackleTeleported();
+        jumped = true;
       }
     }
     deriveCtx.dt = dt;
     deriveCtx.lineTarget = ctx.lineTarget || null;
     deriveCtx.allowSticks = ctx.allowSticks !== false;
     const xin = input.derive(deriveCtx);
+    // (the tackle's tip is last frame's, from before the jump: drop that sample, as a snap turn does below; the
+    // next frame starts from the tip after the jump)
+    if (jumped) input.teleported();
+    // a new XR level (the adaptive quality stepped at a calm moment): the held fish's programs for it
+    if (qm && !fishKeepers.has(qm.quality)) warmFish(qm.quality);
     // panels get trigger presses first
     routeSelect('rod', xin);
     routeSelect('reel', xin);
@@ -289,10 +375,11 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
       snapTurn(-xin.snapTurn * SNAP_TURN_RAD);
       refreshPoses();
       input.teleported();
+      tackleTeleported();
       xin.head.position.setFromMatrixPosition(camera.matrixWorld);
     }
     updateFade(dt, xin);
-    haptics.update(dt, ctx.frame);
+    haptics.update(dt, ctx.frame, ctx);
     for (let i = frameHooks.length - 1; i >= 0; i--) {
       let keep = false;
       try {
@@ -375,6 +462,8 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
         lift01: r2(xin.rod.lift01),
         tipVel: vec(xin.rod.tipVel),
         tipSpeed: r2(xin.rod.tipSpeed),
+        rigidTipSpeed: r2(xin.rod.rigidTipVel.length()), // the unbent blank's tip (hooksets)
+        castSpeed: r2(xin.rod.castSpeed), // the faster of the two (casts)
         pitchRate: r2(xin.rod.pitchRate),
         trigger: r2(xin.rod.trigger),
         triggerHeld: xin.rod.triggerHeld,
@@ -427,6 +516,8 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
     enter,
     exit: () => session.exit(),
     beginFrame,
+    markDiscontinuity,
+    holdTackle,
     waitFrames,
     // tests: run fn(frames) once per XR frame (after the input is read) until it returns false. Poses set from it
     // reach the next frame exactly, however slowly frames render.
@@ -445,6 +536,10 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
     },
     get starting() {
       return session.starting;
+    },
+    // granted by the browser and being set up by three.js (it has noted the drawing buffer's size / pixel ratio)
+    get settingUp() {
+      return session.settingUp;
     },
     get available() {
       return session.available;

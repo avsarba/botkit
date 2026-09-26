@@ -4,7 +4,8 @@
 //
 //   nibble          rod   0.25 x 35 ms          bite / float under   rod   0.7 x 110 ms
 //   hookset         rod   1.0 x 60 ms           lure lands           rod   0.2 x 25 ms
-//   fight           rod   continuous 0.08 + 0.55 * tension01, re-pulsed every ~50 ms; 0.9 x 40 ms on head shakes / jumps
+//   fight           rod   continuous 0.05 + 0.55 * tension01 (smoothed), re-pulsed every ~50 ms, silent on slack line;
+//                         0.9 x 40 ms on head shakes / jumps
 //   drag slipping   reel  0.35 x 12 ms per ~3 cm of line paid out (<= 30 Hz)
 //   reeling         reel  0.05 tick per handle turn (~0.52 m of line, the reel's gear)
 //   line snap       rod   1.0 x 180 ms, then silence
@@ -31,6 +32,10 @@ const DRAG_CLICK_MAX_HZ = 30;
 const SNAP_SILENCE_S = 0.9;
 const SHAKE_ON = 0.55;
 const SHAKE_OFF = 0.35;
+const RUMBLE_FLOOR = 0.05;
+const RUMBLE_GAIN = 0.55;
+const RUMBLE_SLACK_T01 = 0.02; // below this the line carries nothing: no rumble (slack line is a cue to feel)
+const RUMBLE_SMOOTH_S = 0.06;
 
 export function createHaptics({ events, getGamepad }) {
   let active = false;
@@ -41,6 +46,7 @@ export function createHaptics({ events, getGamepad }) {
   let lastClick = -1;
   let reelAcc = 0;
   let shaking = false;
+  let tSmooth = 0; // smoothed tension01 for the rumble
   const log = []; // recent pulses, for debugging / tests: { t, role, v, ms, kind }
   let count = 0;
 
@@ -101,17 +107,24 @@ export function createHaptics({ events, getGamepad }) {
   });
 
   // Continuous feedback, once per rendered frame while presenting (dt = the frame's game time).
-  function update(dt, frame) {
+  // opts.slackLine: the fight model's slack-line judgement (the rumble stops, so the angler feels the line go slack).
+  function update(dt, frame, opts) {
     if (!active || !frame) return;
     dt = Math.max(0, Math.min(0.1, dt || 0));
     clock += dt;
     const st = frame.state;
     const fighting = (st === STATES.FIGHTING || st === STATES.LANDING) && frame.hooked;
+    const t01 = clamp(frame.tension01 || 0, 0, 1);
+    tSmooth = fighting ? tSmooth + (t01 - tSmooth) * (1 - Math.exp(-dt / RUMBLE_SMOOTH_S)) : 0;
+    const slack = t01 < RUMBLE_SLACK_T01 || !!(opts && opts.slackLine);
     if (fighting && clock >= silentUntil) {
-      rumbleT -= dt;
-      if (rumbleT <= 0) {
-        rumbleT = RUMBLE_EVERY_S;
-        pulse('rod', 0.08 + 0.55 * clamp(frame.tension01 || 0, 0, 1), RUMBLE_MS, 'fight');
+      if (slack) rumbleT = 0; // (resumes at once when the line comes tight)
+      else {
+        rumbleT -= dt;
+        if (rumbleT <= 0) {
+          rumbleT = RUMBLE_EVERY_S;
+          pulse('rod', RUMBLE_FLOOR + RUMBLE_GAIN * tSmooth, RUMBLE_MS, 'fight');
+        }
       }
       const hs = frame.hooked.headShake01 || 0;
       if (!shaking && hs > SHAKE_ON) {
@@ -151,6 +164,7 @@ export function createHaptics({ events, getGamepad }) {
     dragAcc = 0;
     reelAcc = 0;
     shaking = false;
+    tSmooth = 0;
     silentUntil = -1;
   }
 

@@ -9,18 +9,30 @@
 //
 // Everything velocity-like is measured in GAME time (the frame's clamped dt, <= 50 ms): identical to real time on a
 // headset (11-14 ms frames), and it keeps gestures meaningful under a slow software renderer.
+//
+// Two rod tips: the tackle's bent tip-top (tackle.getRodTip: the rod loading and whipping through) gives the cast its
+// release velocity; the rigid blank's tip (reel seat + rod direction x seat-to-tip length, straight from the controller
+// pose) drives the hookset and strike gestures, so the tackle's own bite bounce or a bend flicking under a load can
+// never set the hook by itself.
 import * as THREE from 'three';
-import { TACKLE, clamp } from '../config.js';
+import { TACKLE, XR_ROD_TILT_RAD, clamp } from '../config.js';
+import { ROD } from '../tackle/rod.js';
 
 const DEG = Math.PI / 180;
-export const ROD_TILT_RAD = 20 * DEG; // the blank points along the grip's forward axis tilted this much up
+export const ROD_TILT_RAD = XR_ROD_TILT_RAD; // the blank points along the grip's forward axis tilted this much up (config.js)
+const SEAT_TO_TIP_M = ROD.tipY; // reel seat -> tip-top of the (unbent) blank
 const TRIGGER_ON = 0.5; // digital use of the trigger (cast hold): press above, release below TRIGGER_OFF
 const TRIGGER_OFF = 0.25;
 export const REEL_DEAD_ZONE = 0.08;
 const VEL_WINDOW_S = 0.06; // rod-tip velocity / rod rates are differences over this much time
 const HIST = 16;
-export const HOOK_TIP_MPS = 2.2; // rod tip sweeping up / back faster than this sets the hook
+export const HOOK_TIP_MPS = 2.2; // rod tip sweeping up / back faster than this sets the hook (STRIKE)
 export const HOOK_PITCH_RATE = 3; // ... or the rod rising faster than this (rad/s)
+// In WAITING a sweep right after a nibble yanks the bait away (an early strike): only a clearly deliberate one counts
+// there, held this many consecutive frames, so easing the rod up to watch the float does not lose the fish.
+export const DELIBERATE_TIP_MPS = 4;
+export const DELIBERATE_PITCH_RATE = 3;
+const DELIBERATE_FRAMES = 2;
 const STICK_ON = 0.7;
 const STICK_OFF = 0.3;
 const DRAG_REPEAT_S = 0.25;
@@ -29,6 +41,12 @@ const CRANK_MIN_RPS = 0.5;
 export const CRANK_M_PER_REV = TACKLE.reelRetrieveMps / TACKLE.reelTurnsPerS; // line per handle turn (~0.52 m, the reel's)
 const CRANK_MIN_HAND_MPS = 0.1; // below this the hand isn't moving enough to tell a circle
 const CRANK_HOLD_S = 0.25; // crank stays "on" this long through a sample that can't tell
+// The sense of the hand's circle (in the plane of the rod and its "up") that turns the reel forward: over the top
+// toward the rod tip, down, and back toward the angler, as a spinning reel is cranked. crankRate measures the turn
+// from the rod's forward axis toward its "up", so forward is a NEGATIVE rate; the tackle's crankByHand (which makes the
+// drawn handle follow the hand) takes the same sense as forward, the same for both rod hands (a left-handed setup only
+// mirrors the handle to the other side). Circling the other way is anti-reverse: no retrieve.
+const CRANK_FWD_SIGN = -1;
 const LIFT_FULL_RAD = 60 * DEG;
 const SIDE_FULL = 0.75; // sin of the rod's angle off the line (times its horizontal share) that is full side pressure
 // cast mapping (XR.md): power from rod-tip speed at release, direction from its horizontal part, launch pitch from its
@@ -36,13 +54,31 @@ const SIDE_FULL = 0.75; // sin of the rod's angle off the line (times its horizo
 // A rod swinging forward past vertical moves its tip downward, so the tip's path alone would launch every overhead cast
 // at the 8 deg floor; the rod unloading as the line is let go lifts the lure: let go at "11 o'clock" (rod ~55 deg up)
 // and it flies out at ~30 deg (the desktop's launch pitch), earlier goes higher, later lower.
-export const CAST = { minMps: 1.2, spanMps: 10, minPower: 0.08, lobPower: 0.12, stillMps: 0.5, lobPitchRad: 25 * DEG, pitchMinRad: 8 * DEG, pitchMaxRad: 55 * DEG, rodReleaseRad: 25 * DEG, minHorizMps: 1, behindRad: 110 * DEG };
+// Power: a lure leaves at about the tip speed, and the desktop's full-power launch corresponds to ~20-25 m/s of tip
+// speed, so the span is wide: a relaxed stroke (~220 deg/s of wrist at the release) throws ~10-12 m, a hard one
+// (~450-500 deg/s, 14-16 m/s at the tip) some 20-25 m, and ~700 deg/s and more nearly all the way. Monotonic in the
+// speed, with the lob as its floor: nothing throws shorter than letting go with the rod still. (To be tuned against
+// real headset recordings.)
+export const CAST = {
+  minMps: 1.5,
+  spanMps: 22,
+  lobPower: 0.12,
+  stillMps: 0.5,
+  minHoldS: 0.15, // a trigger tap shorter than this with the tip still is not a cast (the desktop ignores < 0.12 s clicks)
+  lobPitchRad: 25 * DEG,
+  pitchMinRad: 8 * DEG,
+  pitchMaxRad: 55 * DEG,
+  rodReleaseRad: 25 * DEG,
+  minHorizMps: 1,
+  behindRad: 110 * DEG,
+  gazeAssist: 0.7, // a flat (sidearm) swing goes this much of the way toward where the player looks
+};
 // "behind the player": measured from the lake direction (the rig's -Z at session start; snap turns don't move it)
 const LAKE = new THREE.Vector3(0, 0, -1);
 
 export function castPowerFromSpeed(speed) {
   if (!(speed >= CAST.stillMps)) return CAST.lobPower;
-  return clamp((speed - CAST.minMps) / CAST.spanMps, CAST.minPower, 1);
+  return Math.max(CAST.lobPower, clamp((speed - CAST.minMps) / CAST.spanMps, 0, 1));
 }
 
 function makeButtonState() {
@@ -134,10 +170,14 @@ export function createXRInput({ rig }) {
     head: { position: new THREE.Vector3(), direction: new THREE.Vector3(0, 0, -1), yaw: 0, pitch: 0 },
     rod: Object.assign(makeRole('rod'), {
       base: new THREE.Vector3(),
-      dir: new THREE.Vector3(0, 0.34, -0.94),
-      tip: new THREE.Vector3(),
+      dir: new THREE.Vector3(0, Math.sin(ROD_TILT_RAD), -Math.cos(ROD_TILT_RAD)),
+      tip: new THREE.Vector3(), // the tackle's bent tip-top (casts)
       tipVel: new THREE.Vector3(),
       tipSpeed: 0,
+      rigidTip: new THREE.Vector3(), // the unbent blank's tip, straight from the controller pose (hooksets)
+      rigidTipVel: new THREE.Vector3(),
+      castVel: new THREE.Vector3(), // the faster of the two tip velocities: what a release now would throw with
+      castSpeed: 0,
       pitch: 0,
       yaw: 0,
       pitchRate: 0,
@@ -151,7 +191,8 @@ export function createXRInput({ rig }) {
     }),
     reelSpeed01: 0, // max(trigger, crank)
     castPower01: 0, // live estimate while the rod trigger is held
-    hookGesture: false, // rising edge of an up / back sweep this frame
+    hookGesture: false, // rising edge of an up / back sweep this frame (rigid tip)
+    deliberateStrike: false, // rising edge of a clearly deliberate sweep (the early-strike test in WAITING)
     hookMetric: { tipUpBack: 0, pitchRate: 0 },
     snapTurn: 0, // -1 left / +1 right (one per flick)
     dragStep: 0, // +1 tighter / -1 looser
@@ -161,7 +202,8 @@ export function createXRInput({ rig }) {
 
   // ---- rod-tip history (game time)
   const hT = new Float64Array(HIST);
-  const hP = new Float32Array(HIST * 3);
+  const hP = new Float32Array(HIST * 3); // bent tip-top
+  const hR = new Float32Array(HIST * 3); // rigid blank tip
   const hPitch = new Float32Array(HIST);
   const hYaw = new Float32Array(HIST);
   let hHead = 0;
@@ -170,6 +212,7 @@ export function createXRInput({ rig }) {
   let yawUnwrapped = 0;
   let lastYaw = NaN;
   let hookWasOn = false;
+  let deliberateN = 0;
   let crankAngle = NaN;
   let crankRate = 0;
   let crankHoldT = 0;
@@ -192,6 +235,7 @@ export function createXRInput({ rig }) {
     lastYaw = NaN;
     yawUnwrapped = 0;
     hookWasOn = false;
+    deliberateN = 0;
     crankAngle = NaN;
     crankRate = 0;
     crankHoldT = 0;
@@ -330,11 +374,14 @@ export function createXRInput({ rig }) {
     return out.copy(ROD_LOCAL).applyQuaternion(h.quat).normalize();
   }
 
-  function pushTip(tip, pitch, yaw) {
+  function pushTip(tip, rigid, pitch, yaw) {
     hT[hHead] = clock;
     hP[hHead * 3] = tip.x;
     hP[hHead * 3 + 1] = tip.y;
     hP[hHead * 3 + 2] = tip.z;
+    hR[hHead * 3] = rigid.x;
+    hR[hHead * 3 + 1] = rigid.y;
+    hR[hHead * 3 + 2] = rigid.z;
     hPitch[hHead] = pitch;
     hYaw[hHead] = yaw;
     hHead = (hHead + 1) % HIST;
@@ -397,8 +444,9 @@ export function createXRInput({ rig }) {
     if (rodH.grip.visible) {
       rodDirFromGrip(rodH, rod.dir);
       if (!(ctx.getRodBase && ctx.getRodBase(rod.base))) rod.base.copy(rodH.pos);
+      rod.rigidTip.copy(rod.base).addScaledVector(rod.dir, SEAT_TO_TIP_M);
       rod.fromTackle = !!(ctx.getRodTip && ctx.getRodTip(rod.tip));
-      if (!rod.fromTackle) rod.tip.copy(rod.base).addScaledVector(rod.dir, TACKLE.rodLengthM);
+      if (!rod.fromTackle) rod.tip.copy(rod.rigidTip);
       rod.pitch = Math.asin(clamp(rod.dir.y, -1, 1));
       const yaw = Math.atan2(-rod.dir.x, -rod.dir.z);
       if (Number.isFinite(lastYaw)) {
@@ -409,43 +457,57 @@ export function createXRInput({ rig }) {
       } else yawUnwrapped = yaw;
       lastYaw = yaw;
       rod.yaw = yaw;
-      if (dt > 0) pushTip(rod.tip, rod.pitch, yawUnwrapped);
+      if (dt > 0) pushTip(rod.tip, rod.rigidTip, rod.pitch, yawUnwrapped);
       const i0 = windowStart();
       const newest = (hHead - 1 + HIST) % HIST;
       const span = i0 >= 0 ? hT[newest] - hT[i0] : 0;
       if (span > 1e-4) {
         rod.tipVel.set(hP[newest * 3] - hP[i0 * 3], hP[newest * 3 + 1] - hP[i0 * 3 + 1], hP[newest * 3 + 2] - hP[i0 * 3 + 2]).multiplyScalar(1 / span);
+        rod.rigidTipVel.set(hR[newest * 3] - hR[i0 * 3], hR[newest * 3 + 1] - hR[i0 * 3 + 1], hR[newest * 3 + 2] - hR[i0 * 3 + 2]).multiplyScalar(1 / span);
         rod.pitchRate = (hPitch[newest] - hPitch[i0]) / span;
         rod.yawRate = (hYaw[newest] - hYaw[i0]) / span;
       } else {
         rod.tipVel.set(0, 0, 0);
+        rod.rigidTipVel.set(0, 0, 0);
         rod.pitchRate = rod.yawRate = 0;
       }
       rod.tipSpeed = rod.tipVel.length();
       rod.lift01 = clamp(rod.pitch / LIFT_FULL_RAD, 0, 1);
     } else {
       rod.tipVel.set(0, 0, 0);
+      rod.rigidTipVel.set(0, 0, 0);
       rod.tipSpeed = rod.pitchRate = rod.yawRate = 0;
       hCount = 0;
       lastYaw = NaN;
     }
-    xin.castPower01 = rod.triggerHeld ? castPowerFromSpeed(rod.tipSpeed) : 0;
+    // Cast velocity: the faster of the bent tip-top's and the rigid blank's. The rod whipping through adds to the
+    // swing (a stroke that stops, an abrupt one); a rod still loading at the release (its tip lagging behind a stroke
+    // that is still speeding up) never throws shorter than the swing itself, so a harder swing always throws farther.
+    rod.castVel.copy(rod.rigidTipVel.lengthSq() > rod.tipVel.lengthSq() ? rod.rigidTipVel : rod.tipVel);
+    rod.castSpeed = rod.castVel.length();
+    xin.castPower01 = rod.triggerHeld ? castPowerFromSpeed(rod.castSpeed) : 0;
 
-    // ---- hookset gesture: tip speed up / back (away from the line) or the rod rising fast
+    // ---- hookset gesture: the RIGID tip sweeping up / back (away from the line) or the rod rising fast. (Not the bent
+    // tip-top: a lure bite loads and bounces it, and that must never set the hook by itself.)
+    const rv = rod.rigidTipVel;
     let back = 0;
     if (ctx.lineTarget) {
       _v.subVectors(ctx.lineTarget, rod.base).setY(0);
-      if (_v.lengthSq() > 1e-6) back = -rod.tipVel.dot(_v.normalize());
+      if (_v.lengthSq() > 1e-6) back = -rv.dot(_v.normalize());
     } else {
       _v.copy(rod.dir).setY(0);
-      if (_v.lengthSq() > 1e-6) back = -rod.tipVel.dot(_v.normalize());
+      if (_v.lengthSq() > 1e-6) back = -rv.dot(_v.normalize());
     }
-    const upBack = Math.hypot(Math.max(0, rod.tipVel.y), Math.max(0, back));
+    const upBack = Math.hypot(Math.max(0, rv.y), Math.max(0, back));
     xin.hookMetric.tipUpBack = upBack;
     xin.hookMetric.pitchRate = rod.pitchRate;
     const hookOn = rod.connected && (upBack > HOOK_TIP_MPS || rod.pitchRate > HOOK_PITCH_RATE);
     xin.hookGesture = hookOn && !hookWasOn;
     hookWasOn = hookOn;
+    // a deliberate strike: faster, and sustained over consecutive frames (a twitch or a gentle lift is not one)
+    const deliberate = rod.connected && dt > 0 && (upBack > DELIBERATE_TIP_MPS || rod.pitchRate > DELIBERATE_PITCH_RATE);
+    deliberateN = deliberate ? deliberateN + 1 : dt > 0 ? 0 : deliberateN;
+    xin.deliberateStrike = deliberate && deliberateN === DELIBERATE_FRAMES;
 
     // ---- reel: analog trigger, or turning the handle for real
     const t = reel.trigger;
@@ -494,7 +556,8 @@ export function createXRInput({ rig }) {
           crankRate *= Math.exp(-dt / 0.1);
         }
       }
-      rps = Math.abs(crankRate) / (2 * Math.PI);
+      // forward only: circling the other way is anti-reverse (the drawn handle does not turn back either)
+      rps = Math.max(0, CRANK_FWD_SIGN * crankRate) / (2 * Math.PI);
     } else {
       crankAngle = NaN;
       crankRate = 0;
@@ -539,16 +602,35 @@ export function createXRInput({ rig }) {
   }
 
   // Cast from the tip velocity at trigger release (XR.md "Rod-tip cast mapping").
-  const castOut = { power01: 0, direction: new THREE.Vector3(0, 0, -1), pitchRad: 0, speed: 0, elevRad: 0, rodRad: 0, behind: false, lob: false, angleFromLakeRad: 0 };
+  const castOut = { power01: 0, direction: new THREE.Vector3(0, 0, -1), pitchRad: 0, speed: 0, elevRad: 0, rodRad: 0, behind: false, lob: false, angleFromLakeRad: 0, gazeW: 0 };
   function castFromRelease() {
-    const v = xin.rod.tipVel;
+    const v = xin.rod.castVel;
     const speed = v.length();
     const h = Math.hypot(v.x, v.z);
     castOut.speed = speed;
     castOut.lob = !(speed >= CAST.stillMps);
     castOut.power01 = castPowerFromSpeed(speed);
-    if (h >= CAST.minHorizMps) castOut.direction.set(v.x / h, 0, v.z / h);
-    else {
+    castOut.gazeW = 0;
+    if (h >= CAST.minHorizMps) {
+      // The lure leaves along the tip's path. A flat (sidearm) sweep moves the tip sideways across the target, and
+      // without a rod load or a lure's weight to time the release by, a VR player lets go late: such a cast goes
+      // mostly where the player looks. Weighted by how flat the swing plane is: the rod's rotation (rod direction x
+      // the rigid tip's velocity) about the vertical against its rotation about a horizontal axis (the yaw rate vs
+      // pitch rate of the swing, but well defined when an overhead swing passes the vertical, where the rod's own yaw
+      // flips), so an overhead cast keeps the tip's path exactly.
+      let az = Math.atan2(v.x, -v.z);
+      _v2.crossVectors(xin.rod.dir, xin.rod.rigidTipVel);
+      const yr = Math.abs(_v2.y);
+      const pr = Math.hypot(_v2.x, _v2.z);
+      const w = CAST.gazeAssist * clamp(yr / (yr + pr + 1e-3), 0, 1);
+      const hd = xin.head.direction;
+      if (w > 1e-3 && Math.hypot(hd.x, hd.z) > 1e-3) {
+        const gaze = Math.atan2(hd.x, -hd.z);
+        az += w * Math.atan2(Math.sin(gaze - az), Math.cos(gaze - az));
+        castOut.gazeW = w;
+      }
+      castOut.direction.set(Math.sin(az), 0, -Math.cos(az));
+    } else {
       _v2.copy(xin.rod.dir).setY(0);
       if (_v2.lengthSq() < 1e-4) _v2.copy(xin.head.direction).setY(0);
       if (_v2.lengthSq() < 1e-6) _v2.copy(LAKE);
@@ -579,6 +661,7 @@ export function createXRInput({ rig }) {
   function teleported() {
     hCount = 0;
     lastYaw = NaN;
+    deliberateN = 0;
     crankAngle = NaN;
     crankRate = 0;
     for (const h of HANDS) {

@@ -343,9 +343,18 @@ export function createRod({ quality = 'high' } = {}) {
     if (mag < 1e-4 || Fp < 1e-6 || !Number.isFinite(mag)) {
       th.fill(0);
     } else {
-      const ang = Math.min(Math.atan2(Fp, Fa), 2.7);
-      const Fu = mag * Math.cos(ang);
-      const Fv = mag * Math.sin(ang);
+      // The shooting solve needs the load at most 2.7 rad off the blank. A load pushing the tip back toward the
+      // butt (near-pure compression) keeps that direction but only its true side component: the bend then fades
+      // out as the side load goes to zero instead of keeping ~0.43 x the load sideways and flipping to the other
+      // side whenever the tiny side component changes sign (a one-frame flick of the whole tip).
+      let ang = Math.atan2(Fp, Fa);
+      let k = 1;
+      if (ang > 2.7) {
+        k = Fp / (mag * Math.sin(2.7));
+        ang = 2.7;
+      }
+      const Fu = k * mag * Math.cos(ang);
+      const Fv = k * mag * Math.sin(ang);
       let lo = 0;
       let hi = ang;
       for (let i = 0; i < 26; i++) {

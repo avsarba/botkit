@@ -125,6 +125,14 @@ export function createWater(ctx) {
     tSkyline: { value: null },
     tEnv: { value: null },
     uEnvIntensity: { value: 1 },
+    // directional fog: the environment's own uniform objects (shared by reference; see env.fogUniforms)
+    uFogSunDir: (env.fogUniforms && env.fogUniforms.uFogSunDir) || { value: new THREE.Vector3(0, 0, -1) },
+    uFogSun: (env.fogUniforms && env.fogUniforms.uFogSun) || { value: new THREE.Color(1, 1, 1) },
+    uFogMid: (env.fogUniforms && env.fogUniforms.uFogMid) || { value: new THREE.Color(1, 1, 1) },
+    uFogSide: (env.fogUniforms && env.fogUniforms.uFogSide) || { value: new THREE.Color(1, 1, 1) },
+    uFogAway: (env.fogUniforms && env.fogUniforms.uFogAway) || { value: new THREE.Color(1, 1, 1) },
+    uDirFog: { value: env.fogUniforms ? 1 : 0 },
+    uCheapMul: { value: 0 }, // VR at 'low': the multiplicative pass skips the wave normal (see shaders.js)
   };
 
   const common = {
@@ -552,6 +560,7 @@ export function createWater(ctx) {
     if (q !== quality) applyQuality(q);
     const xrNow = !!(renderer.xr && renderer.xr.isPresenting);
     if (xrNow !== xrActive) setXRActive(xrNow);
+    uniforms.uCheapMul.value = xrActive && quality === 'low' ? 1 : 0;
     const cam = frame.camera || ctx.camera;
 
     readEnv();

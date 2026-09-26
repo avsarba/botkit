@@ -369,9 +369,9 @@ export function createShowcase({ renderer, camera, createFishMesh, getCatchRect 
     // where the body wants to hang: gravity, a little of the gripped jaw's own direction, and never
     // through the deck (a long fish held low leans out, away from the angler)
     _t.set(0, -1, 0).addScaledVector(_u, -0.35).normalize();
-    let floorY = DOCK.deckY;
-    const rig = xrGrip && xrGrip.parent;
-    if (rig && !rig.isScene) floorY = _co.setFromMatrixPosition(rig.matrixWorld).y;
+    // (the real deck, in world space: never derived from the player rig, which a `local` reference space raises to
+    // eye height, and recenters / snap turns only ever move sideways)
+    const floorY = DOCK.deckY;
     const hmax = clamp((a.y - floorY - XR_FLOOR_CLEAR) / L, 0, 1);
     if (-_t.y > hmax) {
       _w.set(_t.x, 0, _t.z);
@@ -551,7 +551,8 @@ export function createShowcase({ renderer, camera, createFishMesh, getCatchRect 
     lastShow = null;
     if (!fish) return;
     showToken++;
-    // (VR: the fish drew with the lake's programs, which the fish system keeps alive)
+    // (VR: the fish drew in the lake scene; its programs stay alive through the stand-in that src/xr/index.js keeps
+    // compiled for the session's XR level. Its materials are disposed below like the desktop fish's.)
     if (!xrOn) {
       try {
         keepPrograms(fish.object3d);

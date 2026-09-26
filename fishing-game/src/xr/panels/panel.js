@@ -1,22 +1,30 @@
 // A world-space UI panel: a canvas drawn with the DOM UI's tokens, shown on an unlit plane.
 // The canvas is redrawn only when something it shows changed (invalidate), and at most ~15 times a
-// second; the texture uploads only after a redraw. Buttons are rectangles in canvas pixels that the
+// second (minMs); the texture uploads only after a redraw. Buttons are rectangles in canvas pixels that the
 // controller rays hit-test through the plane's UV.
+//
+// A headset's eye buffer shows these canvases 2-4x smaller than drawn, so the texture is mipmapped (trilinear; the
+// HUD adds a little anisotropy): plain bilinear minification skips texels, and thin strokes and small text crawl as
+// the head and hands move. The canvas uploads premultiplied (its own format), blended as premultiplied color with
+// the fade folded into the color as well, so the mip levels never darken the edges toward the empty canvas' black.
+// `pxScale` draws the same pxW x pxH layout on a smaller (or larger) canvas.
 import * as THREE from 'three';
 
 export const REDRAW_MIN_MS = 1000 / 15;
 export const PANEL_RENDER_ORDER = 950; // after the scene's transparent passes (water, splashes, line)
 
-export function createPanel({ name, widthM, heightM, pxW, pxH, draw, interactive = false, renderOrder = PANEL_RENDER_ORDER }) {
+export function createPanel({ name, widthM, heightM, pxW, pxH, draw, interactive = false, renderOrder = PANEL_RENDER_ORDER, pxScale = 1, minMs = REDRAW_MIN_MS }) {
   const canvas = document.createElement('canvas');
-  canvas.width = pxW;
-  canvas.height = pxH;
+  const scale = Number.isFinite(pxScale) && pxScale > 0 ? pxScale : 1;
+  canvas.width = Math.max(1, Math.round(pxW * scale));
+  canvas.height = Math.max(1, Math.round(pxH * scale));
   const ctx = canvas.getContext('2d');
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
-  texture.generateMipmaps = false;
-  texture.minFilter = THREE.LinearFilter;
+  texture.generateMipmaps = true;
+  texture.minFilter = THREE.LinearMipmapLinearFilter;
   texture.magFilter = THREE.LinearFilter;
+  texture.premultiplyAlpha = true;
   texture.wrapS = texture.wrapT = THREE.ClampToEdgeWrapping;
   const material = new THREE.MeshBasicMaterial({
     map: texture,
@@ -27,6 +35,14 @@ export function createPanel({ name, widthM, heightM, pxW, pxH, draw, interactive
     depthWrite: true,
     alphaTest: 0.02, // the empty canvas around pills / rounded corners neither draws nor writes depth
     side: THREE.FrontSide,
+    // premultiplied texels: src + dst * (1 - src alpha); the opacity (fades) scales the color too (setOpacity)
+    blending: THREE.CustomBlending,
+    blendEquation: THREE.AddEquation,
+    blendSrc: THREE.OneFactor,
+    blendDst: THREE.OneMinusSrcAlphaFactor,
+    blendEquationAlpha: THREE.AddEquation,
+    blendSrcAlpha: THREE.OneFactor,
+    blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
   });
   const geometry = new THREE.PlaneGeometry(widthM, heightM);
   const mesh = new THREE.Mesh(geometry, material);
@@ -67,11 +83,11 @@ export function createPanel({ name, widthM, heightM, pxW, pxH, draw, interactive
     // Redraw if invalidated and the rate limit allows (force: ignore the limit, e.g. on open).
     flush(now, force = false) {
       if (!panel.dirty) return false;
-      if (!force && now - panel.lastDraw < REDRAW_MIN_MS) return false;
+      if (!force && now - panel.lastDraw < minMs) return false;
       panel.dirty = false;
       panel.lastDraw = now;
       panel.buttons.length = 0;
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
       ctx.clearRect(0, 0, pxW, pxH);
       ctx.save();
       let used;
@@ -112,6 +128,9 @@ export function createPanel({ name, widthM, heightM, pxW, pxH, draw, interactive
       if (a === panel.opacity) return;
       panel.opacity = a;
       material.opacity = a;
+      // (premultiplied: the color fades with the alpha; the shader decodes / encodes sRGB around it, so scale by the
+      // decoded factor to keep color and coverage in step)
+      material.color.setRGB(a, a, a, THREE.SRGBColorSpace);
       panel.syncVisible();
     },
     // uv (0..1 over the visible plane) -> canvas px

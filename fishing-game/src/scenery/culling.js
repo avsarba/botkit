@@ -14,6 +14,35 @@ const _pos = new THREE.Vector3();
 // azimuth convention used by the scenery: 0 = straight out over the lake (-Z), +pi/2 = +X
 export const azimuthOf = (x, z) => Math.atan2(x, -z);
 
+// XR: the azimuth half-extent (rad, from the view azimuth) of the circular view cone of radius r around a view
+// direction at pitch p, over the elevations [e0, e1] (rad) that a chunk spans. A point at elevation e and azimuth
+// offset d is in the cone when sin p sin e + cos p cos e cos d >= cos r, so cos d >= (cos r - sin p sin e) /
+// (cos p cos e). The widest offset over [e0, e1] is at an end or at the cone's widest elevation, sin e* = sin p / cos r.
+// Returns -1 when no elevation of the chunk is inside the cone, PI when every azimuth is.
+export function coneAzimuthExtent(p, r, e0, e1) {
+  const lo = Math.max(e0, p - r);
+  const hi = Math.min(e1, p + r);
+  if (lo > hi) return -1;
+  const sp = Math.sin(p);
+  const cp = Math.cos(p);
+  const cr = Math.cos(r);
+  let best = -1;
+  const at = (e) => {
+    const c = cp * Math.cos(e);
+    if (c < 1e-4) return Math.PI; // (straight up / down: every azimuth)
+    const x = (cr - sp * Math.sin(e)) / c;
+    if (x <= -1) return Math.PI;
+    if (x >= 1) return x - 1 < 1e-9 ? 0 : -1;
+    return Math.acos(x);
+  };
+  best = Math.max(best, at(lo), at(hi));
+  if (Math.abs(sp) < cr) {
+    const es = Math.asin(sp / cr);
+    if (es > lo && es < hi) best = Math.max(best, at(es));
+  }
+  return best;
+}
+
 // Exact elevation-angle range of a static chunk as seen from the eye (x = z = 0, y = EYE_Y),
 // for the object itself and for its mirror image in the water (y -> -y).
 const EYE_Y = 2.2;
@@ -76,18 +105,19 @@ export function createSectorCuller() {
       let half = Math.PI;
       let elTop = Math.PI;
       let elBot = -Math.PI;
+      let pitch = 0;
+      let coneR = 0; // XR: the view cone's radius (azimuth extents are per chunk, from its elevation range)
       if (!all) {
         camera.getWorldDirection(_dir);
         azC = Math.atan2(_dir.x, -_dir.z);
-        const pitch = Math.asin(Math.max(-1, Math.min(1, _dir.y)));
+        pitch = Math.asin(Math.max(-1, Math.min(1, _dir.y)));
         if (xr) {
-          // circular cone of radius r around the view direction: its exact azimuth extent
+          // circular cone of radius r around the view direction (the head can roll), plus the elevation margin
           const pm = camera.projectionMatrix.elements;
           const tH = pm[0] > 1e-6 ? (1 + Math.abs(pm[8])) / pm[0] : 3;
           const tV = pm[5] > 1e-6 ? (1 + Math.abs(pm[9])) / pm[5] : 3;
           const r = Math.min(1.45, Math.atan(Math.hypot(tH, tV)) + XR_MARGIN);
-          const cp = Math.cos(pitch);
-          if (cp > Math.sin(r) + 0.02) half = Math.asin(Math.sin(r) / cp) + 0.2;
+          coneR = r + 0.08;
           elTop = pitch + r + 0.08;
           elBot = pitch - r - 0.08;
         } else {
@@ -112,9 +142,10 @@ export function createSectorCuller() {
           continue;
         }
         // chunk entirely above or below the view (e.g. the far forest while looking down); its
-        // mirror image in the water (planar reflection) counts too
+        // mirror image in the water (planar reflection) counts too (not in VR: no planar mirror there)
         const b = it.b;
-        if ((b.max < elBot || b.min > elTop) && (b.mMax < elBot || b.mMin > elTop)) {
+        const outside = b.max < elBot || b.min > elTop;
+        if (outside && (xr || b.mMax < elBot || b.mMin > elTop)) {
           it.obj.visible = false;
           continue;
         }
@@ -123,7 +154,12 @@ export function createSectorCuller() {
         const hw = (it.a1 - it.a0) * 0.5;
         let d = Math.abs(mid - azC) % TWO_PI;
         if (d > Math.PI) d = TWO_PI - d;
-        it.obj.visible = d <= hw + half;
+        if (xr) {
+          // the cone's azimuth extent over this chunk's own elevations (looking down at the reel, a horizon chunk
+          // needs about +-65 deg, not every azimuth)
+          const ext = coneAzimuthExtent(pitch, coneR, b.min, b.max);
+          it.obj.visible = ext >= 0 && d <= hw + ext + 0.2;
+        } else it.obj.visible = d <= hw + half;
       }
     },
   };

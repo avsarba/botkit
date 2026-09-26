@@ -5,7 +5,7 @@
 //   node tools/harness.mjs [--file dist/index.html] [--out out/run] [--size 1280x720]
 //                          [--mobile] [--wait 4000] [--shots 3000,6000]
 //                          [--scenario tools/scenarios/foo.mjs] [--eval "js expr"]
-//                          [--timeout 120000] [--quiet] [--xr]
+//                          [--timeout 120000] [--quiet] [--xr] [--raw]
 //
 // A scenario module exports `default async function ({ page, shot, sleep, log, game })`.
 //   shot(name)          -> saves out/<run>/<name>.png
@@ -47,6 +47,8 @@ const quiet = has('--quiet');
 // before any page script runs, emulating a Meta Quest 3 with two controllers. Scenarios drive it through
 // window.__xrDevice (see node_modules/iwer/lib/device/XRDevice.d.ts / XRController.d.ts).
 const xr = has('--xr');
+// --raw serves the file as it is, without the Artifact viewer's skeleton (dist/play.html, the standalone build, has its own)
+const raw = has('--raw');
 
 const ROOT = resolve('.');
 const THREE_DIR = join(ROOT, 'node_modules/three');
@@ -103,7 +105,8 @@ page.setDefaultTimeout(timeout);
 await page.route('**/*', async (route) => {
   const url = route.request().url();
   if (url === `${ORIGIN}/` || url === `${ORIGIN}/index.html`) {
-    const body = SKELETON_HEAD + (await readFile(file, 'utf8')) + '</body></html>';
+    const html = await readFile(file, 'utf8');
+    const body = raw ? html : SKELETON_HEAD + html + '</body></html>';
     return route.fulfill({ status: 200, contentType: 'text/html', headers: { 'content-security-policy': CSP }, body });
   }
   const m = url.match(/^https:\/\/cdn\.jsdelivr\.net\/npm\/three@[^/]+\/(.*)$/);

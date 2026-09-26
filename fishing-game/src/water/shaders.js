@@ -156,11 +156,29 @@ uniform float uShoreElev;
 // G = its distance from the dock
 uniform float uShoreProfile;
 uniform sampler2D tSkyline;
+// directional fog (the terrain's / scenery's): the fog color from this point's view azimuth relative to the sun
+uniform vec3 uFogSunDir;
+uniform vec3 uFogSun;
+uniform vec3 uFogMid;
+uniform vec3 uFogSide;
+uniform vec3 uFogAway;
+uniform float uDirFog;       // 1: the directional colors above; 0: three's fogColor
+// 1 (VR at the 'low' level): the multiplicative pass uses the flat surface's Fresnel and skips the wave / detail
+// normal (a uniform branch: no recompile). Splash rings still run so their foam keeps hiding the bed.
+uniform float uCheapMul;
 
 varying vec3 vWorld;
 varying vec2 vX0;
 varying vec3 vViewPos;
 varying float vLee;
+
+vec3 waterFogColor(vec3 ray) {
+  vec2 fxz = ray.xz;
+  float fl = length(fxz);
+  float cs = fl > 1e-4 ? dot(fxz / fl, uFogSunDir.xz) : 0.0;
+  vec3 c = cs > 0.0 ? mix(uFogSide, uFogMid, smoothstep(0.0, 0.7071, cs)) : mix(uFogSide, uFogAway, -cs);
+  return cs > 0.7071 ? mix(uFogMid, uFogSun, smoothstep(0.7071, 1.0, cs)) : c;
+}
 
 vec3 toDisplay(vec3 c) {
   #ifdef TONE_MAPPING
@@ -357,20 +375,33 @@ void main() {
 
   // ---- surface normal ------------------------------------------------------
   float var = 0.0; // slope variance the pixel cannot resolve (grows with distance)
-  float windPatch = texture2D(tDetail, vX0 * uPatchScale + uDetOff2P.zw).a;
-  // wind patches ("cat's paws"), sheltered shallows and the lee of the windward
-  // shore vary the roughness
   float lee = clamp(vLee, 0.0, 1.0);
-  float calm = mix(0.25, 1.3, smoothstep(0.25, 0.75, windPatch)) * mix(0.25, 1.0, smoothstep(0.15, 1.4, envDepthAt(vX0)))
-             * (1.0 - 0.8 * lee);
-  float ruffle = uRuffle * calm;
-  vec2 sl = gerstnerSlope(vX0, foot, calm * calm, var) * (1.0 - 0.6 * lee);
-  sl += detailSlope(vX0, uDet0, uDetOff01.xy, ruffle, var);
-  sl += detailSlope(vX0, uDet1, uDetOff01.zw, ruffle, var);
-  sl += detailSlope(vX0, uDet2, uDetOff2P.xy, ruffle, var);
+  float calm = 1.0;
   float foam = 0.0;
-  sl += rippleSlope(vX0, foot, var, foam);
-  vec3 N = normalize(vec3(-sl.x, 1.0, -sl.y));
+  vec3 N;
+#ifdef PASS_MUL
+  if (uCheapMul > 0.5) {
+    // the multiplicative pass only needs N for its Fresnel term, which barely moves near normal incidence: the flat
+    // surface's. The splash rings still run for their foam.
+    if (uRingCount > 0) rippleSlope(vX0, foot, var, foam);
+    N = vec3(0.0, 1.0, 0.0);
+  } else {
+#else
+  {
+#endif
+    float windPatch = texture2D(tDetail, vX0 * uPatchScale + uDetOff2P.zw).a;
+    // wind patches ("cat's paws"), sheltered shallows and the lee of the windward
+    // shore vary the roughness
+    calm = mix(0.25, 1.3, smoothstep(0.25, 0.75, windPatch)) * mix(0.25, 1.0, smoothstep(0.15, 1.4, envDepthAt(vX0)))
+               * (1.0 - 0.8 * lee);
+    float ruffle = uRuffle * calm;
+    vec2 sl = gerstnerSlope(vX0, foot, calm * calm, var) * (1.0 - 0.6 * lee);
+    sl += detailSlope(vX0, uDet0, uDetOff01.xy, ruffle, var);
+    sl += detailSlope(vX0, uDet1, uDetOff01.zw, ruffle, var);
+    sl += detailSlope(vX0, uDet2, uDetOff2P.xy, ruffle, var);
+    sl += rippleSlope(vX0, foot, var, foam);
+    N = normalize(vec3(-sl.x, 1.0, -sl.y));
+  }
   // Facets turned away from the eye are hidden behind the crests in front of
   // them; keep N.V at least half the flat surface's (which is tiny far away,
   // so the far-shore mirror is not lifted into the sky).
@@ -505,7 +536,8 @@ void main() {
          + shore * ((1.0 - F) * inscat * (1.0 - foamC) + glint * (1.0 - foamC) + uFoamRad * foamC);
   vec3 S = (1.0 - fogF) * (toDisplay(base + A) - pBase);
   #ifdef USE_FOG
-    S += fogF * fogColor * (vec3(1.0) - M);
+    vec3 fogC = uDirFog > 0.5 ? waterFogColor(vWorld - cameraPosition) : fogColor;
+    S += fogF * fogC * (vec3(1.0) - M);
   #endif
   gl_FragColor = vec4(max(S, vec3(0.0)), 1.0);
   #ifdef WATER_DEBUG

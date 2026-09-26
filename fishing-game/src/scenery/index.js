@@ -32,6 +32,8 @@ export function createScenery(ctx) {
   root.name = 'scenery';
   scene.add(root);
   const shared = createSharedUniforms();
+  // the environment's directional fog (every patched scenery material fogs per fragment with it, see shaderlib.js)
+  if (env && env.fogUniforms) Object.assign(shared, env.fogUniforms);
   const culler = createSectorCuller();
 
   const t0 = performance.now();

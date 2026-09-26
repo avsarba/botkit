@@ -9,7 +9,7 @@ import * as THREE from 'three';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { Line2 } from 'three/addons/lines/Line2.js';
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
-import { TACKLE, LURES, STATES, LAYERS, DOCK, G, clamp, lerp, damp, smoothstep, makeRng } from '../config.js';
+import { TACKLE, LURES, STATES, LAYERS, DOCK, G, XR_ROD_TILT_RAD, clamp, lerp, damp, smoothstep, makeRng } from '../config.js';
 import { createRod, ROD } from './rod.js';
 import { createLureModels } from './lures.js';
 import { createRope, enhanceLineMaterial } from './rope.js';
@@ -35,7 +35,7 @@ const SEG_GROW = 3;
 const TIP_SEGS = 6; // in flight the first few segments off the tip-top stay short ...
 const TIP_REST = 0.1; // ... at most this long (m), so paid-out line cannot fold up under the tip
 // VR (WebXR, see XR.md): the real rod rides the rod-hand controller grip at full scale
-const XR_TILT = THREE.MathUtils.degToRad(20); // blank tilted this far above the grip's forward (-Z) axis
+const XR_TILT = XR_ROD_TILT_RAD; // blank tilted this far above the grip's forward (-Z) axis (config.js, shared with src/xr/input.js)
 const XR_SEAT = new THREE.Vector3(0, 0, 0.006); // reel seat from the grip origin (rod-local: axis through the palm)
 const XR_LINE_PX = 1.5; // line width per eye in the headset (device px)
 const XR_TIP_MASS = 0.055; // kg: tip section + tackle lagging a swung rod (inertial bend)
@@ -634,6 +634,38 @@ export function createTackle(ctx) {
   }
   let teleported = false;
   const tipJump = new THREE.Vector3();
+
+  // VR, game halted (see the API's xrHold): pin the line to where the hand-held tip is now, with no simulation.
+  const _hold = new THREE.Vector3();
+  function xrHold() {
+    if (!xrOn) return;
+    followGrip(0); // refreshes the rod / grip matrices; dt 0 restarts the swing kinematics from the current pose
+    if (!xrTracked) return;
+    tip.copy(rod.tipLocal).applyMatrix4(rod.object.matrixWorld);
+    if (!vfinite(tip)) return;
+    if (!tipInit) {
+      tipPrev.copy(tip);
+      tipInit = true;
+    }
+    _hold.subVectors(tip, tipPrev);
+    tipPrev.copy(tip);
+    tipVel.set(0, 0, 0);
+    xrJump = false;
+    if (mode === 'home' && !lost) {
+      const bail = bailTarget;
+      resetToHome(); // re-hangs the rig under the tip and rewrites the line
+      bailTarget = bail;
+      return;
+    }
+    if (mode === 'lost') {
+      tail.pin(0, tip);
+      tail.write();
+      return;
+    }
+    if (_hold.lengthSq() > 1e-12 && !ropeNeedsLay) rope.shiftNearStart(_hold.x, _hold.y, _hold.z, 3);
+    pinRope();
+    rope.write();
+  }
 
   // ------------------------------------------------------------------ reel
   function animateReel(dt, input, frame) {
@@ -2283,6 +2315,16 @@ export function createTackle(ctx) {
     setXRMode,
     getRodBase,
     getReelHandle,
+    // VR: the rig jumped before this frame (a snap turn, a recenter), so the tip's move is a teleport, not a swing
+    // (the tip-speed test alone misses a 30 deg turn once frames take longer than ~30 ms)
+    xrTeleported() {
+      if (xrOn) xrJump = true;
+    },
+    // VR: the game is halted (the VR menu, the journal) but the rod still rides the moving hand. Keep the line on
+    // the rod: the tip follows the grip, the near line moves with it (a home rig re-hangs under it), and the swing
+    // kinematics restart from here, so neither the halt nor the resume reads as a whip. No physics step, no timers,
+    // no events.
+    xrHold,
     get xrMode() {
       return xrOn;
     },

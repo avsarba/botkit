@@ -15,7 +15,7 @@ import { createShowcase } from './showcase.js';
 import { createInput } from './input.js';
 import { createView, DEFAULT_PITCH } from './view.js';
 import { createQualityManager, defaultXRLevel } from './quality.js';
-import { createXR } from '../xr/index.js';
+import { createXR, CAST as XR_CAST } from '../xr/index.js';
 
 const DEG = Math.PI / 180;
 const LURE_BY_ID = Object.fromEntries(LURES.map((l) => [l.id, l]));
@@ -29,6 +29,10 @@ const REEL_SET_S = 0.12;
 const CLOCK_STATES = new Set([STATES.READY, STATES.CHARGING, STATES.CASTING, STATES.WAITING, STATES.STRIKE, STATES.FIGHTING]);
 // Coaching prompts during the angler's first few fights.
 const HINT_FIGHTS = 3;
+// Camera near plane: the desktop's, and in VR (a fish or a glove held up close to the face stays whole; 0.05 keeps the
+// depth precision at the far shore)
+const DESKTOP_NEAR_M = 0.1;
+const XR_NEAR_M = 0.05;
 // Retrieve advice per lure while it is in the water: [mouse / keyboard, touch with Slow off, touch with
 // Slow on]. The slow retrieve is Shift on a keyboard and the Slow toggle beside the big button on touch.
 const LURE_PROMPTS = {
@@ -135,7 +139,7 @@ export function createGame(opts) {
     qm,
     species: opts.species || [],
     getHandlers: () => handlers,
-    getModules: () => ({ tackle, showcase, ui, audio }),
+    getModules: () => ({ tackle, showcase, ui, audio, fishKeeper: opts.fishProgramKeeper }),
     getConfig: () => ({ units, muted, quality: qm.auto ? 'auto' : qm.quality, records, rodHand, lureId, hours }),
     hooks: {
       onStart: (info) => onXRStart(info),
@@ -143,6 +147,8 @@ export function createGame(opts) {
       onEnd: () => onXREnd(),
       onVisibility: (v) => onXRVisibility(v),
       onAvailability: (ok) => announceXR(ok),
+      // three.js could not start a granted session (it has put the drawing buffer back): one resize
+      onStartFailed: () => resize(),
     },
   });
   xr.setRodHand(rodHand);
@@ -184,6 +190,7 @@ export function createGame(opts) {
   let journalOpen = false;
   let slowToggle = false; // touch: the Slow chip (Shift on a keyboard)
   let timeScale = 1;
+  let fixedDt = 0; // debug: every frame steps the game this much (s) whatever the frame time (0 = real time)
   let lastNow = 0;
   let fpsAcc = 0;
   let fpsFrames = 0;
@@ -193,6 +200,9 @@ export function createGame(opts) {
   let needsRender = false;
   let xrCharge = false; // CHARGING was entered with the rod-hand trigger (VR)
   let xrReelWas = false; // the reel hand was reeling last frame (VR reel-set release)
+  let xrWasHalted = true; // VR: the simulation did not run last frame (a pause, the journal, a session start)
+  let xrHintPending = false; // VR: the one-time controls hint (lures, menu) at the first READY of a session
+  let xrReelHintT = -99; // VR: when the "the other trigger reels" hint last showed (game time)
   let lastFlags = null; // the catch card's flags (the VR card is shown again when a session starts on it)
   const pendingCasts = [];
   const eventLog = [];
@@ -586,6 +596,13 @@ export function createGame(opts) {
 
   function onKey(code) {
     if (!ready || state === STATES.TITLE) return;
+    // VR: the page's dialogs sit hidden (and inert) behind the headset, so their own Esc handling is off; Esc / P
+    // open and close the VR menu instead (closing an open journal first), in any state, the catch card included.
+    if (xr.presenting && (code === 'Escape' || code === 'KeyP')) {
+      if (journalOpen) closeJournal();
+      else setUserPause(!userPaused);
+      return;
+    }
     const modal = !!(ui && ui.isModalOpen());
     if (code === 'KeyJ') {
       if (journalOpen) closeJournal();
@@ -699,6 +716,11 @@ export function createGame(opts) {
     held.clear();
     xrCharge = false;
     xrReelWas = false;
+    xrWasHalted = true; // the first simulated frame in the headset is a discontinuity (the desktop rod -> the hand)
+    xrHintPending = true;
+    // the fish held up to the face, a glove brought close: the default 0.1 m near plane would cut them open
+    camera.near = XR_NEAR_M;
+    camera.updateProjectionMatrix();
     view.setBypass(true);
     qm.enterXR(level);
     frame.quality = qm.quality;
@@ -730,15 +752,20 @@ export function createGame(opts) {
 
   // the dock eye, looking where the headset last looked (runs before the tackle rebuilds its desktop view model)
   function restoreDesktopView() {
+    if (camera.near !== DESKTOP_NEAR_M) {
+      camera.near = DESKTOP_NEAR_M;
+      camera.updateProjectionMatrix();
+    }
     if (!view.bypass) return;
     view.setBypass(false);
     view.set(xr.xin.head.yaw, DEFAULT_PITCH, true);
     view.apply();
   }
 
-  // the headset's system menu / taking it off: a fish on waits for the angler (like a window blur)
+  // the headset's system menu / taking it off: the game pauses into the VR menu, whatever is going on (apps are expected
+  // to pause while the system UI has focus; with hand tracking it is also the way to the menu outside a fight)
   function onXRVisibility(v) {
-    if (v !== 'visible' && ready && (state === STATES.STRIKE || state === STATES.FIGHTING || state === STATES.LANDING)) setUserPause(true);
+    if (v !== 'visible' && ready && state !== STATES.TITLE) setUserPause(true);
   }
 
   // the DOM UI while the headset presents: not visible in the headset, and inert so a mouse / keyboard on a PC VR
@@ -783,6 +810,7 @@ export function createGame(opts) {
       rodDeg: +((c.rodRad * 180) / Math.PI).toFixed(1), // the rod's elevation at release
       lob: c.lob,
       behind: c.behind,
+      gazeAssist: +c.gazeW.toFixed(2), // how far a flat swing's direction was turned toward the gaze (0..0.7)
     });
     if (c.behind) {
       setState(STATES.READY);
@@ -792,10 +820,27 @@ export function createGame(opts) {
     doCast(c.power01, c.direction, { pitchRad: c.pitchRad });
   }
 
+  // VR hints naming the hands (the rod hand casts and strikes, the other hand reels, picks lures, opens the menu)
+  const xrReelSide = () => (rodHand === 'left' ? 'right' : 'left');
+  function xrControlsHint() {
+    const lures = rodHand === 'left' ? 'A / B' : 'X / Y';
+    xr.hudCall('toast', `${lures}: change lure \u00b7 ${xrReelSide()} stick click: menu`, 'info', 6500);
+  }
+  // the rod trigger does nothing while the line is out: point at the one that reels
+  function xrReelHint() {
+    if (frame.time - xrReelHintT < 5) return;
+    xrReelHintT = frame.time;
+    xr.hudCall('toast', `The ${xrReelSide()} trigger reels`, 'info');
+  }
+
   // One controller snapshot per XR frame -> game actions (the continuous parts are in processInput).
   function xrActions(x) {
     if (!x || !ready) return;
     if (state !== STATES.CHARGING) xrCharge = false;
+    if (xrHintPending && state === STATES.READY && !userPaused && !journalOpen) {
+      xrHintPending = false;
+      xrControlsHint();
+    }
     // reel-hand thumbstick click: the VR menu (pause); it also closes an open journal
     if (x.menu) {
       if (journalOpen) closeJournal();
@@ -823,7 +868,11 @@ export function createGame(opts) {
         break;
       case STATES.CHARGING:
         if (xrCharge && !x.rod.triggerHeld) {
-          if (x.rod.present) xrCast();
+          if (x.rod.present && chargeT < XR_CAST.minHoldS && x.rod.castSpeed < XR_CAST.stillMps) {
+            // a reflex tap of the trigger with the rod still: not a cast (the desktop ignores clicks under 0.12 s)
+            xrCharge = false;
+            setState(STATES.READY);
+          } else if (x.rod.present) xrCast();
           else {
             // the rod controller went away mid-swing (not just a tracking blip): no cast
             xrCharge = false;
@@ -832,11 +881,16 @@ export function createGame(opts) {
         }
         break;
       case STATES.WAITING: {
-        // a sweep right on top of a nibble yanks the bait away, as a click does on the desktop
+        // a deliberate sweep right on top of a nibble yanks the bait away, as a click does on the desktop (easing the
+        // rod up to watch the float is not one)
         const L = lure();
-        if ((x.hookGesture || x.rod.primaryDown) && L && LURE_BY_ID[L.id] && LURE_BY_ID[L.id].kind === 'bait' && L.inWater && frame.time - lastNibbleT < EARLY_STRIKE_S) earlyStrike();
+        if ((x.deliberateStrike || x.rod.primaryDown) && L && LURE_BY_ID[L.id] && LURE_BY_ID[L.id].kind === 'bait' && L.inWater && frame.time - lastNibbleT < EARLY_STRIKE_S) earlyStrike();
+        if (x.rod.triggerDown) xrReelHint();
         break;
       }
+      case STATES.FIGHTING:
+        if (x.rod.triggerDown) xrReelHint();
+        break;
       case STATES.STRIKE:
         if (x.hookGesture || x.rod.primaryDown) hookset();
         // a reel set: letting go of the reel sets it too (like releasing the button on the desktop)
@@ -1032,8 +1086,9 @@ export function createGame(opts) {
     if (state === STATES.FIGHTING) stepFight(dt);
     const hf = frame.hooked;
     if (state === STATES.FIGHTING && hf) {
-      tackle.setFight(true, { fishPosition: hf.position, tensionN: fight.tensionN, lineOutM: fight.lineOutM });
-      tackle.setRodLoad(fight.tensionN, hf.position);
+      // (the frame's mean over the fight substeps: smooth at any frame rate)
+      tackle.setFight(true, { fishPosition: hf.position, tensionN: fight.frameTensionN, lineOutM: fight.lineOutM });
+      tackle.setRodLoad(fight.frameTensionN, hf.position);
     } else if (state === STATES.LANDING && hf) {
       tackle.getRodTip(_tip);
       const d = hf.position.distanceTo(_tip);
@@ -1044,7 +1099,7 @@ export function createGame(opts) {
 
     // frame numbers
     if (state === STATES.FIGHTING) {
-      frame.tensionN = fight.tensionN;
+      frame.tensionN = fight.frameTensionN;
       frame.lineOutM = fight.lineOutM;
       frame.slipMps = fight.slipMps;
     } else if (state === STATES.LANDING) {
@@ -1195,12 +1250,13 @@ export function createGame(opts) {
     if (xr.presenting) xr.hudCall('update', hud, frame, xr.xin);
   }
 
-  // Prompts in the headset: controller wording (rod hand: trigger to cast, sweep to strike; reel hand: trigger / crank).
+  // Prompts in the headset: controller wording naming the hand (the rod hand's trigger casts, a rod sweep strikes; the
+  // other hand's trigger reels, or turning the reel).
   const _xp = [null, 'info'];
   const XR_LURE_PROMPTS = {
-    spinner: 'Steady retrieve: half-pull the reel trigger, or turn the reel',
-    crankbait: 'Pull the reel trigger to crank it down \u00b7 pause now and then',
-    topwater: 'Light reel-trigger pulls walk it \u00b7 pause now and then',
+    spinner: (r) => `Steady retrieve: half-pull the ${r} trigger, or turn the reel`,
+    crankbait: (r) => `Pull the ${r} trigger to crank it down \u00b7 pause now and then`,
+    topwater: (r) => `Light ${r}-trigger pulls walk it \u00b7 pause now and then`,
   };
   function xrPrompt(L, hf) {
     _xp[0] = null;
@@ -1212,25 +1268,28 @@ export function createGame(opts) {
     };
     const keep = rodHand === 'left' ? 'X' : 'A';
     const rel = rodHand === 'left' ? 'Y' : 'B';
+    const rodT = rodHand === 'left' ? 'left' : 'right';
+    const reelT = xrReelSide();
     switch (state) {
       case STATES.READY:
-        return say('Hold the trigger, swing the rod forward and let go to cast');
+        return say(`Hold the ${rodT} trigger, swing the rod forward and let go to cast`);
       case STATES.CHARGING:
-        return say('Swing forward and let go of the trigger');
+        return say(`Swing forward and let go of the ${rodT} trigger`);
       case STATES.WAITING: {
         if (!L) return _xp;
         const def = LURE_BY_ID[L.id];
-        if (L.state === 'land') return say('On the bank. Pull the reel trigger to reel it in');
+        if (L.state === 'land') return say(`On the bank. Pull the ${reelT} trigger to reel it in`);
         if (def && def.kind === 'bait') {
           if (L.state !== 'water') return _xp;
           if (frame.time - lastNibbleT < 1.2) return say('Nibble\u2026 wait for it');
-          return say('Watch the float \u00b7 sweep the rod up when it goes under');
+          return say(`Watch the float \u00b7 sweep the rod up when it goes under \u00b7 ${reelT} trigger reels in`);
         }
-        return say(XR_LURE_PROMPTS[L.id] || 'Pull the reel trigger to reel \u00b7 pause now and then');
+        return say(XR_LURE_PROMPTS[L.id] ? XR_LURE_PROMPTS[L.id](reelT) : `Pull the ${reelT} trigger to reel \u00b7 pause now and then`);
       }
       case STATES.STRIKE:
+        // (also shown while the STRIKE cue flashes: the cue may be out of view, e.g. while looking at the wrist)
         if (bite && bite.reelSet) return say('Keep reeling!', 'danger');
-        return say('Sweep the rod up!', 'danger');
+        return say('Strike! Sweep the rod up', 'danger');
       case STATES.FIGHTING:
         if (hf) {
           const fp = fightPrompt(hf, false, true);
@@ -1268,7 +1327,7 @@ export function createGame(opts) {
     if (!fightHints) return _fp;
     // coaching for the angler's first few fights
     const ft = fs.t;
-    if (ft < 4) return say(vr ? 'Fish on! Reel with the trigger \u00b7 keep the rod up' : touch ? 'Fish on! Hold to reel \u00b7 drag up to lift the rod' : 'Fish on! Hold to reel \u00b7 mouse up lifts the rod', 'good');
+    if (ft < 4) return say(vr ? `Fish on! Reel with the ${xrReelSide()} trigger \u00b7 keep the rod up` : touch ? 'Fish on! Hold to reel \u00b7 drag up to lift the rod' : 'Fish on! Hold to reel \u00b7 mouse up lifts the rod', 'good');
     const lat = hf.velocity.x * fightInp.rightX + hf.velocity.z * fightInp.rightZ; // + = running right
     if (Math.abs(lat) > 0.6 && frame.input.rodSide * Math.sign(lat) > -0.3) {
       const dir = lat > 0 ? 'left' : 'right';
@@ -1277,7 +1336,7 @@ export function createGame(opts) {
       return say(touch ? `Running ${run}: drag ${dir} for side pressure` : `Running ${run}: mouse ${dir} (${lat > 0 ? 'A' : 'D'}) for side pressure`, 'info');
     }
     if (ft > 8 && ft < 13) return say('Pump it: lift the rod, then reel as you lower it', 'info');
-    if (ft > 16 && ft < 21) return say(vr ? 'Rod thumbstick up / down sets the drag \u00b7 keep it out of the red' : touch ? 'The \u2212 / + buttons set the drag' : 'Scroll or [ ] sets the drag \u00b7 keep it out of the red', 'info');
+    if (ft > 16 && ft < 21) return say(vr ? `${rodHand === 'left' ? 'Left' : 'Right'} thumbstick up / down sets the drag \u00b7 keep it out of the red` : touch ? 'The \u2212 / + buttons set the drag' : 'Scroll or [ ] sets the drag \u00b7 keep it out of the red', 'info');
     return _fp;
   }
 
@@ -1300,11 +1359,12 @@ export function createGame(opts) {
     lastTris = info.render.triangles;
   }
 
-  const xrCtx = { dt: 0, frame: null, lineTarget: null, allowSticks: true, allowTurn: true };
+  const xrCtx = { dt: 0, frame: null, lineTarget: null, allowSticks: true, allowTurn: true, slackLine: false };
   function loop(now, xrFrame) {
     const realDt = lastNow ? Math.max(0, (now - lastNow) / 1000) : 1 / 60;
     lastNow = now;
     if (!ready) return;
+    const stepDt = fixedDt > 0 ? fixedDt : Math.min(0.05, realDt); // game time this frame
     fpsAcc += realDt;
     fpsFrames++;
     if (fpsAcc >= 1) {
@@ -1318,14 +1378,20 @@ export function createGame(opts) {
       const halted = userPaused || journalOpen;
       const L = lure();
       const hf = frame.hooked;
-      xrCtx.dt = Math.min(0.05, realDt);
+      xrCtx.dt = stepDt;
       xrCtx.frame = halted ? null : frame;
       xrCtx.lineTarget = hf ? hf.position : L && L.state !== 'home' && L.state !== 'flying' ? L.bobberPosition || L.position : null;
       xrCtx.allowSticks = xrCtx.allowTurn = !halted;
+      xrCtx.slackLine = state === STATES.FIGHTING && fight.state.slackT > 0.3;
       xrActions(xr.beginFrame(xrFrame, xrCtx));
     }
     // (in VR every frame renders, paused or not: the headset needs a frame and the menu lives in the scene)
     if (userPaused || journalOpen || (document.hidden && !xrOn)) {
+      if (xrOn) {
+        // the rod rides the hand meanwhile: keep the line on its tip, and treat the resume as a discontinuity
+        xrWasHalted = true;
+        xr.holdTackle();
+      }
       updateHud();
       if (needsRender || xrOn) {
         needsRender = false;
@@ -1337,9 +1403,16 @@ export function createGame(opts) {
     // Adaptive quality samples BEFORE this frame renders: a pixel-ratio step resizes (and so clears) the
     // drawing buffer, which has to happen before the draw, not after it, or the browser would present a
     // blank frame (a black flash) each time auto quality adjusts. In VR the XR frame time drives it.
+    // (not while a session is starting: three.js has already noted the drawing buffer's size and pixel ratio to
+    // restore on exit, and the XR profile takes over the level in a moment)
     if (xrOn) xr.sampleQuality(realDt);
-    else if (state !== STATES.TITLE || qm.auto) qm.sample(realDt);
-    const dt = Math.min(0.05, realDt);
+    else if (!xr.settingUp && (state !== STATES.TITLE || qm.auto)) qm.sample(realDt);
+    // VR: the game runs again after a halt (the menu, the journal, however it was resumed: the reel-stick click, Esc,
+    // J, the HUD's Resume, debug.pause) or a session start. The rod moved with the hand meanwhile: that move is not a
+    // swing (no hookset, no cast speed, no whip of the line).
+    if (xrOn && xrWasHalted) xr.markDiscontinuity();
+    xrWasHalted = false;
+    const dt = stepDt;
     for (let i = 0; i < timeScale; i++) simulate(dt);
     renderFrame(dt);
     needsRender = false;
@@ -1348,7 +1421,9 @@ export function createGame(opts) {
   // ---------------------------------------------------------------- resize / visibility
   // A VR session is starting or presenting: the page may lose focus / be hidden because the headset took over,
   // and three.js owns the drawing buffer (it warns "Can't change size while VR device is presenting").
-  const xrBusy = () => xr.presenting || xr.starting || renderer.xr.isPresenting;
+  // (granted, not merely requested: a request left pending behind a permission prompt must not stop the desktop game
+  // from pausing on blur / a hidden tab)
+  const xrBusy = () => xr.presenting || xr.settingUp || renderer.xr.isPresenting;
   function resize() {
     if (xr.presenting || renderer.xr.isPresenting) return; // (onXREnd resizes once the session is over)
     const stage = canvas.parentElement;
@@ -1580,6 +1655,13 @@ export function createGame(opts) {
     setTimeScale(k) {
       timeScale = clamp(Math.round(Number(k) || 1), 1, 60);
       return timeScale;
+    },
+    // every rendered frame steps the game by exactly s seconds (0.001..0.05) whatever the real frame time; 0 = real
+    // time. A scripted VR gesture (one pose per XR frame) then has exact speeds even when an emulated frame comes early.
+    setFixedDt(sec) {
+      const v = Number(sec) || 0;
+      fixedDt = v > 0 ? clamp(v, 0.001, 0.05) : 0;
+      return fixedDt;
     },
     setPixelRatio(p) {
       qm.setAuto(false);

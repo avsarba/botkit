@@ -466,10 +466,11 @@ export function createUI(ctx = {}) {
     root.inert = on;
     xrNote.hidden = !on;
     if (on) return;
-    // back on the page: a dialog opened meanwhile (the pause menu, the journal, the catch card) takes focus as usual
+    // back on the page: a dialog opened meanwhile (the pause menu, the journal, the catch card) takes focus as it
+    // would have on opening (Resume, Close, Release)
     const top = dialogStack[dialogStack.length - 1];
     if (top && top.el.isConnected) {
-      const f = focusables(top.el)[0] || top.el;
+      const f = top.focusEl && !top.focusEl.disabled ? top.focusEl : focusables(top.el)[0] || top.el;
       try {
         f.focus({ preventScroll: true });
       } catch {
@@ -479,7 +480,7 @@ export function createUI(ctx = {}) {
   }
 
   // ---------- dialogs: focus in, Tab trap, Esc ----------
-  const dialogStack = []; // { el, onEsc, restore }
+  const dialogStack = []; // { el, onEsc, restore, focusEl }
   function focusables(el) {
     return Array.from(el.querySelectorAll('button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')).filter(
       (n) => !n.hidden && n.offsetParent !== null
@@ -493,7 +494,7 @@ export function createUI(ctx = {}) {
     if (i >= 0) dialogStack.splice(i, 1);
     const prev = doc.activeElement;
     const restore = mayRestore && fromKeyboard() && prev && prev !== doc.body && root.contains(prev) && !el.contains(prev) ? prev : null;
-    dialogStack.push({ el, onEsc, restore, openedAt: performance.now() });
+    dialogStack.push({ el, onEsc, restore, focusEl, openedAt: performance.now() });
     const target = focusEl && !focusEl.disabled ? focusEl : el;
     try {
       target.focus({ preventScroll: true });

@@ -33,6 +33,13 @@ export const TACKLE = {
   maxCastM: 42,
 };
 
+// VR (XR.md): how the rod sits in the rod-hand controller grip, shared by the tackle (the drawn rod and glove) and the
+// XR input (rod direction, lift, casts, hooksets). The blank runs along the grip's forward (-Z) axis tilted this much
+// up: 0 = straight through the fist, the way a spinning rod sits in a real hand (on a Touch controller the grip's -Z is
+// already ~45 deg above the pointing ray). Try -10..+5 deg on a headset; a higher resting lift belongs in the
+// rodLift01 mapping (src/xr/input.js), not in this visual mount.
+export const XR_ROD_TILT_RAD = 0;
+
 // Terminal tackle the player can tie on (keys 1-4).
 export const LURES = [
   {

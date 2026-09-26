@@ -530,14 +530,19 @@ export function createGame(opts) {
 
   // ---------------------------------------------------------------- UI handlers (CONTRACT.md "UI")
   const handlers = {
-    onStart: () => startGame(),
+    onStart: () => {
+      if (!xr.presenting) startGame();
+    },
     onLure: (id) => setLure(id),
     onDrag: (d01) => setDrag(d01),
     onTimePreset: (h) => setHours(h),
     onMute: (m) => setMuted(m),
     onUnits: (u) => setUnits(u),
     onPause: (p) => setUserPause(p),
-    onActionDown: () => actionDown('touch'),
+    // (the DOM hold button: not while a headset presents, where the controllers are the input)
+    onActionDown: () => {
+      if (!xr.presenting) actionDown('touch');
+    },
     onActionUp: () => actionUp('touch'),
     onQuality: (q) => setQualityManual(q),
     onSlow: (on) => {
@@ -572,7 +577,7 @@ export function createGame(opts) {
         if (state !== STATES.TITLE && !(ui && ui.isModalOpen())) setDrag(drag01 + s * 0.05);
       },
       touchStart: () => {
-        if (state === STATES.STRIKE) hookset(); // any tap sets the hook on touch screens
+        if (state === STATES.STRIKE && !xr.presenting) hookset(); // any tap sets the hook on touch screens
       },
       touchEnd: () => {},
       key: onKey,
@@ -675,12 +680,22 @@ export function createGame(opts) {
         console.warn('[core] audio start failed', err);
       }
     }
-    return xr.enter({ level: manualQuality || defaultXRLevel() });
+    return xr.enter({ level: xrLevel() });
+  }
+
+  // The XR quality profile (XR.md): a standalone headset (Quest, Pico) always starts at 'low', whatever was picked
+  // for the 2D page (on the same phone-class GPU a desktop pick of 'high' would not hold the headset's frame rate);
+  // elsewhere (PC VR) a level picked by hand in the pause menu is used, else 'medium'.
+  function xrLevel() {
+    const def = defaultXRLevel();
+    if (def === 'low' || !manualQuality) return def;
+    return manualQuality;
   }
 
   // The rig, camera and grips are in place (src/xr did that); now the game side.
   function onXRStart({ level }) {
     input.suspend(true);
+    uiXR(true);
     held.clear();
     xrCharge = false;
     xrReelWas = false;
@@ -699,6 +714,7 @@ export function createGame(opts) {
 
   // Back to the desktop in the current state, the camera at the dock eye looking where the headset looked.
   function onXREnd() {
+    uiXR(false);
     input.suspend(false);
     input.disarm();
     xrCharge = false;
@@ -723,6 +739,18 @@ export function createGame(opts) {
   // the headset's system menu / taking it off: a fish on waits for the angler (like a window blur)
   function onXRVisibility(v) {
     if (v !== 'visible' && ready && (state === STATES.STRIKE || state === STATES.FIGHTING || state === STATES.LANDING)) setUserPause(true);
+  }
+
+  // the DOM UI while the headset presents: not visible in the headset, and inert so a mouse / keyboard on a PC VR
+  // setup cannot press its buttons behind the player's back (the page shows a short "playing in VR" note)
+  function uiXR(on) {
+    if (ui && typeof ui.setXRPresenting === 'function') {
+      try {
+        ui.setXRPresenting(!!on);
+      } catch (err) {
+        console.warn('[core] setXRPresenting failed', err);
+      }
+    }
   }
 
   function announceXR(ok) {
@@ -751,6 +779,8 @@ export function createGame(opts) {
       speedMps: +c.speed.toFixed(2),
       yawDeg: +((Math.atan2(c.direction.x, -c.direction.z) * 180) / Math.PI).toFixed(1), // + = right of the lake axis
       pitchDeg: +((c.pitchRad * 180) / Math.PI).toFixed(1),
+      tipElevDeg: +((c.elevRad * 180) / Math.PI).toFixed(1), // the tip's path at release
+      rodDeg: +((c.rodRad * 180) / Math.PI).toFixed(1), // the rod's elevation at release
       lob: c.lob,
       behind: c.behind,
     });
@@ -1316,8 +1346,11 @@ export function createGame(opts) {
   }
 
   // ---------------------------------------------------------------- resize / visibility
+  // A VR session is starting or presenting: the page may lose focus / be hidden because the headset took over,
+  // and three.js owns the drawing buffer (it warns "Can't change size while VR device is presenting").
+  const xrBusy = () => xr.presenting || xr.starting || renderer.xr.isPresenting;
   function resize() {
-    if (xr.presenting) return; // three.js owns the drawing buffer while the headset presents (resized on exit)
+    if (xr.presenting || renderer.xr.isPresenting) return; // (onXREnd resizes once the session is over)
     const stage = canvas.parentElement;
     const w = Math.max(1, (stage && stage.clientWidth) || window.innerWidth);
     const h = Math.max(1, (stage && stage.clientHeight) || window.innerHeight);
@@ -1329,7 +1362,7 @@ export function createGame(opts) {
   window.addEventListener('resize', resize);
   if (typeof ResizeObserver === 'function' && canvas.parentElement) new ResizeObserver(resize).observe(canvas.parentElement);
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && ready && state !== STATES.TITLE && !xr.presenting) setUserPause(true);
+    if (document.hidden && ready && state !== STATES.TITLE && !xrBusy()) setUserPause(true);
     if (document.hidden) flushPersist();
     lastNow = 0;
   });
@@ -1337,7 +1370,7 @@ export function createGame(opts) {
   // on, pause so it isn't lost while the angler is looking elsewhere. (Idle states keep running.)
   window.addEventListener('blur', () => {
     // (in VR the session's own visibility decides: the page may lose focus when the headset takes over)
-    if (ready && !xr.presenting && (state === STATES.STRIKE || state === STATES.FIGHTING || state === STATES.LANDING)) setUserPause(true);
+    if (ready && !xrBusy() && (state === STATES.STRIKE || state === STATES.FIGHTING || state === STATES.LANDING)) setUserPause(true);
   });
 
   // ---------------------------------------------------------------- hot reload snapshot
@@ -1515,7 +1548,28 @@ export function createGame(opts) {
       available: () => xr.detect(),
       enter: () => (ready ? enterVR() : whenReady().then(() => enterVR())),
       exit: () => xr.exit(),
-      status: () => ({ ...xr.status(), state, paused: userPaused, rodLift01: r2(frame.input.rodLift01), rodSide: r2(frame.input.rodSide), reelSpeed01: r2(frame.input.reelSpeed01), quality: qm.quality }),
+      status: () => ({
+        ...xr.status(),
+        state,
+        paused: userPaused,
+        journalOpen,
+        rodLift01: r2(frame.input.rodLift01),
+        rodSide: r2(frame.input.rodSide),
+        reelSpeed01: r2(frame.input.reelSpeed01),
+        quality: qm.quality,
+        qualityAuto: qm.auto,
+        pixelRatio: qm.pixelRatio,
+        settings: { units, muted: audio ? !!audio.muted : muted, hours: r2(hours), lureId, rodHand },
+      }),
+      // a world point in the rig's frame (the XR reference space the emulator's poses are given in)
+      toRig: (p) => {
+        const v = new THREE.Vector3(Number(p[0]) || 0, Number(p[1]) || 0, Number(p[2]) || 0);
+        xr.rig.updateMatrixWorld(true);
+        xr.rig.worldToLocal(v);
+        return [v.x, v.y, v.z].map((x) => Math.round(x * 1000) / 1000);
+      },
+      // a VR panel button's centre ({ world, local } where local is in the XR reference space), for pointing a ray
+      panelTarget: (panel, id) => xr.panelTarget(panel, id),
       // extras for scenarios
       waitFrames: (n = 1) => xr.waitFrames(n),
       // fn(frameCount) after each XR frame's controller read, until it returns false (drive poses frame-exactly)

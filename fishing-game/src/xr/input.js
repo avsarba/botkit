@@ -26,13 +26,17 @@ const STICK_OFF = 0.3;
 const DRAG_REPEAT_S = 0.25;
 const CRANK_NEAR_M = 0.25; // the reel hand must be this close to the reel handle
 const CRANK_MIN_RPS = 0.5;
-export const CRANK_M_PER_REV = 0.8; // line per handle turn
+export const CRANK_M_PER_REV = TACKLE.reelRetrieveMps / TACKLE.reelTurnsPerS; // line per handle turn (~0.52 m, the reel's)
 const CRANK_MIN_HAND_MPS = 0.1; // below this the hand isn't moving enough to tell a circle
 const CRANK_HOLD_S = 0.25; // crank stays "on" this long through a sample that can't tell
 const LIFT_FULL_RAD = 60 * DEG;
 const SIDE_FULL = 0.75; // sin of the rod's angle off the line (times its horizontal share) that is full side pressure
-// cast mapping (XR.md): power from rod-tip speed at release, direction from its horizontal part, pitch from its elevation
-export const CAST = { minMps: 1.2, spanMps: 10, minPower: 0.08, lobPower: 0.12, stillMps: 0.5, lobPitchRad: 25 * DEG, pitchMinRad: 8 * DEG, pitchMaxRad: 55 * DEG, minHorizMps: 1, behindRad: 110 * DEG };
+// cast mapping (XR.md): power from rod-tip speed at release, direction from its horizontal part, launch pitch from its
+// elevation or, in an overhead cast, from the rod's own elevation at release less rodReleaseRad (whichever is higher).
+// A rod swinging forward past vertical moves its tip downward, so the tip's path alone would launch every overhead cast
+// at the 8 deg floor; the rod unloading as the line is let go lifts the lure: let go at "11 o'clock" (rod ~55 deg up)
+// and it flies out at ~30 deg (the desktop's launch pitch), earlier goes higher, later lower.
+export const CAST = { minMps: 1.2, spanMps: 10, minPower: 0.08, lobPower: 0.12, stillMps: 0.5, lobPitchRad: 25 * DEG, pitchMinRad: 8 * DEG, pitchMaxRad: 55 * DEG, rodReleaseRad: 25 * DEG, minHorizMps: 1, behindRad: 110 * DEG };
 // "behind the player": measured from the lake direction (the rig's -Z at session start; snap turns don't move it)
 const LAKE = new THREE.Vector3(0, 0, -1);
 
@@ -535,7 +539,7 @@ export function createXRInput({ rig }) {
   }
 
   // Cast from the tip velocity at trigger release (XR.md "Rod-tip cast mapping").
-  const castOut = { power01: 0, direction: new THREE.Vector3(0, 0, -1), pitchRad: 0, speed: 0, behind: false, lob: false, angleFromLakeRad: 0 };
+  const castOut = { power01: 0, direction: new THREE.Vector3(0, 0, -1), pitchRad: 0, speed: 0, elevRad: 0, rodRad: 0, behind: false, lob: false, angleFromLakeRad: 0 };
   function castFromRelease() {
     const v = xin.rod.tipVel;
     const speed = v.length();
@@ -550,7 +554,10 @@ export function createXRInput({ rig }) {
       if (_v2.lengthSq() < 1e-6) _v2.copy(LAKE);
       castOut.direction.copy(_v2.normalize());
     }
-    castOut.pitchRad = castOut.lob ? CAST.lobPitchRad : clamp(Math.atan2(v.y, Math.max(h, 1e-6)), CAST.pitchMinRad, CAST.pitchMaxRad);
+    castOut.elevRad = Math.atan2(v.y, Math.max(h, 1e-6)); // the tip's path
+    castOut.rodRad = xin.rod.pitch; // the (unbent) rod's elevation
+    const launch = Math.max(castOut.elevRad, castOut.rodRad - CAST.rodReleaseRad);
+    castOut.pitchRad = castOut.lob ? CAST.lobPitchRad : clamp(launch, CAST.pitchMinRad, CAST.pitchMaxRad);
     castOut.angleFromLakeRad = castOut.direction.angleTo(LAKE);
     castOut.behind = castOut.angleFromLakeRad > CAST.behindRad;
     return castOut;

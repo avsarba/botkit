@@ -6,7 +6,7 @@
 //   hookset         rod   1.0 x 60 ms           lure lands           rod   0.2 x 25 ms
 //   fight           rod   continuous 0.08 + 0.55 * tension01, re-pulsed every ~50 ms; 0.9 x 40 ms on head shakes / jumps
 //   drag slipping   reel  0.35 x 12 ms per ~3 cm of line paid out (<= 30 Hz)
-//   reeling         reel  0.05 tick per handle turn (0.8 m of line)
+//   reeling         reel  0.05 tick per handle turn (~0.52 m of line, the reel's gear)
 //   line snap       rod   1.0 x 180 ms, then silence
 //   UI hover/press  that hand 0.1 x 10 ms       bail opens (cast hold)  rod 0.15 x 15 ms
 import { STATES, TACKLE, clamp } from '../config.js';

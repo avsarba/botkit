@@ -215,6 +215,18 @@ body {
 .toast[data-kind="bad"]::before { background: var(--red); }
 .toast[data-kind="bad"] { border-color: var(--red-soft); }
 .toast.is-out { opacity: 0; transform: translateY(-6px); }
+
+/* ---------- a VR headset presenting: the page behind it shows only a note (the HUD lives in the headset) ---------- */
+#ui[data-xr] > :not(.xr-note) { visibility: hidden !important; }
+.xr-note {
+  position: fixed; left: 50%; bottom: calc(28px + var(--safe-b, 0px)); transform: translateX(-50%);
+  max-width: calc(100% - 2 * var(--gut, 16px)); box-sizing: border-box;
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px 10px 14px;
+  font: 500 15px/1.3 var(--f-ui); color: var(--text);
+  background: var(--glass-strong); border: 1px solid var(--hair); border-radius: 8px;
+}
+.xr-note::before { content: ""; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
 @keyframes toast-in { from { transform: translateY(-8px); } to { transform: none; } }
 
 /* Prompt band: cast power + prompt live in a bottom-centre band, never in the middle of the screen
@@ -1138,5 +1150,6 @@ kbd {
 
   <div class="toasts" id="toasts"></div>
   <div id="ui-live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+  <p class="xr-note" id="xr-note" hidden>Playing in VR. To come back here, choose Exit VR in the headset menu (reel-hand thumbstick click).</p>
 </div>
 <!--BUNDLE-->

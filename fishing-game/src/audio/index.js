@@ -67,7 +67,11 @@ export function createAudio(ctx = {}) {
     rz: 0,
   };
 
-  const isHidden = () => typeof document !== 'undefined' && document.hidden === true;
+  // (a VR headset presenting counts as heard even when the 2D page reports itself hidden: some headset
+  // browsers hide or blur the page while the immersive session is up)
+  const xrMgr = ctx.renderer && ctx.renderer.xr ? ctx.renderer.xr : null;
+  const xrPresenting = () => !!(xrMgr && xrMgr.isPresenting);
+  const isHidden = () => typeof document !== 'undefined' && document.hidden === true && !xrPresenting();
   const wantRunning = () => started && !muted && !isHidden();
   const running = () => !!ac && ac.state === 'running';
 
@@ -163,6 +167,10 @@ export function createAudio(ctx = {}) {
           return false;
         }
         if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility);
+        if (xrMgr && typeof xrMgr.addEventListener === 'function') {
+          xrMgr.addEventListener('sessionstart', onVisibility);
+          xrMgr.addEventListener('sessionend', onVisibility);
+        }
         if (typeof window !== 'undefined') {
           window.addEventListener('pointerdown', kick, { capture: true, passive: true });
           window.addEventListener('keydown', kick, { capture: true, passive: true });
@@ -255,6 +263,10 @@ export function createAudio(ctx = {}) {
       clearTimeout(suspendTimer);
       clearInterval(idleTimer);
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility);
+      if (xrMgr && typeof xrMgr.removeEventListener === 'function') {
+        xrMgr.removeEventListener('sessionstart', onVisibility);
+        xrMgr.removeEventListener('sessionend', onVisibility);
+      }
       if (typeof window !== 'undefined') {
         window.removeEventListener('pointerdown', kick, { capture: true });
         window.removeEventListener('keydown', kick, { capture: true });

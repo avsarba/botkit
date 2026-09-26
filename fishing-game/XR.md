@@ -24,16 +24,31 @@ Desktop and phone play must keep working exactly as before. Read CONTRACT.md fir
   ['bounded-floor', 'hand-tracking', 'layers'] })`, falling back to `local` if `local-floor` is refused (then offset
   the rig by 1.6 m standing height). `renderer.xr.setReferenceSpaceType('local-floor')`, `renderer.xr.setSession(s)`.
   Framebuffer scale and fixed foveation come from the XR quality profile (below). Audio starts from the same click.
-- Entering VR from the title starts the game (READY) at once. Leaving VR (session `end`, from the menu or the headset's
-  system button) returns to the desktop view in the current state, with the camera back at the dock eye and everything
-  re-parented as before. Entering/leaving can happen any number of times without leaks or duplicated listeners.
+- Entering VR from the title starts the game (READY) at once; entering from the pause menu resumes the game in the
+  headset. Leaving VR (session `end`, from the menu or the headset's system button) returns to the desktop view in the
+  current state, with the camera back at the dock eye and everything re-parented as before. Exit VR in the VR menu
+  leaves the game paused (that menu is the pause), so the player finds the page's own pause menu; a session ended from
+  the headset leaves it as it was. Entering/leaving can happen any number of times without leaks or duplicated listeners.
 - `renderer.setAnimationLoop` is already used (it drives XR frames too). Nothing may call `requestAnimationFrame` for
-  per-frame work while presenting (it does not fire in XR).
+  per-frame work while presenting (it does not fire in XR). Every frame renders while presenting, paused or not (the
+  headset needs a frame and the menu lives in the scene).
+- The 2D page while presenting: the headset browser may blur or hide it as the session starts (Quest does). Window `blur`
+  and `document` `visibilitychange` never pause the game while a session is starting or presenting, and the sound keeps
+  playing; instead the session's own `visibilitychange` (the headset's system menu: `visible-blurred` / `hidden`) pauses
+  during STRIKE, FIGHTING or LANDING, which opens the VR menu. three.js owns the drawing buffer while presenting: the
+  game's resize handler and the quality manager never resize it or change the pixel ratio then (three.js warns "Can't
+  change size while VR device is presenting"); one resize runs on exit.
+- The page UI (`ui.setXRPresenting(on)`): hidden and `inert` while presenting, with a one-line "Playing in VR" note in
+  its place (what a PC VR monitor shows), so a mouse or keyboard at the desk cannot press its buttons; it keeps being
+  updated so it is current on exit. The desktop pointer / Space / steering input is suspended (the DOM hold button and
+  touch strikes are ignored too); the other key shortcuts (Esc, J, M, U, 1-4, [ ]) still work and reach the VR panels.
 
 ## Player rig and comfort
 
 - `rig` = a THREE.Group at `(0, DOCK.deckY, 0)` facing -Z. While presenting, the camera is a child of the rig so the
-  headset pose is relative to the deck. The rod-hand and reel-hand controller grips/rays are also rig children.
+  headset pose is relative to the deck. The rod-hand and reel-hand controller grips/rays are also rig children. On the
+  first frame of a session and after a reference-space `reset` the rig slides horizontally so the head starts over the
+  dock end, wherever the player stands in the room.
 - Snap turn: rod-hand thumbstick left/right past 0.7 -> rotate the rig 30 degrees about the headset position (one step per
   flick, re-armed below 0.3). No smooth locomotion; the player can walk physically.
 - Never move or rotate the XR view from game code (no follow camera, no title drift, no fight camera) while presenting;
@@ -41,30 +56,42 @@ Desktop and phone play must keep working exactly as before. Read CONTRACT.md fir
 
 ## Hands and input (default: rod in the right hand; a menu setting swaps hands)
 
+Hand tracking (no controllers): a pinch works as that hand's trigger; there are no stick or button gestures.
+
 | action | how |
 |---|---|
-| Cast | READY: hold the rod-hand **trigger** (finger on the line, bail opens, haptic tick), swing the rod forward, **release the trigger** during the swing. Power and direction come from the rod-tip velocity at release (see below). Releasing with the tip nearly still drops a short lob (power ~0.12). |
-| Reel | Reel-hand **trigger**, analog: speed = trigger value (dead zone 0.08) times TACKLE.reelRetrieveMps. Or turn the reel for real: circling the reel hand within ~25 cm of the reel handle at > 0.5 rev/s reels at the matching speed (about 0.8 m of line per turn at full speed). The larger of the two wins. |
+| Cast | READY: hold the rod-hand **trigger** (finger on the line, bail opens, haptic tick), swing the rod forward, **release the trigger** during the swing. Power and direction come from the rod-tip velocity at release (see below). Releasing with the tip nearly still drops a short lob (power ~0.12). A rod controller that goes away mid-swing (not just a tracking blip) cancels the cast. |
+| Reel | Reel-hand **trigger**, analog: speed = (trigger - 0.08) / 0.92 (dead zone 0.08) times TACKLE.reelRetrieveMps. Or turn the reel for real: circling the reel hand within ~25 cm of the reel handle at > 0.5 rev/s reels at the matching speed, with the reel's own gear: about 0.52 m of line per turn (`TACKLE.reelRetrieveMps` 0.78 m/s at `TACKLE.reelTurnsPerS` 1.5 turns/s, the same reel the desktop animates), so 1.5 rev/s and faster is the full retrieve. The larger of the two wins. The reel handle follows the circling hand (forward only, like anti-reverse). |
 | Slow retrieve | Light trigger pressure (analog), no modifier needed. |
 | Set the hook | During STRIKE: sweep the rod up/back sharply (rod-tip speed > 2.2 m/s upward/backward, or rod pitch rate > 3 rad/s), or press the rod-hand **A/X** button. Lure bites while reeling = reel set, as on desktop (keep reeling). |
 | Rod lift / side pressure | The real rod pose. rodLift01 = rod elevation above horizontal (0 deg -> 0, 60 deg or more -> 1); rodSide = rod direction's lateral offset from the line toward the fish, -1..1 (+ = rod swept to the player's right). Pumping = raising then lowering the real rod. |
 | Drag | Rod-hand thumbstick up/down: one 0.05 step per flick (repeats every 0.25 s while held). |
 | Snap turn | Rod-hand thumbstick left/right. |
 | Lures | READY only: reel-hand **X/Y** (or A/B on a left-handed setup) cycles to the next/previous lure. |
-| Menu / pause | Reel-hand **thumbstick click** (Quest does not expose its menu button to WebXR): opens the VR menu panel and pauses. |
+| Menu / pause | Reel-hand **thumbstick click** (Quest does not expose its menu button to WebXR): opens the VR menu panel and pauses; again resumes (or closes an open journal). |
 | Keep / Release | On the catch card: rod-hand **A** = Keep, **B** = Release, or point a ray at the card buttons and pull a trigger. |
 
-Rod-tip cast mapping: `v` = tip velocity (world, smoothed over ~60 ms) at trigger release. `speed = |v|`,
-`power01 = clamp((speed - 1.2) / 10.0, 0.08, 1)`, `direction` = horizontal part of `v` (or the rod's horizontal pointing
-direction if the horizontal part is under 1 m/s), launch pitch = elevation of `v` clamped to 8..55 degrees. Casting behind
-the player (direction more than 110 degrees from the rig's -Z) is ignored with a short "Cast out over the water" hint.
+Rod-tip cast mapping: `v` = tip velocity (world, over the last ~60 ms of game time) at trigger release, of the tackle's
+bent tip-top (`tackle.getRodTip`), so the rod loading and whipping through counts: letting go while the rod is still
+loading throws short. `speed = |v|`, `power01 = clamp((speed - 1.2) / 10.0, 0.08, 1)` (under 0.5 m/s: the 0.12 lob),
+`direction` = horizontal part of `v` (or the rod's horizontal pointing direction if the horizontal part is under 1 m/s).
+Launch pitch = the higher of the elevation of `v` and the rod's own elevation at release less 25 degrees, clamped to
+8..55 degrees (a lob: 25). The tip of a rod swinging forward past vertical is already moving down, so the tip's path alone
+would launch every overhead cast at the 8 degree floor, about a third short of the desktop's range for the same power;
+the rod unloading as the line is let go lifts the lure: let go at "11 o'clock" (rod ~55 degrees up) and it flies out at
+~30 degrees (the desktop's launch pitch), earlier goes higher, later lower; a sidearm cast stays low and an underhand
+flick keeps its upward path. Launch speed per power is the desktop calibration. Casting behind the player (direction
+more than 110 degrees from the lake direction, world -Z: the rig's -Z at session start, which snap turns do not change,
+so a player who turned around still cannot cast onto the dock or the shore) is ignored with a short "Cast out over the
+water" hint.
 
 ## Haptics (gamepad.hapticActuators[0].pulse / inputSource.gamepad.vibrationActuator fallback, always guarded)
 
 nibble: rod hand 0.25 x 35 ms. bite / float goes under: rod hand 0.7 x 110 ms. hookset: rod hand 1.0 x 60 ms. fight:
 rod hand continuous rumble ~ 0.08 + 0.55 * tension01 (re-pulsed every ~50 ms), extra 0.9 x 40 ms spikes on head shakes and
 jumps. drag slipping: reel hand clicks, one 0.35 x 12 ms pulse per ~3 cm of line paid out (cap 30 Hz). reeling: very light
-0.05 ticks per handle turn. line snap: rod hand 1.0 x 180 ms then silence. lure lands: 0.2 x 25 ms. UI hover/press: 0.1 x 10 ms.
+0.05 ticks per handle turn (~0.52 m of line). line snap: rod hand 1.0 x 180 ms then silence. lure lands: 0.2 x 25 ms. UI
+hover/press: 0.1 x 10 ms. bail opens (cast hold starts): rod hand 0.15 x 15 ms. Nothing pulses unless a session presents.
 
 ## World-space UI (DOM overlays are not visible in VR)
 
@@ -79,8 +106,10 @@ fonts as the DOM UI (wait for `document.fonts.ready` before the first draw).
   gently flexing), and a field-notebook card panel (same content as the DOM card) floats beside it facing the player.
   Keep/Release per the input table. The DOM showcase overlay pass is not used in VR.
 - **VR menu** (pause): floating panel with Resume, Lure picker, Time presets, Sound on/off, Units, Rod hand (right/left),
-  Journal, Exit VR. Controller rays (thin line + dot, only visible while a menu/card is open or the ray is over a panel)
-  and trigger to press; hover highlight + haptic tick.
+  Journal, Exit VR (no graphics quality: the XR profile below adapts by itself). It opens where the player looks. Controller
+  rays (thin line + dot, only visible while a menu, the journal or the card is open) and trigger to press; hover highlight
+  + haptic tick. A trigger press anywhere on an open panel is taken by the panel and never reaches the game. Whatever
+  pauses the game (the stick click, the headset's system menu, `debug.pause(true)`) opens this menu.
 - **Journal**: panel listing species (caught count, best weight/length, tip for uncaught) and recent catches.
 
 ## Rendering while presenting
@@ -89,14 +118,26 @@ fonts as the DOM UI (wait for `document.fonts.ready` before the first draw).
   analytic far-shore band). Any offscreen pass that still runs while presenting must set `renderer.xr.enabled = false` for
   its duration and restore it (passes.js already does for the reflection).
 - Environment: PMREM re-bakes and any other offscreen render guard `renderer.xr.enabled` the same way. Sky/cloud/star domes
-  follow the viewer's position (`camera.matrixWorld`, which three keeps in sync with the headset).
+  follow the viewer's position (`camera.matrixWorld`, which three keeps in sync with the headset). Without the planar
+  mirror the water's far-shore band follows the real skyline in VR (`env.skylineOccluderAt(azimuth)`: treeline and hills
+  per azimuth) instead of the fixed 3.4 degree band the desktop's 'low' level uses. Terrain and scenery culling use the
+  XR camera (both eyes' frustum, with a margin for head roll).
 - Shadows at most 1024. XR quality profile: 'high' -> framebufferScale 1.0, foveation 0.5; 'medium' -> 0.9, 0.8; 'low' ->
-  0.75, 1.0. Default profile in XR: 'low' on standalone headsets (user agent contains OculusBrowser, Quest, Pico or
-  Mobile VR), 'medium' otherwise; adaptive quality measures XR frame time against the session's frame rate.
+  0.75, 1.0; the profile's name is also the scene's quality level while presenting. Profile in XR: always 'low' on
+  standalone headsets (user agent contains OculusBrowser, Quest, Pico or Mobile VR: a level picked for the 2D page there
+  would not hold the headset's frame rate); elsewhere (PC VR) a level picked by hand in the pause menu, else 'medium'.
+  Adaptive quality measures XR frame time against the session's frame rate: slow frames first raise foveation to 1, then
+  step the scene level down at a calm moment (READY); sustained headroom climbs back, never above the profile; a level
+  picked by hand stays put. The framebuffer scale is fixed for a session (a three.js limit). On exit the desktop's level,
+  auto mode and pixel ratio come back.
 - The fishing line (LineMaterial) keeps a thin, visible width in the headset (per-eye resolution); the float's screen-space
   minimum size uses the per-eye projection.
 - The first-person desktop rod (camera-attached, drawn at 0.5 scale) becomes the real rod in the rod-hand grip at full scale;
-  the gloved hand model goes on the rod hand and a second glove on the reel hand.
+  the gloved hand model goes on the rod hand and a second glove on the reel hand. The desktop landing ring is not shown.
+- The landed fish in the hand is part of the lake scene (`showcase.setXR`); on the desktop the showcase compiles its fish
+  without blocking (`compileAsync`), and a fish hidden while that compile is still pending (a quick Keep, or entering /
+  leaving VR on the catch card) is detached at once and disposed only once the compile settles (three.js' readiness
+  check would otherwise read a disposed material and throw).
 
 ## Module ownership for the XR work
 
@@ -125,7 +166,14 @@ fonts as the DOM UI (wait for `document.fonts.ready` before the first draw).
 ## Debug hooks and testing
 
 - `window.__game.debug.xr = { available(), enter(), exit(), status() }` (status: presenting, referenceSpace, profile,
-  framebufferScale, hands, lastCast, pointerOverPanel).
+  framebufferScale, hands, lastCast, pointerOverPanel). Also: status has the rig, head, rod (dir, lift, tip velocity,
+  trigger), reel (trigger, crank reading and handle), hookMetric, the HUD's own status (`ui`: menu / journal / card open,
+  ray hover), the game settings, recent haptics and the quality; `lastCast` has power01, speedMps, yawDeg (+ = right of
+  the lake axis), pitchDeg, tipElevDeg, rodDeg, lob, behind. `waitFrames(n)` resolves after n XR frames; `everyFrame(fn)`
+  runs fn after each XR frame's controller read until it returns false (drive a gesture one pose per frame, whatever the
+  frame time); `setRodHand(h)`; `panelTarget(panel, buttonId)` -> `{ world, local }` centre of a VR panel button
+  (`local` in the reference space the emulator's poses use), for pointing a ray; `toRig([x, y, z])` a world point in
+  that space.
 - Harness: `node tools/harness.mjs --xr ...` installs IWER (Meta's WebXR emulator, dev dependency only, never shipped) as
   `navigator.xr` before page scripts, emulating a Quest 3; scenarios move the headset/controllers and press buttons through
   `window.__xrDevice` (`__xrDevice.position/quaternion`, `__xrDevice.controllers.right|left.position/quaternion`,
@@ -133,3 +181,12 @@ fonts as the DOM UI (wait for `document.fonts.ready` before the first draw).
   `.updateAxes('thumbstick', x, y)`; set `__xrDevice.stereoEnabled = true` for side-by-side eye screenshots). Check the
   exact button ids in node_modules/iwer (gamepad config for metaQuest3). The emulator is not a GPU headset: judge
   correctness and framing, not frame rate.
+- The regression scenario is `tools/scenarios/xr.mjs` (`npm run build`, then
+  `node tools/harness.mjs --xr --scenario tools/scenarios/xr.mjs --out out/xr --size 960x540`): the title's Enter VR
+  button, casts at three swing speeds and to both sides (plus a lob and a cast toward the shore), every lure, the analog
+  reel trigger and the crank gesture, two catches (flick and A hooksets, lift / side / trigger fights, Keep with A,
+  Release with B), the VR menu (time, units, sound, journal, rod hand), left-handed play and snap turns, Exit VR, the
+  desktop afterwards, re-entry from the pause menu and a headset-side `session.end()`, with stereo shots at the key
+  moments. It also fakes the page blurring / being hidden, a window resize and the headset's system menu while
+  presenting. Gestures are played one pose per XR frame; a software-rendered frame counts as 50 ms of game time (the
+  loop's dt clamp), so gesture speeds hold however slow the frames are. `XR_ONLY=casts,reel,...` runs a subset.

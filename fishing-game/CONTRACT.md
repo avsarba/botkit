@@ -6,6 +6,11 @@ truth for how the modules fit together. If you own a module, implement exactly
 the API below; if you need something that is not here, add it in a way that keeps
 every existing signature working, and describe it in your final report.
 
+**VR (WebXR):** the immersive VR mode (Enter VR on the title and in the pause menu, the rig, controllers, haptics,
+world-space HUD, rendering while presenting, the standalone `dist/play.html` build) is specified in **XR.md**, which
+adds to this file. Everything here keeps working unchanged on desktop and phones; the XR additions to the module APIs
+are listed under "XR additions" below and described in XR.md.
+
 ## Ground rules (all modules)
 
 - Plain JavaScript ES modules (no TypeScript, no JSX). `import * as THREE from 'three'`.
@@ -412,7 +417,8 @@ adds 12 % rotor friction. Reeling shortens `lineOut` only while the drag holds (
 Clock: `DAY.gameMinutesPerSecond` = 0.25 (1 real second = 15 game seconds, an hour of light ~4 real minutes). It
 runs only while fishing (READY, CHARGING, CASTING, WAITING, STRIKE, FIGHTING) and stands still while netting, on
 the catch card, re-tying after a snap, after an escape, while paused / the journal is open and on the title.
-Window blur during STRIKE / FIGHTING / LANDING pauses the game. Quality: `onQuality('auto')` returns to adaptive
+Window blur during STRIKE / FIGHTING / LANDING pauses the game (not while a VR session starts or presents: then the
+headset session's own visibility decides, XR.md). Quality: `onQuality('auto')` returns to adaptive
 quality (stall-filtered median frame time, steps down and back up); a manual level applies fully and is saved.
 
 Debug hooks for automated tests (must exist):
@@ -432,13 +438,27 @@ window.__game = {
                                               //   lineOutM, tensionN, lure: {...}, hooked: {...} | null }
     // extras for scenarios: setTimeScale(k), setPixelRatio(p), setAutoQuality(on), setRod(side, lift),
     // slack(m), pause(p), action(down), keep(), release(), events(since), records(), fight, modules(), render()
+    xr: { available(), enter(), exit(), status(), ... },   // VR: see XR.md "Debug hooks and testing"
   }
 }
 ```
 
+### XR additions (details in XR.md)
+- `src/xr/`: `createXR(...)` (session, rig, input, haptics, XR quality; core wires it) and `createXRHud(...)`
+  (world-space panels). Core handlers gain `onEnterVR()` (call inside the click), `onExitVR()`, `onRodHand(hand)`.
+- UI: `setXRAvailable(bool)` (the Enter VR buttons), `setXRPresenting(bool)` (the page UI hidden and inert behind the
+  headset, with a short note).
+- Tackle: `setXRMode(on, { rodGrip, reelGrip, rodHand })`, `cast(power01, direction, { pitchRad })`,
+  `predictLanding(power01, direction, target, { pitchRad })`, `getRodBase(target)`, `getReelHandle(target)`, `xrMode`.
+- Showcase: `setXR(on, { holdGrip })` (the landed fish held in the reel hand), `xr`.
+- Environment: `skylineOccluderAt(azimuth, out)` (the water's far-shore band in VR).
+- Quality manager: `enterXR(level)`, `setXRLevel(q)`, `exitXR()`, `inXR`; `createXRAdaptive(...)`.
+- `TACKLE.reelTurnsPerS` (config.js): handle turns per second at full retrieve (the reel animation and the VR crank).
+
 ## Testing
 
-- `npm run build` bundles `src/main.js` into `dist/index.html` using `src/index.template.html`.
+- `npm run build` bundles `src/main.js` into `dist/index.html` using `src/index.template.html`, and the same page in a
+  full `<!doctype html>` skeleton into `dist/play.html` (for hosting on any HTTPS server, e.g. for a VR headset).
 - Sandbox a single module: write `src/sandbox/<module>.js` (see `src/sandbox/stubs.js` for contract-shaped
   stubs of the environment and water), then
   `node build.mjs --entry src/sandbox/<module>.js --out dist/sandbox-<module>.html --template none`
@@ -450,5 +470,6 @@ window.__game = {
 - Scenarios: `--scenario path.mjs` exporting `default async ({ page, shot, sleep, log, game }) => {}`.
   The regression set: `boot`, `catch`, `snap`, `tour`, `soak` and `spot` (review-fix spot checks; `SPOT=water,glint`
   runs a subset) at `--size 960x540`, and `mobile` with `--mobile` (390x844) plus `--size 667x375` / `640x360`
-  (short landscape phones: side-panel catch card). A transient moment (a heavy fight, the STRIKE cue) is frozen
+  (short landscape phones: side-panel catch card), and `xr` with `--xr` (VR in the emulated Quest 3, XR.md).
+  A transient moment (a heavy fight, the STRIKE cue) is frozen
   with `debug.pause(true)` before its screenshot, since one software-rendered frame can outlast it.

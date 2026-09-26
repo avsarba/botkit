@@ -431,10 +431,12 @@ export function createQualityManager({ renderer, initial = 'high', auto = true, 
     // come back afterwards (three.js restores the drawing buffer size itself when the session ends).
     enterXR(level) {
       if (xrSaved) return;
-      if (probe && (probe.kind === 'probe' || probe.kind === 'headroom')) applyPR(probe.prBefore);
+      // (the session already presents: a pixel-ratio probe in flight is undone on exit, not now, because
+      // three.js refuses to resize the drawing buffer while presenting)
+      const prBack = probe && (probe.kind === 'probe' || probe.kind === 'headroom') ? probe.prBefore : null;
       probe = null;
       pending = null;
-      xrSaved = { quality, auto: autoMode };
+      xrSaved = { quality, auto: autoMode, prBack };
       setLevel(LEVELS.includes(level) ? level : quality);
     },
     setXRLevel(q) {
@@ -445,6 +447,7 @@ export function createQualityManager({ renderer, initial = 'high', auto = true, 
       const s = xrSaved;
       xrSaved = null;
       autoMode = s.auto;
+      if (Number.isFinite(s.prBack)) applyPR(s.prBack);
       setLevel(s.quality);
       const cap = Math.min(dpr(), PR_CAP[quality]);
       if (!autoMode) applyPR(cap); // a level picked meanwhile comes with its full pixel ratio

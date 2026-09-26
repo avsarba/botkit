@@ -27,7 +27,8 @@ export const TACKLE = {
   dragMinN: 4.5, // ~1 lb
   dragMaxN: 44.5, // ~10 lb (a real reel caps drag below line test)
   dragDefault01: 0.45,
-  reelRetrieveMps: 0.78, // 6.2:1 gear, ~31 in of line per handle turn at ~1.5 turns/s
+  reelRetrieveMps: 0.78, // full-speed retrieve: 1.5 handle turns/s at ~0.52 m (20 in) of line per turn
+  reelTurnsPerS: 1.5, // handle turns per second at full retrieve (the reel animation, the VR crank gesture)
   spoolCapacityM: 150, // ~165 yd of 12 lb mono
   maxCastM: 42,
 };

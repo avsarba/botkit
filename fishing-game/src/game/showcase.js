@@ -75,6 +75,10 @@ export function createShowcase({ renderer, camera, createFishMesh, getCatchRect 
   let lengthM = 0.3;
   let ready = true; // programs compiled: the fish may be drawn
   let showToken = 0;
+  // A fish whose compileAsync is still being polled must not have its materials disposed before it settles:
+  // three.js' readiness check would then read a disposed material and throw ("reading 'isReady'"). hide()
+  // detaches such a fish at once and disposes it when its compile settles.
+  const compiling = new WeakMap(); // fish handle -> promise that settles with its compile
   let snap = true; // next layout jumps straight to its target
   const frameInfo = { cx: 0, cy: 0, d: 1, spanPx: 0, mode: 'side' };
   const cur = { x: 0, y: 0, d: 1 };
@@ -533,7 +537,9 @@ export function createShowcase({ renderer, camera, createFishMesh, getCatchRect 
         camera.updateMatrixWorld();
         rig.matrix.copy(camera.matrixWorld);
         rig.matrixWorldNeedsUpdate = true;
-        renderer.compileAsync(scene, camera).then(done, done);
+        const settled = renderer.compileAsync(scene, camera).then(done, done);
+        compiling.set(handle, settled);
+        settled.then(() => compiling.delete(handle));
       } catch {
         ready = true;
       }
@@ -553,10 +559,15 @@ export function createShowcase({ renderer, camera, createFishMesh, getCatchRect 
         console.warn('[showcase] keeping programs failed', err);
       }
     }
-    fish.dispose();
+    const f = fish;
     fish = null;
     ready = true;
     xrHang.removeFromParent();
+    const pending = compiling.get(f);
+    if (pending) {
+      f.object3d.removeFromParent();
+      pending.then(() => f.dispose());
+    } else f.dispose();
   }
 
   function syncEnvironment(env, scene0) {

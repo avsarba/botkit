@@ -331,6 +331,8 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
 
   const r2 = (v) => Math.round(v * 100) / 100;
   const vec = (p) => [r2(p.x), r2(p.y), r2(p.z)];
+  const r3 = (v) => Math.round(v * 1000) / 1000;
+  const vec3 = (p) => [r3(p.x), r3(p.y), r3(p.z)];
   function status() {
     const xin = input.xin;
     const handInfo = (h) => ({ connected: h.connected, tracked: h.grip.visible, profile: h.profile, gamepad: !!h.gamepad, hand: h.isHand, position: vec(h.pos) });
@@ -367,6 +369,7 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
         base: vec(xin.rod.base),
         tip: vec(xin.rod.tip),
         fromTackle: xin.rod.fromTackle,
+        dir: vec3(xin.rod.dir),
         pitchDeg: r2(xin.rod.pitch / DEG),
         yawDeg: r2(xin.rod.yaw / DEG),
         lift01: r2(xin.rod.lift01),
@@ -376,17 +379,46 @@ export function createXR({ renderer, scene, camera, events, qm, species = [], ge
         trigger: r2(xin.rod.trigger),
         triggerHeld: xin.rod.triggerHeld,
       },
-      reel: { connected: xin.reel.connected, trigger: r2(xin.reel.trigger), trigger01: r2(xin.reel.trigger01), crank: { active: xin.reel.crank.active, near: xin.reel.crank.near, revPerSec: r2(xin.reel.crank.revPerSec), distanceM: r2(xin.reel.crank.distanceM) }, reelSpeed01: r2(xin.reelSpeed01) },
+      reel: {
+        connected: xin.reel.connected,
+        trigger: r2(xin.reel.trigger),
+        trigger01: r2(xin.reel.trigger01),
+        position: vec(xin.reel.position),
+        crank: { active: xin.reel.crank.active, near: xin.reel.crank.near, revPerSec: r2(xin.reel.crank.revPerSec), speed01: r2(xin.reel.crank.speed01), distanceM: r2(xin.reel.crank.distanceM), handle: vec3(xin.reel.crank.handle) },
+        reelSpeed01: r2(xin.reelSpeed01),
+      },
       castPower01: r2(xin.castPower01),
+      hookMetric: { tipUpBack: r2(xin.hookMetric.tipUpBack), pitchRate: r2(xin.hookMetric.pitchRate) },
       fade: r2(fadeOpacity),
+      ui: hud && session.presenting && typeof hud.status === 'function' ? hud.status() : null,
       haptics: { count: haptics.count, recent: haptics.log.slice(-12) },
     };
+  }
+
+  // tests: a VR panel button's centre (world, and in the rig's frame, which is the XR reference space the emulator's
+  // controller poses are given in), for pointing a controller ray at it. null when the panel / button isn't up.
+  const _pt = new THREE.Vector3();
+  function panelTarget(panelName, buttonId) {
+    const P = hud && session.presenting ? hud.debugPanels : null;
+    const panel = P && P[panelName];
+    if (!panel || !panel.mesh || !panel.mesh.visible) return null;
+    const b = (panel.buttons || []).find((x) => x.id === buttonId);
+    if (!b) return null;
+    const u = (b.x + b.w / 2) / panel.W;
+    const v = 1 - (b.y + b.h / 2) / panel.usedH;
+    panel.mesh.updateWorldMatrix(true, false);
+    _pt.set((u - 0.5) * panel.widthM, (v - 0.5) * panel.heightM, 0).applyMatrix4(panel.mesh.matrixWorld);
+    const world = vec3(_pt);
+    rig.updateMatrixWorld(true);
+    const local = vec3(rig.worldToLocal(_pt));
+    return { world, local, disabled: !!b.disabled };
   }
 
   return {
     rig,
     input,
     haptics,
+    panelTarget,
     adaptive,
     get xin() {
       return input.xin;

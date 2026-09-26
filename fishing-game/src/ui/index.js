@@ -72,7 +72,7 @@ function nullUI() {
   return {
     showTitle: noop, hideTitle: noop, setState: noop, update: noop, strikeCue: noop,
     showCatch: noop, hideCatch: noop, toast: noop, openJournal: noop, closeJournal: noop,
-    setLoading: noop, setPaused: noop, isModalOpen: () => false, getCatchRect: () => null, setXRAvailable: noop, dispose: noop,
+    setLoading: noop, setPaused: noop, isModalOpen: () => false, getCatchRect: () => null, setXRAvailable: noop, setXRPresenting: noop, dispose: noop,
   };
 }
 
@@ -449,6 +449,35 @@ export function createUI(ctx = {}) {
   });
   vrPauseBtn.addEventListener('click', () => call('onEnterVR'));
 
+  // While a VR session presents (XR.md): the headset shows the world-space HUD; the page behind it keeps its state
+  // (core still drives it, so it is current when the player comes back) but is hidden and inert, so a mouse or
+  // keyboard at a PC VR setup cannot press its buttons, and shows a short note instead.
+  const xrNote = $('xr-note');
+  let xrPresenting = false;
+  function setXRPresenting(on) {
+    on = !!on;
+    if (on === xrPresenting) return;
+    xrPresenting = on;
+    if (on) {
+      const a = doc.activeElement;
+      if (a && a !== doc.body && root.contains(a) && a.blur) a.blur();
+      root.setAttribute('data-xr', '');
+    } else root.removeAttribute('data-xr');
+    root.inert = on;
+    xrNote.hidden = !on;
+    if (on) return;
+    // back on the page: a dialog opened meanwhile (the pause menu, the journal, the catch card) takes focus as usual
+    const top = dialogStack[dialogStack.length - 1];
+    if (top && top.el.isConnected) {
+      const f = focusables(top.el)[0] || top.el;
+      try {
+        f.focus({ preventScroll: true });
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   // ---------- dialogs: focus in, Tab trap, Esc ----------
   const dialogStack = []; // { el, onEsc, restore }
   function focusables(el) {
@@ -493,6 +522,7 @@ export function createUI(ctx = {}) {
   }
   function onKeyDown(e) {
     if (!e.repeat) lastKeyAt = performance.now();
+    if (xrPresenting) return; // (the dialogs are not on screen: the headset's menu is)
     const top = dialogStack[dialogStack.length - 1];
     if (!top) return;
     // A key still held from gameplay (Space = hold to reel) auto-repeats onto the button that just
@@ -1406,6 +1436,7 @@ export function createUI(ctx = {}) {
     // panel on the right.
     getCatchRect,
     setXRAvailable, // show / hide the Enter VR buttons (title + pause menu)
+    setXRPresenting, // a VR session presents: hide the page UI, make it inert, show the "playing in VR" note
     dispose,
   };
 }

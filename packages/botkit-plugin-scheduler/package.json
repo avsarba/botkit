@@ -1,0 +1,51 @@
+{
+  "name": "botkit-plugin-scheduler",
+  "version": "1.0.0",
+  "description": "Persistent cron, interval and one-shot jobs for Botkit: scheduled work runs as ordinary Botkit turns, on its own clock channel or inside a saved conversation",
+  "main": "./lib/index.js",
+  "typings": "./lib/index.d.ts",
+  "files": [
+    "/lib",
+    "/src"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc ; nyc mocha tests/*.tests.js",
+    "eslint": "./node_modules/.bin/eslint --fix src/*"
+  },
+  "author": "Microsoft Corp.",
+  "license": "MIT",
+  "keywords": [
+    "botkit",
+    "botbuilder",
+    "botframework",
+    "bots",
+    "chatbots",
+    "scheduler",
+    "cron",
+    "reminders",
+    "jobs"
+  ],
+  "homepage": "https://github.com/howdyai/botkit/blob/master/packages/botkit-plugin-scheduler#readme",
+  "bugs": {
+    "url": "https://github.com/howdyai/botkit/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/howdyai/botkit.git"
+  },
+  "dependencies": {
+    "botkit": "^4.10.0",
+    "botbuilder": "^4.10.1",
+    "debug": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^10.17.5",
+    "eslint": "^7.7.0",
+    "eslint-config-standard": "^14.1.1",
+    "eslint-plugin-import": "^2.20.0",
+    "eslint-plugin-node": "^11.1.0",
+    "eslint-plugin-promise": "^4.2.1",
+    "eslint-plugin-standard": "^4.0.1"
+  }
+}

@@ -9,6 +9,7 @@ import { Activity, MemoryStorage, Storage, ConversationReference, TurnContext, B
 import { Dialog, DialogContext, DialogSet, DialogTurnStatus, WaterfallDialog } from 'botbuilder-dialogs';
 import { BotkitBotFrameworkAdapter } from './adapter';
 import { BotWorker } from './botworker';
+import { BotkitMessageTemplate } from './conversation';
 import { BotkitConversationState } from './conversationState';
 import * as path from 'path';
 import * as http from 'http';
@@ -177,6 +178,79 @@ export interface BotkitPlugin {
     };
     init?: (botkit: Botkit) => void;
     [key: string]: any; // allow arbitrary additional fields to be added.
+}
+
+/**
+ * Describes the [BotkitConversation](#BotkitConversation) question that is waiting for input in a conversation,
+ * as returned by [controller.getPendingQuestion()](#getPendingQuestion).
+ * `template` and `vars` are copies: plain objects and arrays in them are copied at every level, so changing them does not affect the dialog.
+ */
+export interface BotkitPendingQuestion {
+    /**
+     * The id of the BotkitConversation that asked the question.
+     */
+    dialog: string;
+
+    /**
+     * The name of the thread that contains the question.
+     */
+    thread: string;
+
+    /**
+     * The position of the question in `script[thread]` (the dialog's current step index).
+     */
+    index: number;
+
+    /**
+     * The variable the answer will be stored in (the `key` passed to `ask()` or `addQuestion()`), or undefined when the question has no key.
+     */
+    key?: string;
+
+    /**
+     * A copy of the raw, un-rendered script line that asked the question, including `text`, `quick_replies`, `channelData` and `collect`.
+     * Mustache tokens such as `{{vars.name}}` are not replaced.
+     */
+    template: Partial<BotkitMessageTemplate>;
+
+    /**
+     * A copy of the dialog's variables (`convo.vars`), including answers collected so far.
+     */
+    vars: { [key: string]: any };
+
+    /**
+     * The ids of every dialog on the stack, bottom first. The last entry is the active dialog, usually the question's `<id>_default_prompt`.
+     */
+    stack: string[];
+}
+
+/**
+ * Copy plain objects and arrays recursively, so that changes to the copy never reach the original.
+ * Functions, class instances and other values are shared, not copied.
+ * @ignore
+ */
+function copyPlainData(value: any, seen = new Map<any, any>()): any {
+    if (value === null || typeof value !== 'object') {
+        return value;
+    }
+    if (seen.has(value)) {
+        return seen.get(value);
+    }
+    if (Array.isArray(value)) {
+        const copy = [];
+        seen.set(value, copy);
+        value.forEach((item) => copy.push(copyPlainData(item, seen)));
+        return copy;
+    }
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+        return value;
+    }
+    const copy = {};
+    seen.set(value, copy);
+    Object.keys(value).forEach((key) => {
+        copy[key] = copyPlainData(value[key], seen);
+    });
+    return copy;
 }
 
 /**
@@ -694,7 +768,12 @@ export class Botkit {
                 this.adapter.processActivity(req, res, this.handleTurn.bind(this)).catch((err) => {
                     // todo: expose this as a global error handler?
                     console.error('Experienced an error inside the turn handler', err);
-                    throw err;
+                    // Do not rethrow: nothing awaits this promise, so a rethrow would become an unhandled rejection
+                    // (which terminates Node 15+). Answer the request instead, unless the adapter already did.
+                    if (res && !res.headersSent && typeof res.status === 'function') {
+                        res.status(500);
+                        res.end();
+                    }
                 });
             });
         } else {
@@ -706,6 +785,18 @@ export class Botkit {
      * Accepts the result of a BotBuilder adapter's `processActivity()` method and processes it into a Botkit-style message and BotWorker instance
      * which is then used to test for triggers and emit events.
      * NOTE: This method should only be used in custom adapters that receive messages through mechanisms other than the main webhook endpoint (such as those received via websocket, for example)
+     * The returned promise rejects with the original error if a middleware, handler, dialog step or state write fails; the conversation state of a failed turn is not saved.
+     *
+     * ```javascript
+     * // inside a custom adapter
+     * const context = new TurnContext(this, activity);
+     * try {
+     *     await this.runMiddleware(context, controller.handleTurn.bind(controller));
+     * } catch (err) {
+     *     console.error('The bot failed to handle this activity', err);
+     * }
+     * ```
+     *
      * @param turnContext {TurnContext} a TurnContext representing an incoming message, typically created by an adapter's `processActivity()` method.
      */
     public async handleTurn(turnContext: TurnContext): Promise<any> {
@@ -755,19 +846,25 @@ export class Botkit {
                         if (err) {
                             reject(err);
                         } else {
-                            const interrupt_results = await this.listenForInterrupts(bot, message);
+                            // Nothing awaits this callback, so any error must be routed to reject()
+                            // or the turn would never settle and the error would surface as an unhandled rejection.
+                            try {
+                                const interrupt_results = await this.listenForInterrupts(bot, message);
 
-                            if (interrupt_results === false) {
-                                // Continue dialog if one is present
-                                const dialog_results = await dialogContext.continueDialog();
-                                if (dialog_results && dialog_results.status === DialogTurnStatus.empty) {
-                                    await this.processTriggersAndEvents(bot, message);
+                                if (interrupt_results === false) {
+                                    // Continue dialog if one is present
+                                    const dialog_results = await dialogContext.continueDialog();
+                                    if (dialog_results && dialog_results.status === DialogTurnStatus.empty) {
+                                        await this.processTriggersAndEvents(bot, message);
+                                    }
                                 }
-                            }
 
-                            // make sure changes to the state get persisted after the turn is over.
-                            await this.saveState(bot);
-                            resolve();
+                                // make sure changes to the state get persisted after the turn is over.
+                                await this.saveState(bot);
+                                resolve();
+                            } catch (err) {
+                                reject(err);
+                            }
                         }
                     });
                 }
@@ -785,6 +882,74 @@ export class Botkit {
     }
 
     /**
+     * Find out which [BotkitConversation](#BotkitConversation) question, if any, is waiting for the user to answer.
+     * Adapters for surfaces without a chat UI (terminals, agents, forms) use this after a turn to decide whether to ask for more input,
+     * which variable the next answer fills, and which choices to offer.
+     *
+     * The active dialog on the stack decides the result. Botkit's own `<id>_default_prompt` and `<id>:botkit-wrapper` frames are skipped.
+     * Returns null when no dialog is active, when the active dialog is not a BotkitConversation
+     * (for example a WaterfallDialog waiting on a TextPrompt), or when it is not stopped on a question.
+     *
+     * Pass the context of a turn that has finished to read the state that turn left behind, or a new TurnContext for the same
+     * conversation and user to load it from storage. The activity must include `channelId`, `conversation.id` and `from.id`.
+     * After a turn that failed, use a new context: the failed turn's context still holds its unsaved changes.
+     * This method never changes or saves state and never sends messages.
+     *
+     * ```javascript
+     * // inside a custom adapter
+     * const context = new TurnContext(this, activity);
+     * await this.runMiddleware(context, controller.handleTurn.bind(controller));
+     *
+     * const question = await controller.getPendingQuestion(context);
+     * if (question) {
+     *     console.log(`Dialog ${ question.dialog } is waiting for "${ question.key }"`);
+     * } else {
+     *     console.log('No question is waiting for an answer.');
+     * }
+     * ```
+     *
+     * @param context The context of a completed turn, or a new one for the same conversation and user.
+     * @returns A [BotkitPendingQuestion](#BotkitPendingQuestion) describing the question, or null if no question is waiting for an answer.
+     */
+    public async getPendingQuestion(context: TurnContext): Promise<BotkitPendingQuestion | null> {
+        const dialogContext = await this.dialogSet.createContext(context);
+        const stack = dialogContext.stack;
+
+        // In botbuilder-dialogs 4.x, the active dialog is the last element of the stack.
+        for (let s = stack.length - 1; s >= 0; s--) {
+            const frame = stack[s];
+            if (frame.id.endsWith('_default_prompt') || frame.id.endsWith(':botkit-wrapper')) {
+                continue;
+            }
+
+            // Duck-type BotkitConversation instead of using instanceof, so that duplicate copies of Botkit still work.
+            const dialog: any = this.dialogSet.find(frame.id);
+            if (!dialog || !dialog.script || typeof dialog.script !== 'object' || !frame.state || typeof frame.state.stepIndex !== 'number') {
+                return null;
+            }
+
+            const thread = frame.state.thread || 'default';
+            const index = frame.state.stepIndex;
+            const line = dialog.script[thread] && dialog.script[thread][index];
+            if (line && line.collect && line.action !== 'beginDialog') {
+                return {
+                    dialog: frame.id,
+                    thread: thread,
+                    index: index,
+                    key: line.collect.key,
+                    template: copyPlainData({ ...line }),
+                    vars: copyPlainData({ ...frame.state.values }),
+                    stack: stack.map((f) => f.id)
+                };
+            }
+
+            return null;
+        }
+
+        return null;
+    }
+
+    /**
      * Ingests a message and evaluates it for triggers, run the receive middleware, and triggers any events.
      * Note: This is normally called automatically from inside `handleTurn()` and in most cases should not be called directly.
      * @param bot {BotWorker} An instance of the bot
@@ -796,15 +961,19 @@ export class Botkit {
                 if (err) {
                     return reject(err);
                 }
-                const listen_results = await this.listenForTriggers(bot, message);
+                try {
+                    const listen_results = await this.listenForTriggers(bot, message);
 
-                if (listen_results !== false) {
-                    resolve(listen_results);
-                } else {
-                    // Trigger event handlers
-                    const trigger_results = await this.trigger(message.type, bot, message);
+                    if (listen_results !== false) {
+                        resolve(listen_results);
+                    } else {
+                        // Trigger event handlers
+                        const trigger_results = await this.trigger(message.type, bot, message);
 
-                    resolve(trigger_results);
+                        resolve(trigger_results);
+                    }
+                } catch (err) {
+                    reject(err);
                 }
             });
         });
@@ -1059,7 +1228,8 @@ export class Botkit {
                     }
                 } catch (err) {
                     console.error('Error in trigger handler', err);
-                    throw Error(err);
+                    // rethrow the original error so callers keep its message, stack and identity
+                    throw err instanceof Error ? err : new Error(err);
                 }
             }
         }

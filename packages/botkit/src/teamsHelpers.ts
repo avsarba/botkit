@@ -41,15 +41,20 @@ export class TeamsBotWorker extends BotWorker {
               if (err) {
                   return reject(err);
               }
-              resolve(await this.getConfig('context').sendActivity({
-                  type: 'invokeResponse',
-                  value: {
-                      status: 200,
-                      body: {
-                          task: taskInfo
+              // Nothing awaits this callback, so a failed send must reject or the reply would never settle.
+              try {
+                  resolve(await this.getConfig('context').sendActivity({
+                      type: 'invokeResponse',
+                      value: {
+                          status: 200,
+                          body: {
+                              task: taskInfo
+                          }
                       }
-                  }
-              }));
+                  }));
+              } catch (err) {
+                  reject(err);
+              }
           });
       });
   }

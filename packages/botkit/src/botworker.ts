@@ -93,6 +93,9 @@ export class BotWorker {
      * });
      * ```
      *
+     * The returned promise rejects if a send middleware fails, if the adapter fails to deliver the message,
+     * or if the bot has no context (spawn it from a turn, or call [changeContext()](#changecontext) first).
+     *
      * @param message A string containing the text of a reply, or more fully formed message object
      * @returns Return value will contain the results of the send action, typically `{id: <id of message>}`
      */
@@ -104,7 +107,16 @@ export class BotWorker {
                 if (err) {
                     return reject(err);
                 }
-                resolve(await this.getConfig('context').sendActivity(activity));
+                // Nothing awaits this callback, so a failed send must reject or say() would never settle.
+                try {
+                    const context = this.getConfig('context');
+                    if (!context) {
+                        throw new Error('Cannot send a message from a bot without a context: use bot.changeContext(reference) first');
+                    }
+                    resolve(await context.sendActivity(activity));
+                } catch (err) {
+                    reject(err);
+                }
             });
         });
     };

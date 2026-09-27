@@ -22,6 +22,8 @@ This is a class reference for all the methods exposed by the [botkit](https://gi
 * <a href="#BotkitConversationStep" aria-current="page">BotkitConversationStep</a>
 * <a href="#BotkitHandler" aria-current="page">BotkitHandler</a>
 * <a href="#BotkitMessage" aria-current="page">BotkitMessage</a>
+* <a href="#BotkitMessageTemplate" aria-current="page">BotkitMessageTemplate</a>
+* <a href="#BotkitPendingQuestion" aria-current="page">BotkitPendingQuestion</a>
 * <a href="#BotkitPlugin" aria-current="page">BotkitPlugin</a>
 
 ---
@@ -50,6 +52,7 @@ This class includes the following methods:
 * [completeDep()](#completeDep)
 * [getConfig()](#getConfig)
 * [getLocalView()](#getLocalView)
+* [getPendingQuestion()](#getPendingQuestion)
 * [handleTurn()](#handleTurn)
 * [hears()](#hears)
 * [interrupts()](#interrupts)
@@ -251,11 +254,55 @@ Allows a plugin to bundle views/layouts and make them available to the webserver
 
 
 
+<a name="getPendingQuestion"></a>
+### getPendingQuestion()
+Find out which [BotkitConversation](#BotkitConversation) question, if any, is waiting for the user to answer.
+Adapters for surfaces without a chat UI (terminals, agents, forms) use this after a turn to decide whether to ask for more input,
+which variable the next answer fills, and which choices to offer.
+
+**Parameters**
+
+| Argument | Type | description
+|--- |--- |---
+| context| TurnContext | The context of a completed turn, or a new one for the same conversation and user.<br/>
+
+
+**Returns**
+
+A [BotkitPendingQuestion](#BotkitPendingQuestion) describing the question, or null if no question is waiting for an answer.
+
+
+
+
+The active dialog on the stack decides the result. Botkit's own `<id>_default_prompt` and `<id>:botkit-wrapper` frames are skipped.
+Returns null when no dialog is active, when the active dialog is not a BotkitConversation
+(for example a WaterfallDialog waiting on a TextPrompt), or when it is not stopped on a question.
+
+Pass the context of a turn that has finished to read the state that turn left behind, or a new TurnContext for the same
+conversation and user to load it from storage. The activity must include `channelId`, `conversation.id` and `from.id`.
+After a turn that failed, use a new context: the failed turn's context still holds its unsaved changes.
+This method never changes or saves state and never sends messages.
+
+```javascript
+// inside a custom adapter
+const context = new TurnContext(this, activity);
+await this.runMiddleware(context, controller.handleTurn.bind(controller));
+
+const question = await controller.getPendingQuestion(context);
+if (question) {
+    console.log(`Dialog ${ question.dialog } is waiting for "${ question.key }"`);
+} else {
+    console.log('No question is waiting for an answer.');
+}
+```
+
+
 <a name="handleTurn"></a>
 ### handleTurn()
 Accepts the result of a BotBuilder adapter's `processActivity()` method and processes it into a Botkit-style message and BotWorker instance
 which is then used to test for triggers and emit events.
 NOTE: This method should only be used in custom adapters that receive messages through mechanisms other than the main webhook endpoint (such as those received via websocket, for example)
+The returned promise rejects with the original error if a middleware, handler, dialog step or state write fails; the conversation state of a failed turn is not saved.
 
 **Parameters**
 
@@ -263,6 +310,17 @@ NOTE: This method should only be used in custom adapters that receive messages t
 |--- |--- |---
 | turnContext| TurnContext | a TurnContext representing an incoming message, typically created by an adapter's `processActivity()` method.<br/>
 
+
+
+```javascript
+// inside a custom adapter
+const context = new TurnContext(this, activity);
+try {
+    await this.runMiddleware(context, controller.handleTurn.bind(controller));
+} catch (err) {
+    console.error('The bot failed to handle this activity', err);
+}
+```
 
 
 <a name="hears"></a>
@@ -937,6 +995,9 @@ controller.on('event', async(bot, message) => {
 });
 ```
 
+The returned promise rejects if a send middleware fails, if the adapter fails to deliver the message,
+or if the bot has no context (spawn it from a turn, or call [changeContext()](#changecontext) first).
+
 
 <a name="startConversationWithUser"></a>
 ### startConversationWithUser()
@@ -1593,6 +1654,41 @@ Will also contain any additional fields including in the incoming payload.
 | type | string | The type of event, in most cases defined by the messaging channel or adapter<br/>
 | user | string | Unique identifier of user who sent the message. Typically contains the platform specific user id.<br/>
 | value | string | Any value field received from the platform<br/>
+<a name="BotkitMessageTemplate"></a>
+## Interface BotkitMessageTemplate
+Template for defining a single line of a BotkitConversation script, as passed to `say()`, `ask()`, `addMessage()` and `addQuestion()`.
+
+**Fields**
+
+| Name | Type | Description
+|--- |--- |---
+| action | string | An action to take after this line, such as `next`, `complete`, `stop`, `repeat`, `timeout` or the name of a thread.<br/>
+| attachment |  | A Facebook attachment, or a function that returns one.<br/>
+| attachmentLayout | string | The attachment layout, such as `list` or `carousel`.<br/>
+| attachments |  | Bot Framework attachments, or a function that returns them.<br/>
+| blocks |  | Slack blocks, or a function that returns them.<br/>
+| channelData | any | Platform-specific fields merged into the outgoing activity's `channelData`.<br/>
+| collect |  | Present on questions: the variable the answer is stored in, and the conditions and handlers that evaluate it.<br/>
+| execute |  | The dialog (and optional thread) to start when `action` is `execute_script` or `beginDialog`.<br/>
+| quick_replies |  | Quick replies in the form `[{ title, payload }]`, or a function that returns them.<br/>
+| text |  | The text of the message. An array means one element is picked at random; a function is called as `await text(template, vars)`.<br/>
+<a name="BotkitPendingQuestion"></a>
+## Interface BotkitPendingQuestion
+Describes the [BotkitConversation](#BotkitConversation) question that is waiting for input in a conversation,
+as returned by [controller.getPendingQuestion()](#getPendingQuestion).
+`template` and `vars` are copies: plain objects and arrays in them are copied at every level, so changing them does not affect the dialog.
+
+**Fields**
+
+| Name | Type | Description
+|--- |--- |---
+| dialog | string | The id of the BotkitConversation that asked the question.<br/>
+| index | number | The position of the question in `script[thread]` (the dialog's current step index).<br/>
+| key | string | The variable the answer will be stored in (the `key` passed to `ask()` or `addQuestion()`), or undefined when the question has no key.<br/>
+| stack |  | The ids of every dialog on the stack, bottom first. The last entry is the active dialog, usually the question's `<id>_default_prompt`.<br/>
+| template | Partial&lt;BotkitMessageTemplate&gt; | A copy of the raw, un-rendered script line that asked the question, including `text`, `quick_replies`, `channelData` and `collect`.<br/>Mustache tokens such as `{{vars.name}}` are not replaced.<br/>
+| thread | string | The name of the thread that contains the question.<br/>
+| vars |  | A copy of the dialog's variables (`convo.vars`), including answers collected so far.<br/>
 <a name="BotkitPlugin"></a>
 ## Interface BotkitPlugin
 An interface for plugins that can contain multiple middlewares as well as an init function.

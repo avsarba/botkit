@@ -33,21 +33,51 @@ interface BotkitConvoTrigger {
 }
 
 /**
- * Template for definiting a BotkitConversation template
+ * Template for defining a single line of a BotkitConversation script, as passed to `say()`, `ask()`, `addMessage()` and `addQuestion()`.
  */
-interface BotkitMessageTemplate {
+export interface BotkitMessageTemplate {
+    /**
+     * The text of the message. An array means one element is picked at random; a function is called as `await text(template, vars)`.
+     */
     text: ((template: any, vars: any) => string) | string[];
+    /**
+     * An action to take after this line, such as `next`, `complete`, `stop`, `repeat`, `timeout` or the name of a thread.
+     */
     action?: string;
+    /**
+     * The dialog (and optional thread) to start when `action` is `execute_script` or `beginDialog`.
+     */
     execute?: {
         script: string;
         thread?: string;
     };
+    /**
+     * Quick replies in the form `[{ title, payload }]`, or a function that returns them.
+     */
     quick_replies?: ((template: any, vars: any) => any[]) | any[];
+    /**
+     * Bot Framework attachments, or a function that returns them.
+     */
     attachments?: ((template: any, vars: any) => any[]) | any[];
+    /**
+     * Slack blocks, or a function that returns them.
+     */
     blocks?: ((template: any, vars: any) => any[]) | any[];
+    /**
+     * A Facebook attachment, or a function that returns one.
+     */
     attachment?: ((template: any, vars: any) => any) | any;
+    /**
+     * The attachment layout, such as `list` or `carousel`.
+     */
     attachmentLayout?: string;
+    /**
+     * Platform-specific fields merged into the outgoing activity's `channelData`.
+     */
     channelData?: any;
+    /**
+     * Present on questions: the variable the answer is stored in, and the conditions and handlers that evaluate it.
+     */
     collect: {
         key?: string;
         options?: BotkitConvoTrigger[];
@@ -918,15 +948,25 @@ export class BotkitConversation<O extends object = {}> extends Dialog<O> {
      * @param vars an object defining key/value pairs used for the token replacements
      */
     private parseTemplatesRecursive(attachments: any, vars: any): any {
+        if (typeof (attachments) === 'string') {
+            return mustache.render(attachments, { vars: vars });
+        }
+
         if (attachments && attachments.length) {
             for (let a = 0; a < attachments.length; a++) {
-                for (const key in attachments[a]) {
-                    if (typeof (attachments[a][key]) === 'string') {
-                        attachments[a][key] = mustache.render(attachments[a][key], { vars: vars });
-                    } else {
-                        attachments[a][key] = this.parseTemplatesRecursive(attachments[a][key], vars);
+                if (typeof (attachments[a]) === 'string') {
+                    // a string element such as tags: ['a', '{{vars.b}}'] is rendered in place
+                    attachments[a] = mustache.render(attachments[a], { vars: vars });
+                } else if (attachments[a] !== null && typeof (attachments[a]) === 'object') {
+                    for (const key in attachments[a]) {
+                        if (typeof (attachments[a][key]) === 'string') {
+                            attachments[a][key] = mustache.render(attachments[a][key], { vars: vars });
+                        } else {
+                            attachments[a][key] = this.parseTemplatesRecursive(attachments[a][key], vars);
+                        }
                     }
                 }
+                // numbers, booleans, null and undefined are left unchanged
             }
         } else {
             for (const x in attachments) {

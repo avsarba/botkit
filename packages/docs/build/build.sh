@@ -8,5 +8,8 @@
 ./node_modules/.bin/typedoc --excludePrivate  --ignoreCompilerErrors --module amd --hideGenerator --name "Botkit for Webex Teams" --readme none --entryPoint "botbuilder-adapter-webex" ../botbuilder-adapter-webex/src/index.ts --json build/webex.json
 ./node_modules/.bin/typedoc --excludePrivate  --ignoreCompilerErrors --module amd --hideGenerator --name "Botkit for the Web" --readme none --entryPoint "botbuilder-adapter-web" ../botbuilder-adapter-web/src/index.ts --json build/web.json
 ./node_modules/.bin/typedoc --excludePrivate  --ignoreCompilerErrors --module amd --hideGenerator --name "Botkit CMS Plugin" --readme none --entryPoint "botkit-plugin-cms" ../botkit-plugin-cms/src/index.ts --json build/cms.json
+./node_modules/.bin/typedoc --excludePrivate  --ignoreCompilerErrors --module amd --hideGenerator --name "Botkit for the Command Line" --readme none --entryPoint "botbuilder-adapter-cli" ../botbuilder-adapter-cli/src/index.ts --json build/cli.json
+./node_modules/.bin/typedoc --excludePrivate  --ignoreCompilerErrors --module amd --hideGenerator --name "Botkit for AI Agents (MCP)" --readme none --entryPoint "botbuilder-adapter-mcp" ../botbuilder-adapter-mcp/src/index.ts --json build/mcp.json
+./node_modules/.bin/typedoc --excludePrivate  --ignoreCompilerErrors --module amd --hideGenerator --name "Botkit Scheduler Plugin" --readme none --entryPoint "botkit-plugin-scheduler" ../botkit-plugin-scheduler/src/index.ts --json build/scheduler.json
 
 node build/parse.js

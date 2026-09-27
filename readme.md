@@ -27,6 +27,11 @@ and is released under the [MIT Open Source license](LICENSE.md)
 | [botbuilder-adapter-facebook](packages/botbuilder-adapter-facebook) | A platform adapter for Facebook Messenger | [![NPM Badge](https://img.shields.io/npm/dw/botbuilder-adapter-facebook.svg?logo=npm)](https://www.npmjs.com/package/botbuilder-adapter-facebook) 
 | [generator-botkit](packages/generator-botkit) | A Yeoman generator for creating a new Botkit project | [![NPM Badge](https://img.shields.io/npm/dw/generator-botkit.svg?logo=npm)](https://www.npmjs.com/package/generator-botkit) 
 | [botkit-plugin-cms](packages/botkit-plugin-cms) | A plugin that adds support for [Botkit CMS](https://github.com/howdyai/botkit-cms) | [![NPM Badge](https://img.shields.io/npm/dw/botkit-plugin-cms.svg?logo=npm)](https://www.npmjs.com/package/botkit-plugin-cms)
+| [botbuilder-adapter-cli](packages/botbuilder-adapter-cli) | Run Botkit in the terminal: REPLs, wizards and scripted CI runs | [![NPM Badge](https://img.shields.io/npm/dw/botbuilder-adapter-cli.svg?logo=npm)](https://www.npmjs.com/package/botbuilder-adapter-cli)
+| [botbuilder-adapter-mcp](packages/botbuilder-adapter-mcp) | Serve a Botkit bot to AI agents over the Model Context Protocol | [![NPM Badge](https://img.shields.io/npm/dw/botbuilder-adapter-mcp.svg?logo=npm)](https://www.npmjs.com/package/botbuilder-adapter-mcp)
+| [botkit-plugin-scheduler](packages/botkit-plugin-scheduler) | Cron, interval and one-shot jobs that fire Botkit events | [![NPM Badge](https://img.shields.io/npm/dw/botkit-plugin-scheduler.svg?logo=npm)](https://www.npmjs.com/package/botkit-plugin-scheduler)
+
+To see the command line adapter, the MCP adapter and the scheduler working together, run [Ops Desk](packages/examples/ops-desk), a credential-free example that serves one bot in the terminal, as a CI step and to AI agents.
 
 ## Build Botkit locally
 

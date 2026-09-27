@@ -4,6 +4,21 @@
 
 [Want to contribute? Read our guide!](https://github.com/howdyai/botkit/blob/master/CONTRIBUTING.md)
 
+# 4.11.0
+
+This release takes Botkit beyond chat apps: the same handlers and dialogs now run in the terminal, in CI, for AI agents and on a schedule. [Read the Botkit Beyond Chat guide](packages/docs/beyond-chat.md).
+
+* NEW: [botbuilder-adapter-cli](packages/docs/platforms/cli.md) runs a Botkit bot in the terminal. It works as an interactive REPL, as a wizard with `adapter.run({ dialog })`, and as an unattended CI step that reads its answers from a file and exits with a meaningful code. Quick replies become numbered menus, and `format: 'json'` writes one JSON object per line.
+* NEW: [botbuilder-adapter-mcp](packages/docs/platforms/mcp.md) serves a Botkit bot to AI agents, such as Claude Code, as a Model Context Protocol server on stdio. The `chat` tool lets an agent walk BotkitConversation dialogs step by step. Tools declared with `adapter.tool()` are handled by `controller.on('tool:<name>')`.
+* NEW: [botkit-plugin-scheduler](packages/docs/plugins/scheduler.md) adds cron, interval and one-shot jobs, saved in Botkit storage. A due job fires an ordinary Botkit event, either in the conversation that scheduled it (`bot.schedule()`) or on the scheduler's own clock channel.
+* NEW: [controller.getPendingQuestion()](packages/docs/reference/core.md#getPendingQuestion) tells an adapter which BotkitConversation question, if any, is waiting for an answer: its dialog, thread, key, template and variables. The [BotkitMessageTemplate](packages/docs/reference/core.md#BotkitMessageTemplate) interface is now exported.
+* NEW: [Ops Desk](packages/examples/ops-desk), a credential-free example in the new `packages/examples`, serves one bot three ways: in the terminal, as a CI step and as an MCP server. It includes a guided deploy dialog, reminders, health watches and a nightly cron report.
+* NEW: A guide to [building a new adapter](packages/docs/advanced.md#how-to-build-a-new-adapter).
+
+* FIX: An error thrown by a `hears()`, `on()` or `interrupts()` handler, a dialog handler or hook, or an `afterDialog()` handler, or passed to `next()` by a middleware, now makes `controller.handleTurn()` reject with that error. Before, the turn never finished and caused an unhandled promise rejection, which ends the process on recent versions of Node. The state of a failed turn is not saved, and the webhook route answers with status 500.
+* FIX: `bot.say()` and `bot.replyWithTaskInfo()` now reject when a message cannot be sent, instead of never settling. `bot.say()` on a bot without a context rejects with a message that points to `bot.changeContext()`.
+* FIX: Arrays of strings in the `channelData`, `attachments` and `quick_replies` of a dialog template no longer crash with `Failed to start prompt`. Their strings are rendered with mustache like any other template value.
+
 # 4.10.0
 
 * Update dependencies to [Bot Framework 4.10.1](https://github.com/microsoft/botbuilder-js/releases/tag/4.10)

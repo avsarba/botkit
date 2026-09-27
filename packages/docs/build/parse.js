@@ -205,7 +205,10 @@ generateReference(__dirname + '/slack.json',__dirname + '/../reference/slack.md'
 generateReference(__dirname + '/hangouts.json',__dirname + '/../reference/hangouts.md');
 generateReference(__dirname + '/twilio-sms.json',__dirname + '/../reference/twilio-sms.md');
 generateReference(__dirname + '/facebook.json',__dirname + '/../reference/facebook.md');
+generateReference(__dirname + '/cli.json',__dirname + '/../reference/cli.md');
+generateReference(__dirname + '/mcp.json',__dirname + '/../reference/mcp.md');
 generateReference(__dirname + '/cms.json',__dirname + '/../reference/cms.md');
+generateReference(__dirname + '/scheduler.json',__dirname + '/../reference/scheduler.md');
 
 generateAdapter(__dirname + '/../../botbuilder-adapter-web/readme.md', {name: 'Websocket and Webhooks'} , __dirname + '/../platforms/web.md');
 generateAdapter(__dirname + '/../../botbuilder-adapter-webex/readme.md', {name: 'Webex Teams'} , __dirname + '/../platforms/webex.md');
@@ -213,8 +216,11 @@ generateAdapter(__dirname + '/../../botbuilder-adapter-slack/readme.md', {name: 
 generateAdapter(__dirname + '/../../botbuilder-adapter-hangouts/readme.md', {name: 'Google Hangouts'} , __dirname + '/../platforms/hangouts.md');
 generateAdapter(__dirname + '/../../botbuilder-adapter-twilio-sms/readme.md', {name: 'Twilio SMS'} , __dirname + '/../platforms/twilio-sms.md');
 generateAdapter(__dirname + '/../../botbuilder-adapter-facebook/readme.md', {name: 'Facebook Messenger'} , __dirname + '/../platforms/facebook.md');
+generateAdapter(__dirname + '/../../botbuilder-adapter-cli/readme.md', {name: 'Command Line (CLI)'} , __dirname + '/../platforms/cli.md');
+generateAdapter(__dirname + '/../../botbuilder-adapter-mcp/readme.md', {name: 'AI Agents (MCP)'} , __dirname + '/../platforms/mcp.md');
 
 generatePlugin(__dirname + '/../../botkit-plugin-cms/readme.md', {name: 'Botkit CMS Plugin'} , __dirname + '/../plugins/cms.md');
+generatePlugin(__dirname + '/../../botkit-plugin-scheduler/readme.md', {name: 'Botkit Scheduler Plugin'} , __dirname + '/../plugins/scheduler.md');
 
 
 buildTOC(__dirname + '/../reference/index.md');

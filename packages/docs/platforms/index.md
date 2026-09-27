@@ -8,4 +8,6 @@
 * [Google Hangouts](../platforms/hangouts.md)
 * [Twilio SMS](../platforms/twilio-sms.md)
 * [Facebook Messenger](../platforms/facebook.md)
+* [Command Line (CLI)](../platforms/cli.md)
+* [AI Agents (MCP)](../platforms/mcp.md)
 * [Microsoft Teams](../core.md#using-bot-framework-channels)

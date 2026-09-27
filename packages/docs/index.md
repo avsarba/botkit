@@ -127,6 +127,20 @@ controller.middleware.send.use(function(bot, message, next) {
 ```
 
 
+## Beyond Chat
+
+Botkit's handlers and dialogs also work away from chat apps. Run a bot in the terminal as a REPL, as an installer wizard, or as an unattended CI step that reads its answers from a file. Serve it to AI agents such as Claude Code as a Model Context Protocol server. And let the clock start turns with cron, interval and one-shot jobs.
+
+```javascript
+// a dialog that a person answers at the keyboard, and a CI job answers from a file
+const adapter = new CliAdapter({ answers: require('./answers.json'), nonInteractive: !process.stdin.isTTY });
+const controller = new Botkit({ adapter, disable_webserver: true, disable_console: true });
+controller.addDialog(deployDialog);
+adapter.run({ dialog: 'deploy' }).then((result) => { process.exitCode = result.exitCode; });
+```
+
+[Read the Botkit Beyond Chat guide &raquo;](beyond-chat.md), or go straight to the [command line](platforms/cli.md), [AI agents (MCP)](platforms/mcp.md) and [scheduler](plugins/scheduler.md) docs.
+
 ## What's Next?
 
 * [Continue learning about Botkit's core features](core.md)

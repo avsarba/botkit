@@ -268,4 +268,118 @@ coming
 
 ## How to build a new adapter
 
-coming
+An adapter connects Botkit to a surface: a messaging API, a web page, a terminal, a protocol or a queue. It is a subclass of BotBuilder's `BotAdapter` that turns input into `Activity` objects for Botkit, and turns the bot's outgoing activities into output. Botkit calls `usePlugin(adapter)` in its constructor, so an adapter is also a plugin, with a `name`, optional `middlewares` and an `init(botkit)` hook.
+
+This adapter reads one JSON object per line from a stream and writes the bot's replies as JSON lines. It is complete and works as written:
+
+```javascript
+const readline = require('readline');
+const { BotAdapter, TurnContext } = require('botbuilder');
+const { BotWorker } = require('botkit');
+
+class LinesBotWorker extends BotWorker {
+    // helpers for handlers, such as startConversationWithUser(user) built on this.changeContext()
+}
+
+class LinesAdapter extends BotAdapter {
+    constructor(options = {}) {
+        super();
+        this.name = 'Lines Adapter';         // required: Botkit ignores a plugin without a name
+        this.botkit_worker = LinesBotWorker; // the class of the `bot` passed to handlers
+        this.input = options.input || process.stdin;
+        this.output = options.output || process.stdout;
+    }
+
+    init(botkit) {
+        this.controller = botkit;
+        // init() runs inside new Botkit(), before your handlers are registered: start later
+        botkit.ready(() => setImmediate(() => this.start()));
+        // controller.shutdown() does not touch adapters, so release streams, sockets and timers here
+        botkit.on('shutdown', async () => this.rl && this.rl.close());
+    }
+
+    start() {
+        this.rl = readline.createInterface({ input: this.input });
+        let queue = Promise.resolve();
+        this.rl.on('line', (line) => {
+            // one turn at a time, so turns in a conversation never overlap
+            queue = queue.then(() => this.receive(JSON.parse(line))).catch((err) => console.error(err));
+        });
+    }
+
+    async receive(payload) {
+        const activity = {
+            type: payload.type === 'message' ? 'message' : 'event',
+            channelId: 'lines',                                    // channelId, conversation.id and from.id are required:
+            conversation: { id: payload.conversation || payload.user }, // they are the key of the dialog state
+            from: { id: payload.user },
+            recipient: { id: 'bot' },
+            text: payload.text,                                    // dialogs match and store answers from text
+            channelData: payload,
+            timestamp: new Date(),
+            id: String(Date.now())
+        };
+        if (activity.type === 'event') {
+            activity.channelData.botkitEventType = payload.type;  // fires controller.on(payload.type)
+        }
+        const context = new TurnContext(this, activity);
+        await this.runMiddleware(context, this.controller.handleTurn.bind(this.controller));
+
+        const question = await this.controller.getPendingQuestion(context);
+        if (question) {
+            this.write({ type: 'waiting', key: question.key, conversation: activity.conversation.id });
+        }
+    }
+
+    async sendActivities(context, activities) {
+        return activities.map((activity, i) => {
+            this.write({
+                type: activity.type,
+                text: activity.text,
+                to: activity.recipient.id,                  // the user
+                conversation: activity.conversation.id,
+                quick_replies: activity.channelData && activity.channelData.quick_replies
+            });
+            return { id: `${ Date.now() }-${ i }` };
+        });
+    }
+
+    async updateActivity(context, activity) { /* not supported by this surface */ }
+
+    async deleteActivity(context, reference) { /* not supported by this surface */ }
+
+    async continueConversation(reference, logic) {
+        const request = TurnContext.applyConversationReference({ type: 'event', name: 'continueConversation' }, reference, true);
+        await this.runMiddleware(new TurnContext(this, request), logic);
+    }
+
+    async processActivity(req, res, logic) {
+        res.statusCode = 405; // not an HTTP adapter: answer Botkit's webhook route instead of throwing
+        res.end(JSON.stringify({ error: 'This adapter does not accept HTTP requests' }));
+    }
+
+    write(message) {
+        this.output.write(JSON.stringify(message) + '\n');
+    }
+}
+```
+
+Use it like any other adapter: `const controller = new Botkit({ adapter: new LinesAdapter(), disable_webserver: true })`.
+
+Some parts of the example need a closer look:
+
+* **The abstract methods.** `BotAdapter` requires `sendActivities`, `updateActivity`, `deleteActivity` and `continueConversation`. `updateActivity` and `deleteActivity` may do nothing when the surface cannot edit messages.
+* **Receiving.** Every incoming activity needs `channelId`, `conversation.id` and `from.id`: Botkit uses them to key the conversation state, and throws without them. Pass the turn to `runMiddleware(context, controller.handleTurn.bind(controller))`, which runs the adapter's own middleware (`adapter.use()`) first. As of Botkit 4.11, `handleTurn()` rejects when a handler or middleware fails, so `runMiddleware()` rejects too, unless you set `adapter.onTurnError`. Report the error to the user in a way that fits your surface, and do not let it become an unhandled rejection.
+* **Sending.** By the time `sendActivities` runs, `TurnContext` has applied the turn's reference. `activity.conversation.id` is the conversation and `activity.recipient.id` is the user. `bot.say()` moves any field that is not part of an Activity into `activity.channelData`, so read custom fields such as `quick_replies` from there. Dialog templates also set `suggestedActions`. Proactive messages, from `bot.changeContext(reference)` or `continueConversation()`, arrive here too, with no incoming request to reply to.
+* **Continuing conversations.** `continueConversation()` is what [botkit-plugin-scheduler](plugins/scheduler.md) calls to run a job in a saved conversation. Do not queue these turns behind user input. If a handler awaits `scheduler.runNow(id)`, a queued job turn would wait for the handler's turn to end, while the handler waits for the job: a deadlock.
+* **Synchronous HTTP.** An adapter behind Botkit's webhook route implements `processActivity(req, res, logic)`. It sets `context.turnState.set('httpStatus', 200)`, awaits `this.runMiddleware(context, logic)`, and then answers with `turnState.get('httpStatus')` and `turnState.get('httpBody')`. Handlers change these with `bot.httpStatus()` and `bot.httpBody()`, and `sendActivities` can append replies to `httpBody`, as the web adapter's webhook mode does.
+* **Knowing what the bot is waiting for.** After a turn, [controller.getPendingQuestion(context)](reference/core.md#getPendingQuestion) says whether a BotkitConversation is waiting for an answer. It gives the question's `key`, the raw `template` with its `quick_replies`, and a copy of the dialog's `vars`. Surfaces without a chat window use it to show a prompt, fill a form field, or answer from a file, instead of reading dialog internals.
+* **A custom worker.** Set `botkit_worker` to a `BotWorker` subclass to give handlers extra methods. Override `startConversationWithUser()` with `this.changeContext(reference)`, as the Twilio, CLI and MCP workers do.
+
+**Testing.** Pass `PassThrough` streams (or fakes for an API client) to the adapter, create the controller with `new Botkit({ adapter, disable_webserver: true, disable_console: true })`, write input, and read what the adapter writes. Call `await controller.shutdown()` after each test, so the adapter releases its streams and timers and mocha can exit without `--exit`.
+
+These adapters in the Botkit repository are complete references:
+
+* [botbuilder-adapter-cli](platforms/cli.md) reads a stream line by line. It has a turn queue, turn timeouts, quick replies as numbered menus, a `run()` API for wizards, and automatic answers from `getPendingQuestion()`.
+* [botbuilder-adapter-mcp](platforms/mcp.md) speaks JSON-RPC over stdio. It has per-session queues, tool calls as events in their own conversations, and an outbox for proactive messages.
+* [botbuilder-adapter-web](platforms/web.md) handles HTTP webhooks and websockets, and answers synchronously with `httpStatus` and `httpBody`.

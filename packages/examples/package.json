@@ -1,0 +1,18 @@
+{
+  "name": "botkit-examples",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Runnable, credential-free Botkit examples, starting with Ops Desk: one bot served in the terminal, in CI and to AI agents over MCP",
+  "license": "MIT",
+  "scripts": {
+    "test": "mocha tests/*.tests.js",
+    "start:cli": "node ops-desk/cli.js",
+    "start:mcp": "node ops-desk/mcp.js"
+  },
+  "dependencies": {
+    "botkit": "^4.11.0",
+    "botbuilder-adapter-cli": "^1.0.0",
+    "botbuilder-adapter-mcp": "^1.0.0",
+    "botkit-plugin-scheduler": "^1.0.0"
+  }
+}

@@ -33,7 +33,11 @@ The Botkit project includes several official adapters. Using these plugins, your
 * [Google Hangouts](platforms/hangouts.md)
 * [Facebook Messenger](platforms/facebook.md)
 * [Twilio SMS](platforms/twilio-sms.md)
+* [Command Line (CLI)](platforms/cli.md)
+* [AI Agents (MCP)](platforms/mcp.md)
 * [Microsoft Teams](#ms-teams-extensions)
+
+Botkit bots are not limited to chat apps. The same handlers and dialogs can run in a terminal, as an unattended CI step, as a Model Context Protocol server that AI agents such as Claude Code call as tools, and on a schedule. [Read the Botkit Beyond Chat guide](beyond-chat.md) for a walkthrough, and for tips on designing dialogs that work on every surface.
 
 In addition, the open source community has created a variety of plugins and extensions to Bot Framework.  Check out the [Bot Builder Community Repo](https://github.com/BotBuilderCommunity/botbuilder-community-js) for additional adapters, storage connectors and middlewares.
 
@@ -308,6 +312,39 @@ Most of the platform adapters provide convenience methods that can use used to b
 * [Webex Teams](reference/webex.md#startconversationinroom)
 * [Twilio SMS](reference/twilio-sms.md#startconversationwithuser)
 * [Google Hangouts](reference/hangouts.md#startconversationinthread)
+
+### Schedule messages with the scheduler plugin
+
+For reminders, recurring check-ins and cron-style jobs, the [Botkit Scheduler Plugin](plugins/scheduler.md) does the bookkeeping for you. It saves jobs in Botkit's storage, so they survive restarts. A job created with `bot.schedule()` remembers the conversation it came from. When the job is due, the scheduler continues that conversation on the adapter that owns it and fires an ordinary event. Handle the event with `controller.on()`, and use `bot.say()` and `bot.beginDialog()` as in any other handler:
+
+```javascript
+const { BotkitScheduler } = require('botkit-plugin-scheduler');
+
+const scheduler = new BotkitScheduler();
+controller.usePlugin(scheduler);
+
+// a one-shot reminder in this conversation
+controller.hears('remind me tomorrow', 'message', async(bot, message) => {
+    await bot.schedule({ in: '1d', event: 'reminder', payload: { text: 'Here is the reminder you asked for yesterday.' } });
+    await bot.reply(message, 'OK, I will remind you tomorrow.');
+});
+
+controller.on('reminder', async(bot, message) => {
+    await bot.say(message.value.text);
+});
+
+// a standup in this conversation every weekday at 9:00, Paris time
+controller.hears('daily standup', 'message', async(bot, message) => {
+    await bot.schedule({ id: `standup:${ message.channel }`, cron: '0 9 * * 1-5', timezone: 'Europe/Paris', event: 'standup' });
+    await bot.reply(message, 'I will start a standup here every weekday at 9:00.');
+});
+
+controller.on('standup', async(bot, message) => {
+    await bot.beginDialog('standup');
+});
+```
+
+A job without a conversation, such as `scheduler.cron('nightly-report', '0 2 * * *', { event: 'nightly_report' })`, runs on the scheduler's own clock channel. Scheduled events are delivered as interrupts, so a job never answers a question that a dialog is waiting on.
 
 
 ## Using Dialogs
@@ -599,6 +636,11 @@ let plugin = require('botkit-plugin-whatever');
 controller.usePlugin(plugin);
 ``` 
 
+The Botkit project includes these plugins:
+
+* [Botkit CMS Plugin](plugins/cms.md) loads dialog content from [Botkit CMS](https://github.com/howdyai/botkit-cms).
+* [Botkit Scheduler Plugin](plugins/scheduler.md) runs cron, interval and one-shot jobs that fire Botkit events. It is a complete example of the plugin API: it adds `bot.schedule()` with a spawn middleware, exposes `controller.plugins.scheduler` with `addPluginExtension()`, and stops its timer in a `shutdown` handler.
+
 A plugin module should contain an object (or a function that returns an object) in the form:
 ```javascript
 module.exports = function(botkit) {
@@ -693,6 +735,8 @@ To enable a middleware, register it at the appropriate endpoint:
 ```javascript
 controller.middleware.ingest.use(myBotkitMiddleware);
 ```
+
+To stop a message with an error, call `next(err)`. As of Botkit 4.11, an error passed to `next()` by an ingest, receive or interpret middleware makes [controller.handleTurn()](reference/core.md#handleTurn) reject with that error. So does an error thrown by a `hears()`, `on()` or `interrupts()` handler, a dialog handler or hook, or an `afterDialog()` handler. The conversation state of a failed turn is not saved. An adapter with an `onTurnError` handler passes the error to it. Otherwise the error reaches whoever started the turn: the webhook route logs it and answers the request with status 500, unless the adapter has already responded. Before 4.11, such a turn never finished and caused an unhandled promise rejection.
 
 ### BotBuilder Adapter Middleware
 

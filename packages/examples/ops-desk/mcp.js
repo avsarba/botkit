@@ -12,7 +12,7 @@ const { McpAdapter } = require('botbuilder-adapter-mcp');
 const createOpsDesk = require('./opsdesk');
 
 const INSTRUCTIONS = 'Ops Desk manages deploys for api, billing and search. Use the chat tool: say "help" to list commands, ' +
-    '"deploy" to start a guided deploy (answer each question with one of the offered values), ' +
+    '"deploy" to start a guided deploy (answer each question with one of the offered values, or "cancel" to stop), ' +
     '"remind me in 5 minutes to <task>" for reminders. Use service_status and list_jobs for read-only data.';
 
 /**

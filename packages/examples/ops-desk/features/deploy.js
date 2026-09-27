@@ -6,6 +6,8 @@
  *                            --production--> confirm --match--> ship
  *                                                    --no match--> canceled
  *
+ * "cancel" (or "stop") answers any question by leaving the dialog, through the aborted thread.
+ *
  * Every question has a key (service, env, confirm), so the same dialog can be answered
  * by a person, by an answers file in CI (`--answers`), or by an AI agent over MCP.
  */
@@ -21,10 +23,20 @@ module.exports = function(controller) {
 
     const deploy = new BotkitConversation('deploy', controller);
 
+    // Listed first at every question: while the dialog waits for an answer, it takes every message,
+    // so the way out has to be one of the answers it understands.
+    const cancel = {
+        pattern: '^(cancel|stop)$',
+        handler: async (answer, convo) => {
+            await convo.gotoThread('aborted');
+        }
+    };
+
     deploy.ask({
         text: ['Which service?'],
         quick_replies: services.map((name) => ({ title: name, payload: name }))
     }, [
+        cancel,
         {
             pattern: `^(${ services.map(escapeRegExp).join('|') })$`,
             handler: async (answer, convo) => {
@@ -48,6 +60,7 @@ module.exports = function(controller) {
             { title: 'Production', payload: 'production' }
         ]
     }, [
+        cancel,
         {
             pattern: '^production$',
             handler: async (answer, convo) => {
@@ -73,18 +86,27 @@ module.exports = function(controller) {
 
     deploy.addQuestion({
         text: ['Type the service name ({{{vars.service}}}) to confirm a PRODUCTION deploy.']
-    }, async (answer, convo) => {
-        if (String(answer || '').trim().toLowerCase() === convo.vars.service) {
-            await convo.gotoThread('ship');
-        } else {
-            await convo.gotoThread('canceled');
+    }, [
+        cancel,
+        {
+            default: true,
+            handler: async (answer, convo) => {
+                if (String(answer || '').trim().toLowerCase() === convo.vars.service) {
+                    await convo.gotoThread('ship');
+                } else {
+                    await convo.gotoThread('canceled');
+                }
+            }
         }
-    }, 'confirm', 'confirm');
+    ], 'confirm', 'confirm');
 
     // The 'stop' action ends the dialog with vars._status 'canceled', which run() and afterDialog handlers can see.
     // (convo.stop() inside a handler would end it without setting a status.)
     deploy.addMessage('Confirmation did not match. Deploy canceled.', 'canceled');
     deploy.addAction('stop', 'canceled');
+
+    deploy.addMessage('Deploy canceled.', 'aborted');
+    deploy.addAction('stop', 'aborted');
 
     deploy.before('ship', async (convo) => {
         convo.setVar('version', fleet.deploy(convo.vars.service, convo.vars.env));

@@ -3,7 +3,7 @@
  */
 
 const COMMANDS = [
-    ['deploy', 'ship a service to staging or production, step by step'],
+    ['deploy', 'ship a service to staging or production, step by step (say "cancel" to stop)'],
     ['status', 'versions and health of every service'],
     ['remind me in <n> <seconds|minutes> to <task>', 'set a reminder in this conversation'],
     ['watch / unwatch', 'check fleet health on a schedule, or stop'],
@@ -16,8 +16,8 @@ module.exports = function(controller) {
         const activity = message.incoming_message || {};
         const added = activity.membersAdded;
         const botId = activity.recipient && activity.recipient.id;
-        // Some channels also announce the bot joining; only greet people.
-        if (Array.isArray(added) && added.length && added.every((member) => member && member.id === botId)) {
+        // Greet only when a person joins. Channels also send updates when the bot joins, when members leave, or when nothing about members changed.
+        if (!Array.isArray(added) || !added.some((member) => member && member.id !== botId)) {
             return;
         }
         await bot.reply(message, {

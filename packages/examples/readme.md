@@ -14,9 +14,11 @@ This is a private package in the Botkit monorepo. From the root of the repositor
 npm install
 npm run build
 cd packages/examples
-npm run start:cli   # Ops Desk in the terminal
-npm run start:mcp   # Ops Desk as an MCP server on stdio
-npm test            # in-process and child-process tests of every example
+npm run start:cli      # Ops Desk in the terminal
+npm run -s start:mcp   # Ops Desk as an MCP server on stdio
+npm test               # in-process and child-process tests of every example
 ```
+
+Keep the `-s` (`--silent`) in `npm run -s start:mcp`. An MCP server's stdout carries only protocol messages, and without `-s` npm writes its own banner there first. MCP clients should start the server with `node` and the absolute path to `ops-desk/mcp.js`, as the [Ops Desk readme](ops-desk/readme.md#3-as-an-mcp-server-for-ai-agents) shows.
 
 Read the [Botkit Beyond Chat guide](../docs/beyond-chat.md) for the ideas behind these examples.

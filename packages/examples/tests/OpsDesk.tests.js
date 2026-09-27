@@ -35,6 +35,33 @@ class FakeClock {
 }
 
 /**
+ * A storage that outlives the controllers that use it, like a database across restarts. Items are stored as JSON.
+ */
+class SharedStorage {
+    constructor() {
+        this.items = {};
+    }
+
+    async read(keys) {
+        const found = {};
+        keys.filter((key) => this.items[key] !== undefined).forEach((key) => {
+            found[key] = JSON.parse(this.items[key]);
+        });
+        return found;
+    }
+
+    async write(changes) {
+        Object.keys(changes).forEach((key) => {
+            this.items[key] = JSON.stringify(changes[key]);
+        });
+    }
+
+    async delete(keys) {
+        keys.forEach((key) => delete this.items[key]);
+    }
+}
+
+/**
  * Collect everything written to a stream.
  */
 function capture(stream) {
@@ -54,10 +81,11 @@ function flush() {
  * Ops Desk on a CliAdapter with PassThrough streams, as user 'ann' in conversation 'ops-1'.
  */
 function setupCli(adapterOptions = {}, deskOptions = {}) {
+    const input = new PassThrough();
     const output = new PassThrough();
     const errorOutput = new PassThrough();
     const adapter = new CliAdapter({
-        input: new PassThrough(),
+        input,
         output,
         errorOutput,
         color: false,
@@ -75,7 +103,7 @@ function setupCli(adapterOptions = {}, deskOptions = {}) {
         reportOutput: (activity) => reports.push(activity.text),
         ...deskOptions
     });
-    return { adapter, desk, clock, reports, out: capture(output), err: capture(errorOutput) };
+    return { adapter, desk, clock, reports, input, out: capture(output), err: capture(errorOutput) };
 }
 
 describe('Ops Desk', function() {
@@ -184,12 +212,20 @@ describe('Ops Desk', function() {
             ]);
         });
 
+        it('should not greet when members leave, or when nobody joins', async function() {
+            assert.deepStrictEqual(await adapter.submit('/json {"type":"conversationUpdate","membersRemoved":[{"id":"ann"}]}'), []);
+            assert.deepStrictEqual(await adapter.submit('/json {"type":"conversationUpdate","membersAdded":[]}'), []);
+            assert.deepStrictEqual(await adapter.submit('/json {"type":"conversationUpdate"}'), []);
+        });
+
         it('should list the commands on help', async function() {
             const lines = await adapter.submit('help');
             assert.strictEqual(lines[0], 'bot> Ops Desk commands:');
             ['deploy', 'status', 'remind me in <n> <seconds|minutes> to <task>', 'watch / unwatch', 'break <service> / fix <service>', 'jobs'].forEach((command) => {
                 assert.ok(lines.some((line) => line.trim().startsWith(command)), command);
             });
+            // how to leave the deploy dialog
+            assert.ok(lines.some((line) => line.trim().startsWith('deploy') && line.includes('"cancel"')), lines.join('\n'));
         });
 
         it('should point unknown commands to help', async function() {
@@ -255,6 +291,26 @@ describe('Ops Desk', function() {
             assert.deepStrictEqual(desk.fleet.audit, []);
             // the dialog is over: the next message goes to hears() again
             assert.strictEqual((await adapter.submit('status'))[0], 'bot> SERVICE  STAGING  PRODUCTION  HEALTH');
+        });
+
+        it('should let a person cancel the deploy at any question', async function() {
+            await adapter.submit('deploy');
+            assert.deepStrictEqual(await adapter.submit('cancel'), ['bot> Deploy canceled.']);
+            // the dialog is over: the next message goes to hears() again
+            assert.strictEqual((await adapter.submit('status'))[0], 'bot> SERVICE  STAGING  PRODUCTION  HEALTH');
+
+            await adapter.submit('deploy');
+            await adapter.submit('billing');
+            assert.deepStrictEqual(await adapter.submit('Stop'), ['bot> Deploy canceled.']);
+
+            await adapter.submit('deploy');
+            await adapter.submit('billing');
+            await adapter.submit('production');
+            assert.deepStrictEqual(await adapter.submit('cancel'), ['bot> Deploy canceled.']);
+
+            assert.strictEqual(desk.fleet.status()[1].production, '1.4.1');
+            assert.deepStrictEqual(desk.fleet.audit, []);
+            assert.strictEqual((await adapter.submit('help'))[0], 'bot> Ops Desk commands:');
         });
 
         it('should deliver a reminder into the terminal session', async function() {
@@ -362,6 +418,31 @@ describe('Ops Desk', function() {
         });
     });
 
+    describe('with a storage', function() {
+        // The ops-desk readme: with a storage, give the CliAdapter a fixed conversation (setupCli uses 'ops-1'),
+        // so that a later session finds the jobs of an earlier one.
+        it('should find and stop a watch after a restart in the same conversation', async function() {
+            const storage = new SharedStorage();
+            let { adapter, desk } = setupCli({}, { storage });
+            try {
+                await desk.ready;
+                await adapter.submit('watch');
+            } finally {
+                await desk.controller.shutdown();
+            }
+
+            ({ adapter, desk } = setupCli({}, { storage }));
+            try {
+                await desk.ready;
+                assert.deepStrictEqual(await adapter.submit('jobs'), ['bot> watch:ops-1:ann  health_check  next 2026-09-27T12:00:30.000Z']);
+                assert.deepStrictEqual(await adapter.submit('unwatch'), ['bot> Stopped watching.']);
+                assert.deepStrictEqual(await desk.scheduler.list({ event: 'health_check' }), []);
+            } finally {
+                await desk.controller.shutdown();
+            }
+        });
+    });
+
     describe('unattended', function() {
         let desk;
 
@@ -395,10 +476,23 @@ describe('Ops Desk', function() {
             assert.strictEqual(desk.fleet.audit.length, 1);
         });
 
-        it('should fail with exit code 2 when an answer is missing', async function() {
-            let adapter, err;
-            ({ adapter, desk, err } = setupCli({ answers: { service: 'api' }, nonInteractive: true }));
+        it('should end with status canceled when an answer says cancel', async function() {
+            let adapter;
+            ({ adapter, desk } = setupCli({ answers: { service: 'api', env: 'cancel' }, nonInteractive: true }));
             await desk.ready;
+            const result = await adapter.run({ dialog: 'deploy' });
+            assert.strictEqual(result.status, 'canceled');
+            assert.strictEqual(result.exitCode, 1);
+            assert.strictEqual(desk.fleet.status()[0].staging, '2.3.1');
+            assert.deepStrictEqual(desk.fleet.audit, []);
+        });
+
+        it('should fail with exit code 2 when an answer is missing', async function() {
+            let adapter, err, input;
+            ({ adapter, desk, err, input } = setupCli({ answers: { service: 'api' }, nonInteractive: true }));
+            await desk.ready;
+            // non-interactive runs read input that is not a TTY to its end before they give up on an answer
+            input.end();
             const result = await adapter.run({ dialog: 'deploy' });
             assert.strictEqual(result.status, 'failed');
             assert.strictEqual(result.exitCode, 2);
@@ -490,6 +584,16 @@ describe('Ops Desk', function() {
             assert.strictEqual(result.structuredContent.awaitingInput, false);
             assert.strictEqual(result.isError, undefined);
             assert.strictEqual(server.fleet.audit[0].user, 'mcp-client');
+        });
+
+        it('should let an agent cancel the deploy dialog', async function() {
+            await chat('deploy', 's1');
+            await chat('billing', 's1');
+            const result = await chat('cancel', 's1');
+            assert.strictEqual(result.content[0].text, 'Deploy canceled.');
+            assert.strictEqual(result.structuredContent.awaitingInput, false);
+            assert.strictEqual(result.structuredContent.pendingQuestion, null);
+            assert.deepStrictEqual(server.fleet.audit, []);
         });
 
         it('should keep sessions apart', async function() {

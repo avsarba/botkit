@@ -35255,6 +35255,269 @@
       ]
     },
     {
+      "name": "Botkit for the Command Line",
+      "packageName": "botbuilder-adapter-cli",
+      "path": "reference/cli.md",
+      "classes": [
+        {
+          "name": "CliAdapter",
+          "kind": 128,
+          "kindString": "Class",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "Connect [Botkit](https://www.npmjs.com/package/botkit) to the command line.\nEvery line typed (or piped) becomes a message that runs through the full Botkit pipeline: middleware, `hears()`, `interrupts()`,\n`on()` handlers and BotkitConversation dialogs. Replies are printed as `bot> ...`, quick replies become numbered menus,\nand slash-commands send events, switch users or conversations and show state.",
+            "text": "The same bot can run as an interactive REPL, as a wizard or installer ([run()](#run) with a dialog),\nas a scripted CI step (`answers` and `nonInteractive`), or as a Unix filter (`format: 'json'`).\nThis adapter works with Botkit only: pass it to `new Botkit({ adapter })`.\n"
+          }
+        },
+        {
+          "name": "CliBotWorker",
+          "kind": 128,
+          "kindString": "Class",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "This is a specialized version of [Botkit's core BotWorker class](core.md#BotWorker) that includes additional methods for the command line.\nIt includes all functionality from the base class, as well as the extension methods below.",
+            "text": "When using the CliAdapter with Botkit, all `bot` objects passed to handler functions will include these extensions.\n"
+          }
+        }
+      ],
+      "interfaces": [
+        {
+          "name": "CliAdapterOptions",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "Options passed to the CliAdapter constructor. Every option is optional."
+          }
+        },
+        {
+          "name": "CliChoice",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "One entry of a numbered menu, as offered by quick replies, suggested actions or card buttons."
+          }
+        },
+        {
+          "name": "CliRunOptions",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "Options for [run()](#run)."
+          }
+        },
+        {
+          "name": "CliRunResult",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "The result of [run()](#run)."
+          }
+        },
+        {
+          "name": "RenderOptions",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "Options for `renderActivity()` and `renderJson()`."
+          }
+        },
+        {
+          "name": "RenderedActivity",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "The result of `renderActivity()`."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Botkit for AI Agents (MCP)",
+      "packageName": "botbuilder-adapter-mcp",
+      "path": "reference/mcp.md",
+      "classes": [
+        {
+          "name": "McpAdapter",
+          "kind": 128,
+          "kindString": "Class",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "Connect [Botkit](https://www.npmjs.com/package/botkit) to AI agents through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).\nThe bot becomes an MCP server that talks JSON-RPC over stdin and stdout, so agents such as Claude Code can start it and use it as a set of tools:",
+            "text": "* the **chat** tool sends a message through the full Botkit pipeline (middleware, `hears()`, `interrupts()`, `on()` and dialogs)\n   and returns the bot's replies, the choices it offers, and whether a dialog is waiting for an answer.\n   BotkitConversation dialogs become validated, step-by-step workflows the agent has to walk through.\n* **declared tools**, created with [tool()](#tool), are handled by `controller.on('tool:<name>')` handlers.\n   The arguments arrive in `message.value`, and the handler returns a structured result with `bot.toolResult()`.\n\nProactive messages, such as scheduled reminders, wait in a per-session outbox until the agent's next chat call,\nand are also sent as log notifications. This adapter works with Botkit only.\n"
+          }
+        },
+        {
+          "name": "McpBotWorker",
+          "kind": 128,
+          "kindString": "Class",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "This is a specialized version of [Botkit's core BotWorker class](core.md#BotWorker) that includes additional methods for AI agents connected over MCP.\nIt includes all functionality from the base class, as well as the extension methods below.",
+            "text": "When using the McpAdapter with Botkit, all `bot` objects passed to handler functions will include these extensions.\n"
+          }
+        },
+        {
+          "name": "JsonRpcConnection",
+          "kind": 128,
+          "kindString": "Class",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "A newline-delimited JSON-RPC 2.0 connection over a pair of streams, as used by the MCP stdio transport.",
+            "text": "* Each line of `input` is one JSON message. A trailing carriage return is removed and blank lines are skipped.\n* A line that is not valid JSON is answered with the error `-32700 Parse error`.\n* Every other message is passed to `handler` without waiting for earlier ones, so requests run concurrently.\n   A result that is not null is written to `output` as one line of JSON. Nothing else is ever written to `output`.\n* When `input` ends, the connection waits for every message in `pending` to be handled, then closes and calls the [onClose()](#onClose) listeners.\n* An error on `output` (for example EPIPE because the client went away) or on `input` is treated like the end of `input`.\n\n```javascript\nconst { JsonRpcConnection } = require('botbuilder-adapter-mcp');\nconst connection = new JsonRpcConnection(process.stdin, process.stdout, async (message) => {\n     if (message.method === 'ping') {\n         return { jsonrpc: '2.0', id: message.id, result: {} };\n     }\n     return null;\n});\nconnection.onClose(() => console.error('The client went away.'));\nconnection.start();\n```\n"
+          }
+        }
+      ],
+      "interfaces": [
+        {
+          "name": "McpAdapterOptions",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "This interface defines the options that can be passed into the McpAdapter constructor function."
+          }
+        },
+        {
+          "name": "McpAttachment",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "An attachment of a bot message, as reported to the agent."
+          }
+        },
+        {
+          "name": "McpCallMeta",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "Options for [McpAdapter.callTool()](#callTool)."
+          }
+        },
+        {
+          "name": "McpCallToolResult",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "The result of an MCP `tools/call` request, as returned by [McpAdapter.callTool()](#callTool)."
+          }
+        },
+        {
+          "name": "McpChoice",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "One choice offered by a bot message, from its quick replies, suggested actions or card buttons."
+          }
+        },
+        {
+          "name": "McpRenderOptions",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "Options for `renderRepliesText()`."
+          }
+        },
+        {
+          "name": "McpReply",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "One activity the bot sent, simplified for an agent. `typing`, `delay` and `trace` activities are never reported."
+          }
+        },
+        {
+          "name": "McpToolAnnotations",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "Hints that describe how a tool behaves. Clients use them to decide, for example, whether to ask the user before calling a tool.\nThey are hints only: clients must not rely on them for security."
+          }
+        },
+        {
+          "name": "McpToolDefinition",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "Describes a tool declared with [McpAdapter.tool()](#tool). The tool's handler is `controller.on('tool:<name>', handler)`."
+          }
+        }
+      ]
+    },
+    {
       "name": "Botkit CMS Plugin",
       "packageName": "botkit-plugin-cms",
       "path": "reference/cms.md",
@@ -36919,6 +37182,101 @@
           ]
         }
       ]
+    },
+    {
+      "name": "Botkit Scheduler Plugin",
+      "packageName": "botkit-plugin-scheduler",
+      "path": "reference/scheduler.md",
+      "classes": [
+        {
+          "name": "BotkitScheduler",
+          "kind": 128,
+          "kindString": "Class",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "Give Botkit a clock: run cron, interval and one-shot jobs that survive restarts.",
+            "text": "A job that comes due becomes an ordinary Botkit turn with the job's event as `message.type`, handled with `controller.on(event, handler)`.\n* A job without a conversation reference (a \"clock job\") runs on the scheduler's own `scheduler` channel. Messages the bot sends there go to the `output` option.\n* A job with a reference runs inside that conversation, on the adapter that owns it, so `bot.say()` reaches the user.\n   Scheduled turns are handled before the dialog system, so a job fires even while a dialog is waiting for an answer, and the\n   dialog still receives the user's next message.\n\nJobs are kept in Botkit storage and reloaded at startup, where the `catchUp` option decides what happens to runs that were missed.\nThe scheduler is built for a single process: if several processes share the storage, each one runs every job.\n\n```javascript\nconst { BotkitScheduler } = require('botkit-plugin-scheduler');\n\nconst scheduler = new BotkitScheduler({ timezone: 'America/New_York' });\ncontroller.usePlugin(scheduler);\n\n// a nightly job, declared at every boot without creating duplicates\ncontroller.ready(async () => {\n     await controller.plugins.scheduler.cron('nightly-report', '0 2 * * *', { event: 'nightly_report' });\n});\ncontroller.on('nightly_report', async (bot, message) => {\n     // runs at 2am New York time\n});\n\n// a reminder in the user's own conversation\ncontroller.hears('remind me', 'message', async (bot, message) => {\n     await bot.schedule({ in: '10m', event: 'reminder', payload: { text: 'Stretch!' } });\n     await bot.reply(message, 'OK, in 10 minutes.');\n});\ncontroller.on('reminder', async (bot, message) => {\n     await bot.say(message.value.text);\n});\n```\n"
+          }
+        },
+        {
+          "name": "ClockAdapter",
+          "kind": 128,
+          "kindString": "Class",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "The adapter behind the scheduler's built-in `scheduler` channel, which runs jobs that are not bound to a conversation (\"clock jobs\").",
+            "text": "Each [BotkitScheduler](#BotkitScheduler) creates one, available as `scheduler.clockAdapter`. It is never the controller's primary adapter:\nBotkit spawns the `bot` for a clock-job turn from the turn's own adapter, so handlers use the normal `bot.say()`, `bot.beginDialog()` and so on.\n\nIn a clock-job turn the activity has channelId `scheduler`, conversation id `scheduler:<job id>` and user id `scheduler`,\nand `context.turnState.get('botkit-scheduler.job')` holds a copy of the job.\nAnything the bot sends on this channel is handed to the scheduler's `output` option.\n\n```javascript\nconst scheduler = new BotkitScheduler({\n     output: async (activity, job) => {\n         console.log(`[${ job ? job.id : 'scheduler' }] ${ activity.text }`);\n     }\n});\ncontroller.usePlugin(scheduler);\n\nawait scheduler.every('heartbeat', '1m', { event: 'heartbeat' });\ncontroller.on('heartbeat', async (bot, message) => {\n     await bot.say('still here'); // printed by the output function\n});\n```\n"
+          }
+        }
+      ],
+      "interfaces": [
+        {
+          "name": "BotkitSchedulerOptions",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "Options for the [BotkitScheduler](#BotkitScheduler) constructor. Every option is optional."
+          }
+        },
+        {
+          "name": "CronExpression",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "A parsed cron expression, as returned by [parseCron()](#parseCron).\nEvery list is sorted and holds each allowed value once."
+          }
+        },
+        {
+          "name": "ScheduleOptions",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "Options for [scheduler.schedule()](#schedule) and `bot.schedule()`. Give exactly one of `in`, `at`, `every` or `cron`."
+          }
+        },
+        {
+          "name": "ScheduledJob",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "A scheduled job, as returned by [get()](#get), [list()](#list) and [schedule()](#schedule). Times are ISO 8601 strings.\nReturned jobs are copies: changing them does not change the schedule."
+          }
+        },
+        {
+          "name": "SchedulerClock",
+          "kind": 256,
+          "kindString": "Interface",
+          "flags": {
+            "isExported": true,
+            "isExternal": true
+          },
+          "comment": {
+            "shortText": "A source of time for [BotkitScheduler](#BotkitScheduler). Pass a fake one in tests to control time.\nThe default uses `Date.now()`, `setTimeout()` and `clearTimeout()`."
+          }
+        }
+      ]
     }
   ],
   "adapters": [
@@ -36945,12 +37303,24 @@
     {
       "name": "Facebook Messenger",
       "path": "platforms/facebook.md"
+    },
+    {
+      "name": "Command Line (CLI)",
+      "path": "platforms/cli.md"
+    },
+    {
+      "name": "AI Agents (MCP)",
+      "path": "platforms/mcp.md"
     }
   ],
   "plugins": [
     {
       "name": "Botkit CMS Plugin",
       "path": "plugins/cms.md"
+    },
+    {
+      "name": "Botkit Scheduler Plugin",
+      "path": "plugins/scheduler.md"
     }
   ]
 }

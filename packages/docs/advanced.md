@@ -364,7 +364,9 @@ class LinesAdapter extends BotAdapter {
 }
 ```
 
-Use it like any other adapter: `const controller = new Botkit({ adapter: new LinesAdapter(), disable_webserver: true })`.
+Use it like any other adapter: `const controller = new Botkit({ adapter: new LinesAdapter(), disable_webserver: true, disable_console: true })`.
+
+Keep `disable_console: true` for any adapter that writes to stdout. Without it, Botkit prints start-up messages such as `Enabling plugin` with `console.log`, so the first line on stdout is not JSON. Your own code must keep stdout clean too, and send its logs to stderr.
 
 Some parts of the example need a closer look:
 

@@ -39,7 +39,7 @@ Botkit 4.11 makes this dependable. When a handler throws, `controller.handleTurn
 | AI agents (MCP) | [botbuilder-adapter-mcp](platforms/mcp.md) | The bot becomes a Model Context Protocol server on stdio. The `chat` tool sends a message through the whole pipeline and returns the replies, the choices offered and the pending question. Tools declared with `adapter.tool()` are handled by `controller.on('tool:<name>')`, and they return structured results with `bot.toolResult()`.
 | The clock | [botkit-plugin-scheduler](plugins/scheduler.md) | Cron, interval and one-shot jobs, saved in Botkit storage. A job bound to a conversation continues it on the adapter that owns it. A clock job runs on the scheduler's own channel. `bot.schedule()` binds a job to the current conversation.
 
-The two adapters work like any other Botkit adapter, and the scheduler is an ordinary plugin. They can be combined with each other and with the chat platforms: for example, a web chat bot can also serve agents with `controller.usePlugin(new McpAdapter())`.
+The two adapters work like any other Botkit adapter, and the scheduler is an ordinary plugin, so the same features can serve every surface. Keep in mind how agents run an MCP server. Each agent session starts its own copy of the bot as a child process, and talks to it over that process's stdin and stdout. It never connects to a bot that is already running. So do not attach an `McpAdapter` to the web chat bot that people use. Every agent session would start another copy of the whole web bot, and each copy would try to bind the web bot's port. Do what Ops Desk does instead. Keep the features in modules, and give agents an entry point of their own that loads them with `new Botkit({ adapter: new McpAdapter(), disable_webserver: true, disable_console: true })`.
 
 ## The Ops Desk walkthrough
 
@@ -164,6 +164,16 @@ controller.afterDialog('deploy', async (bot, results) => {
         audit.push({ service: results.service, env: results.env, user: results.user });
     }
 });
+```
+
+Give people and agents a way out as well. While a dialog waits for an answer, it takes every message, so commands such as `help` never reach `hears()`. Ops Desk lists a `cancel` handler first at every question, which sends the dialog to a thread that also ends with `addAction('stop')`:
+
+```javascript
+const cancel = { pattern: '^(cancel|stop)$', handler: async (answer, convo) => convo.gotoThread('aborted') };
+deploy.ask({ text: ['Which service?'] }, [cancel, /* the other answers */], 'service');
+
+deploy.addMessage('Deploy canceled.', 'aborted');
+deploy.addAction('stop', 'aborted');
 ```
 
 **Let handlers fail loudly.** With Botkit 4.11, an error thrown by a handler rejects the turn. The CLI prints it, or ends an unattended run with status `failed`. The MCP adapter returns it to the agent with `isError`, and the scheduler records it on the job and emits `scheduler_error`. Do not wrap handlers in try/catch just to keep the process alive. Catch only the errors you can explain to the user, as Ops Desk does when a reminder cannot be scheduled.

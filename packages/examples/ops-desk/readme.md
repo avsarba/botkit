@@ -30,7 +30,7 @@ cd packages/examples
 node ops-desk/cli.js
 ```
 
-Type commands, pick menu entries by number or title, and press Ctrl+D or type `/quit` to leave. Try `help`, then `/help` for the adapter's own commands. `/state` shows the question the bot is waiting on.
+Type commands, pick menu entries by number or title, and press Ctrl+D or type `/quit` to leave. Try `help`, then `/help` for the adapter's own commands. `/state` shows the question the bot is waiting on, and `cancel` at any question leaves the deploy dialog.
 
 ```text
 bot> Ops Desk ready. Pick one or type "help".
@@ -180,7 +180,7 @@ Ask the agent to "deploy search to staging with ops-desk", and it makes calls li
 
 A production deploy still asks for the typed confirmation. The agent cannot skip it, because the dialog, not the agent, decides what happens next.
 
-Only JSON-RPC is written to stdout. Anything else the bot or Botkit prints goes to stderr.
+Only JSON-RPC is written to stdout. Anything else the bot or Botkit prints goes to stderr. Start the server with `node`, as above. The package script works too, but only as `npm run -s start:mcp`: without `-s`, npm writes its own banner to stdout before the server starts.
 
 ## How scheduled jobs reach each surface
 
@@ -200,7 +200,17 @@ The watch in [features/watch.js](features/watch.js) is a recurring job with the 
 
 Scheduled turns reach the bot as interrupts. A reminder that fires while the deploy dialog waits for an answer is delivered without being taken as that answer.
 
-Ops Desk keeps its state in memory, so jobs and dialogs are forgotten when the process exits. To keep them, pass a Botkit storage adapter to `createOpsDesk(adapter, { storage })`: the scheduler saves its jobs in the same storage as the dialogs.
+Ops Desk keeps its state in memory, so jobs and dialogs are forgotten when the process exits. To keep them, pass a Botkit storage adapter to `createOpsDesk(adapter, { storage })`, or to `createCli()` or `createMcpServer()`, which take the same options. The scheduler saves its jobs in the same storage as the dialogs.
+
+Jobs and dialogs belong to a conversation, and after a restart the bot finds them only in the same conversation. An MCP chat session keeps its name across restarts (`default`, unless the agent picks another), so that works without extra steps. The CLI, however, starts every run in a new conversation with a random id such as `cli-0ab14f4b`. Give it a fixed conversation along with the storage:
+
+```javascript
+const { createCli } = require('./ops-desk/cli');
+
+const cli = createCli({ storage: myStorage, conversation: 'ops-desk' });
+```
+
+Without a fixed conversation, a watch from an earlier run keeps printing alerts into the terminal. `jobs` and `unwatch` look only at the current conversation, so they cannot find it or stop it.
 
 ## How it is built
 
@@ -237,6 +247,7 @@ A few choices in the deploy dialog make it work on surfaces that are not chat. T
 * Every question has a key, so answers files and `pendingQuestion` can name it.
 * Templates use triple mustaches, as in `{{{vars.service}}}`, so no text is HTML-escaped.
 * The canceled path ends with `addAction('stop')`, so `run()` reports `canceled` and exit code 1.
+* Every question accepts `cancel` (or `stop`) first, so a person or an agent can leave the dialog at any point. It ends with `addAction('stop')` too.
 * Answer handlers store the canonical value with `convo.setVar()`, so `PRODUCTION` and `production` both deploy to `production`.
 
 ## Test it

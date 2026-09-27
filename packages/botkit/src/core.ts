@@ -254,6 +254,66 @@ function copyPlainData(value: any, seen = new Map<any, any>()): any {
 }
 
 /**
+ * The turnState key that marks a TurnContext whose turn failed, so its cached state holds changes that were never saved.
+ * @ignore
+ */
+const FAILED_TURN_KEY = 'botkitTurnFailed';
+
+/**
+ * Make sure a thrown or rejected value is an Error, so callers can rely on `err.message` and `err.stack`.
+ * @ignore
+ */
+function toError(err: any): Error {
+    return err instanceof Error ? err : new Error(err);
+}
+
+/**
+ * Create a middleware pipeline. A middleware that declares `next` is called with it, and ware only catches its synchronous errors.
+ * Here, the promise an async middleware returns is watched too: a rejection before it calls next() is passed to next(err),
+ * so it fails the pipeline like any other middleware error instead of leaving it pending with an unhandled rejection.
+ * @param argc The number of arguments this pipeline's run() passes to each middleware, not counting `next`.
+ * @ignore
+ */
+function createMiddlewarePipeline(argc: number): any {
+    const ware = new Ware();
+    const use = ware.use;
+    ware.use = function(fn: any): any {
+        if (typeof fn !== 'function' || fn.length <= argc) {
+            // arrays and other pipelines are split into single functions by use(), which calls this method again
+            return use.call(this, fn);
+        }
+        const middleware = fn;
+        const wrapped = function(...args: any[]): any {
+            const next = args[argc];
+            if (args.length !== argc + 1 || typeof next !== 'function') {
+                return middleware.apply(this, args);
+            }
+            let nextCalled = false;
+            args[argc] = (...results: any[]): any => {
+                nextCalled = true;
+                return next(...results);
+            };
+            const result = middleware.apply(this, args);
+            if (result && typeof result.then === 'function') {
+                result.then(null, (err) => {
+                    if (nextCalled) {
+                        // the pipeline has already moved on, so the error can only be reported
+                        console.error('Error in middleware after it called next()', err);
+                    } else {
+                        next(toError(err));
+                    }
+                });
+            }
+            return result;
+        };
+        // ware decides whether to pass next by the number of parameters a middleware declares
+        Object.defineProperty(wrapped, 'length', { value: middleware.length });
+        return use.call(this, wrapped);
+    };
+    return ware;
+}
+
+/**
  * Create a new instance of Botkit to define the controller for a conversational app.
  * To connect Botkit to a chat platform, pass in a fully configured `adapter`.
  * If one is not specified, Botkit will expose an adapter for the Microsoft Bot Framework.
@@ -327,13 +387,16 @@ export class Botkit {
      *  next();
      * });
      * ```
+     *
+     * To fail with an error, pass it to `next(err)`, throw it, or (in an async middleware) throw it before calling `next()`.
+     * The turn, or the `bot.say()` that is sending the message, then rejects with that error.
      */
     public middleware = {
-        spawn: new Ware(),
-        ingest: new Ware(),
-        send: new Ware(),
-        receive: new Ware(),
-        interpret: new Ware()
+        spawn: createMiddlewarePipeline(1), // (bot, next)
+        ingest: createMiddlewarePipeline(2), // (bot, message, next)
+        send: createMiddlewarePipeline(2),
+        receive: createMiddlewarePipeline(2),
+        interpret: createMiddlewarePipeline(2)
     }
 
     /**
@@ -785,7 +848,13 @@ export class Botkit {
      * Accepts the result of a BotBuilder adapter's `processActivity()` method and processes it into a Botkit-style message and BotWorker instance
      * which is then used to test for triggers and emit events.
      * NOTE: This method should only be used in custom adapters that receive messages through mechanisms other than the main webhook endpoint (such as those received via websocket, for example)
-     * The returned promise rejects with the original error if a middleware, handler, dialog step or state write fails; the conversation state of a failed turn is not saved.
+     * The returned promise rejects if a middleware, handler, dialog step or state write fails, with the original error
+     * (a thrown value that is not an Error is wrapped in one). The changes a failed turn made to the conversation state are not saved,
+     * except those already saved during the turn: `bot.beginDialog()` and `bot.replaceDialog()` save as soon as they are called,
+     * and so do the `beginDialog` and `execute_script` actions of a BotkitConversation.
+     * When the activity arrives at Botkit's webhook endpoint, a failed turn is logged and, unless the adapter has already responded, answered with status 500.
+     * The Bot Framework adapter includes the error message in the body of that response,
+     * so in production set `adapter.onTurnError` to handle errors without revealing their details.
      *
      * ```javascript
      * // inside a custom adapter
@@ -831,45 +900,52 @@ export class Botkit {
         // Stash the Botkit message in
         turnContext.turnState.set('botkitMessage', message);
 
-        // Create a dialog context
-        const dialogContext = await this.dialogSet.createContext(turnContext);
+        try {
+            // Create a dialog context
+            const dialogContext = await this.dialogSet.createContext(turnContext);
 
-        // Spawn a bot worker with the dialogContext
-        const bot = await this.spawn(dialogContext);
+            // Spawn a bot worker with the dialogContext
+            const bot = await this.spawn(dialogContext);
 
-        return new Promise((resolve, reject) => {
-            this.middleware.ingest.run(bot, message, async (err, bot, message) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    this.middleware.receive.run(bot, message, async (err, bot, message) => {
-                        if (err) {
-                            reject(err);
-                        } else {
-                            // Nothing awaits this callback, so any error must be routed to reject()
-                            // or the turn would never settle and the error would surface as an unhandled rejection.
-                            try {
-                                const interrupt_results = await this.listenForInterrupts(bot, message);
-
-                                if (interrupt_results === false) {
-                                    // Continue dialog if one is present
-                                    const dialog_results = await dialogContext.continueDialog();
-                                    if (dialog_results && dialog_results.status === DialogTurnStatus.empty) {
-                                        await this.processTriggersAndEvents(bot, message);
-                                    }
-                                }
-
-                                // make sure changes to the state get persisted after the turn is over.
-                                await this.saveState(bot);
-                                resolve();
-                            } catch (err) {
+            return await new Promise((resolve, reject) => {
+                this.middleware.ingest.run(bot, message, async (err, bot, message) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        this.middleware.receive.run(bot, message, async (err, bot, message) => {
+                            if (err) {
                                 reject(err);
+                            } else {
+                                // Nothing awaits this callback, so any error must be routed to reject()
+                                // or the turn would never settle and the error would surface as an unhandled rejection.
+                                try {
+                                    const interrupt_results = await this.listenForInterrupts(bot, message);
+
+                                    if (interrupt_results === false) {
+                                        // Continue dialog if one is present
+                                        const dialog_results = await dialogContext.continueDialog();
+                                        if (dialog_results && dialog_results.status === DialogTurnStatus.empty) {
+                                            await this.processTriggersAndEvents(bot, message);
+                                        }
+                                    }
+
+                                    // make sure changes to the state get persisted after the turn is over.
+                                    await this.saveState(bot);
+                                    resolve();
+                                } catch (err) {
+                                    reject(err);
+                                }
                             }
-                        }
-                    });
-                }
+                        });
+                    }
+                });
             });
-        });
+        } catch (err) {
+            // The state cached in this context now holds changes that were never saved: tell getPendingQuestion() to ignore it.
+            turnContext.turnState.set(FAILED_TURN_KEY, true);
+            // Like trigger(), always reject with an Error, so callers can rely on err.message and err.stack.
+            throw toError(err);
+        }
     }
 
     /**
@@ -891,8 +967,12 @@ export class Botkit {
      * (for example a WaterfallDialog waiting on a TextPrompt), or when it is not stopped on a question.
      *
      * Pass the context of a turn that has finished to read the state that turn left behind, or a new TurnContext for the same
-     * conversation and user to load it from storage. The activity must include `channelId`, `conversation.id` and `from.id`.
-     * After a turn that failed, use a new context: the failed turn's context still holds its unsaved changes.
+     * conversation and user to load it from storage. Conversation state is stored under the activity's `channelId`, its whole
+     * `conversation` object and `from.id`. On Teams and Bot Framework channels the conversation has more fields than `id`
+     * (such as `tenantId` and `conversationType`), so build a new context from the conversation reference of a message,
+     * as the second example shows, rather than from `conversation.id` alone.
+     * If the turn failed, even when `adapter.onTurnError` handled the error, its context still holds changes that were never saved,
+     * so the state is loaded from storage instead.
      * This method never changes or saves state and never sends messages.
      *
      * ```javascript
@@ -908,11 +988,19 @@ export class Botkit {
      * }
      * ```
      *
+     * ```javascript
+     * // later, outside of a turn, using the reference of a message received earlier
+     * const activity = TurnContext.applyConversationReference({ type: 'message' }, message.reference, true);
+     * const question = await controller.getPendingQuestion(new TurnContext(controller.adapter, activity));
+     * ```
+     *
      * @param context The context of a completed turn, or a new one for the same conversation and user.
      * @returns A [BotkitPendingQuestion](#BotkitPendingQuestion) describing the question, or null if no question is waiting for an answer.
      */
     public async getPendingQuestion(context: TurnContext): Promise<BotkitPendingQuestion | null> {
-        const dialogContext = await this.dialogSet.createContext(context);
+        // The context of a failed turn caches changes that were never saved, so read the state from storage instead.
+        const stateContext = context.turnState.get(FAILED_TURN_KEY) ? new TurnContext(context.adapter, context.activity) : context;
+        const dialogContext = await this.dialogSet.createContext(stateContext);
         const stack = dialogContext.stack;
 
         // In botbuilder-dialogs 4.x, the active dialog is the last element of the stack.

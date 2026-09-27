@@ -272,6 +272,25 @@ describe('Botkit getPendingQuestion', function() {
         assert.deepStrictEqual(adapter.sent.map((a) => a.text), ['Which env?'], 'reading the pending question must not send anything');
     });
 
+    it('should load the state for a new context built from the conversation reference', async function() {
+        addReleaseDialog();
+        // Teams and Bot Framework conversations carry more fields than the id, and every one of them is part of the state key
+        const conversation = { id: 'a:1xyz', conversationType: 'personal', tenantId: 't-1' };
+        const context = await adapter.turn({ text: 'release', channelId: 'msteams', conversation });
+        const afterTurn = await controller.getPendingQuestion(context);
+        assert.strictEqual(afterTurn.key, 'env');
+
+        // the documented way to build a new context for the same conversation and user
+        const message = context.turnState.get('botkitMessage');
+        const activity = TurnContext.applyConversationReference({ type: 'message' }, message.reference, true);
+        assert.deepStrictEqual(await controller.getPendingQuestion(new TurnContext(adapter, activity)), afterTurn);
+
+        // conversation.id alone is not enough to find the state
+        assert.strictEqual(await controller.getPendingQuestion(new TurnContext(adapter, {
+            type: 'message', channelId: 'msteams', conversation: { id: 'a:1xyz' }, from: { id: 'u1' }
+        })), null);
+    });
+
     it('should return copies that cannot change the dialog', async function() {
         addReleaseDialog();
 

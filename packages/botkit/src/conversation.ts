@@ -705,13 +705,9 @@ export class BotkitConversation<O extends object = {}> extends Dialog<O> {
             // If a prompt is defined in the script, use dc.prompt to call it.
             // This prompt must be a valid dialog defined somewhere in your code!
             if (line.collect && line.action !== 'beginDialog') {
-                try {
-                    return await dc.prompt(this._prompt, await this.makeOutgoing(dc, line, step.values));
-                } catch (err) {
-                    console.error(err);
-                    await dc.context.sendActivity(`Failed to start prompt ${ this._prompt }`);
-                    return await step.next();
-                }
+                // An error building or sending the question fails the turn, as it does for any other line.
+                // Skipping the question instead would continue the dialog without its answer.
+                return await dc.prompt(this._prompt, await this.makeOutgoing(dc, line, step.values));
                 // If there's nothing but text, send it!
                 // This could be extended to include cards and other activity attributes.
             } else {

@@ -279,8 +279,12 @@ Returns null when no dialog is active, when the active dialog is not a BotkitCon
 (for example a WaterfallDialog waiting on a TextPrompt), or when it is not stopped on a question.
 
 Pass the context of a turn that has finished to read the state that turn left behind, or a new TurnContext for the same
-conversation and user to load it from storage. The activity must include `channelId`, `conversation.id` and `from.id`.
-After a turn that failed, use a new context: the failed turn's context still holds its unsaved changes.
+conversation and user to load it from storage. Conversation state is stored under the activity's `channelId`, its whole
+`conversation` object and `from.id`. On Teams and Bot Framework channels the conversation has more fields than `id`
+(such as `tenantId` and `conversationType`), so build a new context from the conversation reference of a message,
+as the second example shows, rather than from `conversation.id` alone.
+If the turn failed, even when `adapter.onTurnError` handled the error, its context still holds changes that were never saved,
+so the state is loaded from storage instead.
 This method never changes or saves state and never sends messages.
 
 ```javascript
@@ -296,13 +300,25 @@ if (question) {
 }
 ```
 
+```javascript
+// later, outside of a turn, using the reference of a message received earlier
+const activity = TurnContext.applyConversationReference({ type: 'message' }, message.reference, true);
+const question = await controller.getPendingQuestion(new TurnContext(controller.adapter, activity));
+```
+
 
 <a name="handleTurn"></a>
 ### handleTurn()
 Accepts the result of a BotBuilder adapter's `processActivity()` method and processes it into a Botkit-style message and BotWorker instance
 which is then used to test for triggers and emit events.
 NOTE: This method should only be used in custom adapters that receive messages through mechanisms other than the main webhook endpoint (such as those received via websocket, for example)
-The returned promise rejects with the original error if a middleware, handler, dialog step or state write fails; the conversation state of a failed turn is not saved.
+The returned promise rejects if a middleware, handler, dialog step or state write fails, with the original error
+(a thrown value that is not an Error is wrapped in one). The changes a failed turn made to the conversation state are not saved,
+except those already saved during the turn: `bot.beginDialog()` and `bot.replaceDialog()` save as soon as they are called,
+and so do the `beginDialog` and `execute_script` actions of a BotkitConversation.
+When the activity arrives at Botkit's webhook endpoint, a failed turn is logged and, unless the adapter has already responded, answered with status 500.
+The Bot Framework adapter includes the error message in the body of that response,
+so in production set `adapter.onTurnError` to handle errors without revealing their details.
 
 **Parameters**
 

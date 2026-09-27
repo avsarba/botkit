@@ -174,6 +174,106 @@ describe('Botkit turn errors', function() {
 
             await assert.rejects(controller.trigger('direct_event'), (err) => err === thrown);
         });
+
+        it('should reject with an Error when a hears handler throws a value that is not an Error', async function() {
+            controller.hears('string', 'message', async () => {
+                throw 'plain string'; // eslint-disable-line no-throw-literal
+            });
+            controller.hears('nothing', 'message', async () => {
+                throw undefined; // eslint-disable-line no-throw-literal
+            });
+
+            await assert.rejects(adapter.turn({ text: 'string' }), (err) => err instanceof Error && err.message === 'plain string');
+            await assert.rejects(adapter.turn({ text: 'nothing' }), (err) => err instanceof Error);
+        });
+
+        it('should reject with an Error when an ask() handler throws null', async function() {
+            const convo = new BotkitConversation('ask_throws_null', controller);
+            convo.ask('Name?', async () => {
+                throw null; // eslint-disable-line no-throw-literal
+            }, 'name');
+            controller.addDialog(convo);
+            controller.hears('start', 'message', async (bot) => {
+                await bot.beginDialog('ask_throws_null');
+            });
+
+            await adapter.turn({ text: 'start' });
+            await assert.rejects(adapter.turn({ text: 'Ann' }), (err) => err instanceof Error && err.message === 'null');
+        });
+    });
+
+    describe('middleware errors reject the turn', function() {
+        for (const stage of ['ingest', 'receive', 'interpret']) {
+            it(`should reject when an async ${ stage } middleware that takes next throws`, async function() {
+                let heard = false;
+                controller.hears('hello', 'message', async () => {
+                    heard = true;
+                });
+                controller.middleware[stage].use(async (bot, message, next) => {
+                    await Promise.resolve();
+                    throw new Error(`${ stage } failed`);
+                });
+
+                await assert.rejects(adapter.turn({ text: 'hello' }), (err) => err.message === `${ stage } failed`);
+                assert.strictEqual(heard, false, 'the turn should stop at the failed middleware');
+            });
+        }
+
+        it('should reject when an async spawn middleware that takes next throws', async function() {
+            controller.middleware.spawn.use(async (bot, next) => {
+                await Promise.resolve();
+                throw new Error('spawn failed');
+            });
+
+            await assert.rejects(adapter.turn({ text: 'hello' }), /spawn failed/);
+            await assert.rejects(controller.spawn({}, adapter), /spawn failed/);
+        });
+
+        it('should reject with an Error when an async middleware that takes next rejects without a reason', async function() {
+            let heard = false;
+            controller.hears('hello', 'message', async () => {
+                heard = true;
+            });
+            controller.middleware.receive.use(async (bot, message, next) => {
+                throw undefined; // eslint-disable-line no-throw-literal
+            });
+
+            await assert.rejects(adapter.turn({ text: 'hello' }), (err) => err instanceof Error);
+            assert.strictEqual(heard, false, 'a rejection without a reason must not continue the turn');
+        });
+
+        it('should keep running an async middleware that takes next and calls it', async function() {
+            let tagged;
+            controller.middleware.receive.use(async (bot, message, next) => {
+                await Promise.resolve();
+                message.tagged = 'yes';
+                next();
+            });
+            controller.hears('hello', 'message', async (bot, message) => {
+                tagged = message.tagged;
+            });
+
+            await adapter.turn({ text: 'hello' });
+            assert.strictEqual(tagged, 'yes');
+        });
+
+        it('should log, not reject, an error an async middleware throws after calling next', async function() {
+            const late = new Error('late failure');
+            let heard = false;
+            controller.middleware.receive.use(async (bot, message, next) => {
+                next();
+                await Promise.resolve();
+                throw late;
+            });
+            controller.hears('hello', 'message', async () => {
+                heard = true;
+            });
+
+            await adapter.turn({ text: 'hello' });
+            await nextTick();
+            assert.strictEqual(heard, true);
+            assert(logged.some((args) => args.includes(late)), 'the late error should be logged');
+        });
     });
 
     describe('dialog errors reject the turn', function() {
@@ -265,6 +365,74 @@ describe('Botkit turn errors', function() {
             await assert.rejects(adapter.turn({ text: 'Ann' }), /after failed/);
         });
 
+        it('should keep a dialog that bot.beginDialog() saved before the handler failed', async function() {
+            // documented: beginDialog() and replaceDialog() save state immediately, so a later failure does not undo them
+            const convo = new BotkitConversation('signup', controller);
+            convo.ask('Email?', async () => {
+                // any answer
+            }, 'email');
+            controller.addDialog(convo);
+            controller.hears('go', 'message', async (bot) => {
+                await bot.beginDialog('signup');
+                throw new Error('analytics failed');
+            });
+
+            await assert.rejects(adapter.turn({ text: 'go' }), /analytics failed/);
+            const pending = await controller.getPendingQuestion(freshContext());
+            assert.strictEqual(pending.dialog, 'signup');
+            assert.strictEqual(pending.key, 'email');
+        });
+
+        it('should reject instead of skipping a question whose template fails to render', async function() {
+            const convo = new BotkitConversation('question_fails', controller);
+            convo.ask({
+                text: 'Pick one',
+                quick_replies: async () => {
+                    throw new Error('quick reply lookup failed');
+                }
+            }, async () => {
+                // any answer
+            }, 'choice');
+            convo.say('Thanks, you picked {{vars.choice}}');
+            controller.addDialog(convo);
+            let results;
+            controller.afterDialog('question_fails', async (bot, dialogResults) => {
+                results = dialogResults;
+            });
+            controller.hears('start', 'message', async (bot) => {
+                await bot.beginDialog('question_fails');
+            });
+
+            await assert.rejects(adapter.turn({ text: 'start' }), /quick reply lookup failed/);
+            assert.deepStrictEqual(adapter.sent, [], 'the dialog should not move past the question');
+            assert.strictEqual(results, undefined, 'the dialog should not complete');
+            assert.strictEqual(await controller.getPendingQuestion(freshContext()), null, 'the failed turn should not be saved');
+        });
+
+        it('should reject when a send middleware fails for a question, as it does for a message', async function() {
+            controller.middleware.send.use((bot, activity, next) => {
+                next(activity.text === 'Email?' ? new Error('filter unavailable') : undefined);
+            });
+            for (const kind of ['question', 'message']) {
+                const convo = new BotkitConversation(`send_fails_${ kind }`, controller);
+                if (kind === 'question') {
+                    convo.ask('Email?', async () => {
+                        // any answer
+                    }, 'email');
+                } else {
+                    convo.say('Email?');
+                }
+                convo.say('Done: {{vars.email}}');
+                controller.addDialog(convo);
+                controller.hears(kind, 'message', async (bot) => {
+                    await bot.beginDialog(`send_fails_${ kind }`);
+                });
+
+                await assert.rejects(adapter.turn({ text: kind }), /filter unavailable/, kind);
+            }
+            assert.deepStrictEqual(adapter.sent, []);
+        });
+
         it('should reject when a controller.afterDialog() handler throws', async function() {
             const convo = new BotkitConversation('afterdialog_throws', controller);
             convo.say('Hi');
@@ -294,6 +462,35 @@ describe('Botkit turn errors', function() {
             assert(captured instanceof Error);
             assert.strictEqual(captured.message, 'kaboom');
         });
+
+        it('should let getPendingQuestion() read the saved state after a turn that onTurnError handled', async function() {
+            adapter.onTurnError = async (context) => {
+                await context.sendActivity('Sorry, something went wrong.');
+            };
+            const convo = new BotkitConversation('pay', controller);
+            convo.ask('Card number?', async (answer) => {
+                if (answer === 'bad') {
+                    throw new Error('card service down');
+                }
+            }, 'card');
+            convo.ask('Amount?', async () => {
+                // any answer
+            }, 'amount');
+            controller.addDialog(convo);
+            controller.hears('pay', 'message', async (bot) => {
+                await bot.beginDialog('pay');
+            });
+
+            await adapter.turn({ text: 'pay' });
+            // runMiddleware resolves because onTurnError handled the error
+            const context = await adapter.turn({ text: 'bad' });
+
+            const pending = await controller.getPendingQuestion(context);
+            assert(pending, 'the question should still be pending');
+            assert.strictEqual(pending.key, 'card');
+            assert.deepStrictEqual(pending, await controller.getPendingQuestion(freshContext()));
+            assert.deepStrictEqual(adapter.sent.map((a) => a.text), ['Card number?', 'Sorry, something went wrong.']);
+        });
     });
 
     describe('sending', function() {
@@ -322,6 +519,18 @@ describe('Botkit turn errors', function() {
             await bot.changeContext(reference);
 
             await assert.rejects(bot.say('x'), /send middleware failed/);
+            assert.deepStrictEqual(adapter.sent, []);
+        });
+
+        it('should reject bot.say() when an async send middleware that takes next throws', async function() {
+            controller.middleware.send.use(async (bot, activity, next) => {
+                await Promise.resolve();
+                throw new Error('async send middleware failed');
+            });
+            const bot = await controller.spawn({}, adapter);
+            await bot.changeContext(reference);
+
+            await assert.rejects(bot.say('x'), /async send middleware failed/);
             assert.deepStrictEqual(adapter.sent, []);
         });
 

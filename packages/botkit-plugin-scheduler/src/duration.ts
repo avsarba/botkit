@@ -15,6 +15,9 @@ const UNITS: { [unit: string]: number } = {
     w: 7 * 24 * 60 * 60 * 1000
 };
 
+/** The longest duration: the span of time a JavaScript Date can hold after the epoch. */
+const MAX_DURATION = 8.64e15;
+
 // 'ms' must come before 'm' so that '500ms' is not read as '500m' followed by a stray 's'.
 const DURATION = /^(?:\d+(?:ms|s|m|h|d|w))+$/;
 const GROUP = /(\d+)(ms|s|m|h|d|w)/g;
@@ -22,9 +25,10 @@ const GROUP = /(\d+)(ms|s|m|h|d|w)/g;
 /**
  * Convert a duration into milliseconds.
  *
- * A finite number greater than 0 is read as milliseconds, and so is a string of digits.
+ * A whole number of milliseconds greater than 0 is read as is, and so is a string of digits.
  * Any other string must be one or more `<integer><unit>` groups with no spaces between them,
- * where the unit is `ms`, `s`, `m`, `h`, `d` or `w`.
+ * where the unit is `ms`, `s`, `m`, `h`, `d` or `w`. Fractions of a millisecond, and durations longer
+ * than a JavaScript Date can hold (8.64e15 milliseconds), are not valid.
  *
  * ```javascript
  * const { parseDuration } = require('botkit-plugin-scheduler');
@@ -36,8 +40,8 @@ const GROUP = /(\d+)(ms|s|m|h|d|w)/g;
  * ```
  *
  * @param value A number of milliseconds, or a duration string such as `'30s'`, `'5m'` or `'1h30m'`.
- * @returns The duration in milliseconds, always greater than 0.
- * @throws Error('Invalid duration "<value>"') when the value cannot be read or is not greater than 0.
+ * @returns The duration in milliseconds: a whole number from 1 to 8.64e15.
+ * @throws Error('Invalid duration "<value>"') when the value cannot be read or is out of that range.
  */
 export function parseDuration(value: number | string): number {
     let ms = NaN;
@@ -57,7 +61,7 @@ export function parseDuration(value: number | string): number {
         }
     }
 
-    if (!isFinite(ms) || ms <= 0) {
+    if (!Number.isInteger(ms) || ms <= 0 || ms > MAX_DURATION) {
         throw new Error(`Invalid duration "${ value }"`);
     }
     return ms;

@@ -94,7 +94,22 @@ const DAY_OF_WEEK: FieldSpec = {
 
 /** How far nextRun() searches before giving up: 8 years, counting leap days. */
 const SEARCH_LIMIT = (8 * 365 + 2) * 24 * 60 * 60 * 1000;
-const HALF_DAY = 12 * 60 * 60 * 1000;
+/** Every UTC offset in use is less than a day, and a zone's offset changes months apart. */
+const DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * A cron expression as lookup tables, indexed by field value.
+ */
+interface Matcher {
+    seconds: boolean[];
+    minutes: boolean[];
+    hours: boolean[];
+    daysOfMonth: boolean[];
+    months: boolean[];
+    daysOfWeek: boolean[];
+    either: boolean;
+    unit: number;
+}
 
 const formatters: { [timezone: string]: any } = {};
 
@@ -189,20 +204,42 @@ export function nextRun(expression: string | CronExpression, from: Date | number
         throw new Error(`Invalid date "${ from }"`);
     }
 
-    const seconds = lookup(cron.seconds, 59);
-    const minutes = lookup(cron.minutes, 59);
-    const hours = lookup(cron.hours, 23);
-    const daysOfMonth = lookup(cron.daysOfMonth, 31);
-    const months = lookup(cron.months, 12);
-    const daysOfWeek = lookup(cron.daysOfWeek, 6);
-    const either = cron.domRestricted && cron.dowRestricted;
+    const matcher: Matcher = {
+        seconds: lookup(cron.seconds, 59),
+        minutes: lookup(cron.minutes, 59),
+        hours: lookup(cron.hours, 23),
+        daysOfMonth: lookup(cron.daysOfMonth, 31),
+        months: lookup(cron.months, 12),
+        daysOfWeek: lookup(cron.daysOfWeek, 6),
+        either: cron.domRestricted && cron.dowRestricted,
+        unit: cron.hasSeconds ? 1000 : 60000
+    };
 
-    // Walk a "naive" wall-clock time (the wall clock of the zone, stored as if it were UTC) forward field by field.
-    const unit = cron.hasSeconds ? 1000 : 60000;
-    let t = Math.floor(wallClock(fromMs, timezone) / unit) * unit + unit;
-    const limit = t + SEARCH_LIMIT;
+    const wall = wallClock(fromMs, timezone);
+    let next = search(matcher, wall, wall + SEARCH_LIMIT, fromMs, timezone);
 
-    while (t <= limit) {
+    // Just after clocks spring forward, times the change skipped can still be ahead, because they run shifted by the change:
+    // when 02:00 becomes 03:00, 02:30 runs at 03:30, so a search from 03:10 must still find it.
+    // Those times are the wall-clock times between `from` read with the offset of before the change, and `from` itself.
+    const before = wallBeforeChange(fromMs, wall, timezone);
+    if (before !== null) {
+        const skipped = search(matcher, before, wall, fromMs, timezone);
+        if (skipped !== null && (next === null || skipped < next)) {
+            next = skipped;
+        }
+    }
+    return next === null ? null : new Date(next);
+}
+
+/**
+ * Walk a "naive" wall-clock time (the wall clock of the zone, stored as if it were UTC) forward field by field,
+ * from the unit after `after` up to `until`, and return the first match whose instant is later than `fromMs`, or null.
+ */
+function search(matcher: Matcher, after: number, until: number, fromMs: number, timezone: string): number | null {
+    const { seconds, minutes, hours, daysOfMonth, months, daysOfWeek, either, unit } = matcher;
+    let t = Math.floor(after / unit) * unit + unit;
+
+    while (t <= until) {
         const date = new Date(t);
         const year = date.getUTCFullYear();
         const month = date.getUTCMonth();
@@ -239,7 +276,7 @@ export function nextRun(expression: string | CronExpression, from: Date | number
 
         const instant = instantFor(t, timezone);
         if (instant > fromMs) {
-            return new Date(instant);
+            return instant;
         }
 
         // The wall time maps to an instant that is not after `from`: the second pass through a repeated hour,
@@ -318,6 +355,26 @@ function offset(ms: number, timezone: string): number {
 }
 
 /**
+ * If clocks sprang forward less than the length of that change before `ms`, the wall-clock time at `ms` read with the offset
+ * of before the change; otherwise null. `wall` is the wall-clock time at `ms`.
+ */
+function wallBeforeChange(ms: number, wall: number, timezone: string): number | null {
+    if (timezone === 'UTC') {
+        return null;
+    }
+    const current = wall - Math.floor(ms / 1000) * 1000;
+    const earlier = offset(ms - DAY, timezone);
+    if (earlier >= current) {
+        return null;
+    }
+    const change = current - earlier;
+    if (offset(ms - change, timezone) !== earlier) {
+        return null;
+    }
+    return wall - change;
+}
+
+/**
  * Convert a naive wall-clock time into an instant.
  * During a fall-back overlap this is the first occurrence; inside a spring-forward gap it is the time shifted by the gap.
  */
@@ -325,8 +382,10 @@ function instantFor(naive: number, timezone: string): number {
     if (timezone === 'UTC') {
         return naive;
     }
-    const before = naive - offset(naive - HALF_DAY, timezone);
-    const after = naive - offset(naive + HALF_DAY, timezone);
+    // The instants that show `naive` are within a day of it, so the offsets a day before and a day after
+    // are the ones on each side of any change near it, whatever the zone's offset (up to +14:00 or down to -12:00).
+    const before = naive - offset(naive - DAY, timezone);
+    const after = naive - offset(naive + DAY, timezone);
     const candidates = before === after ? [before] : [Math.min(before, after), Math.max(before, after)];
     for (const candidate of candidates) {
         if (wallClock(candidate, timezone) === naive) {

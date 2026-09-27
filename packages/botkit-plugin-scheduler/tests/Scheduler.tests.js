@@ -14,17 +14,17 @@ describe('BotkitScheduler', function() {
     let controller;
     let scheduler;
 
-    function setup(options = {}, primary = new FakeAdapter()) {
+    function setup(options = {}, primary = new FakeAdapter(), botkit = {}) {
         clock = new FakeClock(t0);
         adapter = primary;
         scheduler = new BotkitScheduler({ clock, autoStart: false, ...options });
-        controller = new Botkit({ adapter, disable_webserver: true, disable_console: true });
+        controller = new Botkit({ adapter, disable_webserver: true, disable_console: true, ...botkit });
         controller.usePlugin(scheduler);
     }
 
-    async function reset(options, primary) {
+    async function reset(options, primary, botkit) {
         await controller.shutdown();
-        setup(options, primary);
+        setup(options, primary, botkit);
     }
 
     beforeEach(function() {
@@ -262,6 +262,38 @@ describe('BotkitScheduler', function() {
             assert.deepStrictEqual(doc.jobs, {});
         });
 
+        it('should delete the conversation state of clock jobs that are gone', async function() {
+            const storage = new MemoryStorage();
+            await reset({}, undefined, { storage });
+            // MemoryStorage.delete() leaves deleted keys behind with an undefined value.
+            const stateKeys = () => Object.keys(storage.memory).filter((key) => key.indexOf('scheduler/conversations/') === 0 && storage.memory[key] !== undefined).sort();
+            controller.on('sla', async () => {});
+            controller.on('self', async (bot) => {
+                await bot.cancelSchedule('self');
+            });
+            for (let i = 0; i < 3; i++) {
+                await scheduler.schedule({ in: 1000, event: 'sla' });
+            }
+            await scheduler.every('keep', '1m', { event: 'sla' });
+            await scheduler.every('gone', '1m', { event: 'sla' });
+            await scheduler.every('self', '1m', { event: 'self' });
+            assert.strictEqual(await scheduler.tick(t0 + 60000), 6);
+            await scheduler.cancel('gone');
+            assert.deepStrictEqual((await scheduler.list()).map((job) => job.id), ['keep']);
+            assert.deepStrictEqual(stateKeys(), ['scheduler/conversations/scheduler:keep-scheduler/']);
+        });
+
+        it('should keep the conversation state of a clock job that pruneCompleted keeps', async function() {
+            const storage = new MemoryStorage();
+            await reset({ pruneCompleted: false }, undefined, { storage });
+            controller.on('sla', async () => {});
+            await scheduler.schedule({ id: 'once', in: 1000, event: 'sla' });
+            await scheduler.tick(t0 + 1000);
+            assert.ok(storage.memory['scheduler/conversations/scheduler:once-scheduler/']);
+            await scheduler.cancel('once');
+            assert.strictEqual(storage.memory['scheduler/conversations/scheduler:once-scheduler/'], undefined);
+        });
+
         it('should give each run its own copy of the payload', async function() {
             const values = [];
             controller.on('count', async (bot, message) => {
@@ -424,6 +456,37 @@ describe('BotkitScheduler', function() {
             assert.strictEqual((await scheduler.get('unbound')).reference, null);
         });
 
+        it('should not bypass adapter middleware that refuses the turn', async function() {
+            await reset({ pruneCompleted: false });
+            adapter.use(async (context, next) => {
+                if (context.activity.from && context.activity.from.id === 'banned') {
+                    throw new Error('user is blocked');
+                }
+                await next();
+            });
+            controller.on('offer', async (bot) => {
+                await bot.say('Special offer!');
+            });
+            await scheduler.schedule({ id: 'o', in: 1000, event: 'offer', reference: reference('c-b', 'banned') });
+            assert.strictEqual(await scheduler.tick(t0 + 1000), 1);
+            assert.deepStrictEqual(adapter.texts(), []);
+            const job = await scheduler.get('o');
+            assert.strictEqual(job.errors, 1);
+            assert.strictEqual(job.lastError, 'user is blocked');
+        });
+
+        it('should fall back to a direct context for an adapter without continueConversation', async function() {
+            const bare = new FakeAdapter();
+            bare.continueConversation = undefined;
+            await reset({}, bare);
+            controller.on('reminder', async (bot) => {
+                await bot.say('Reminder!');
+            });
+            await scheduler.schedule({ in: 1000, event: 'reminder', reference: reference('c9', 'bo') });
+            assert.strictEqual(await scheduler.tick(t0 + 1000), 1);
+            assert.deepStrictEqual(adapter.texts(), ['Reminder!']);
+        });
+
         it('should not fall back when the adapter ran the turn and it failed', async function() {
             let runs = 0;
             controller.middleware.receive.use((bot, message, next) => {
@@ -450,6 +513,44 @@ describe('BotkitScheduler', function() {
             });
             assert.strictEqual(errors.length, 0);
             assert.strictEqual((await scheduler.get('r')).errors, 0);
+        });
+
+        it('should tell scheduled runs from client events of the same name with isScheduledRun()', async function() {
+            const seen = [];
+            controller.on('sla_escalation', async (bot, message) => {
+                seen.push([message.user, message.botkitScheduler === true, scheduler.isScheduledRun(message)]);
+            });
+            await scheduler.schedule({ id: 'esc', in: 1000, event: 'sla_escalation', reference: reference('c1', 'u1') });
+            await scheduler.every('clock', '1s', { event: 'sla_escalation' });
+            await adapter.turn({ type: 'event', from: { id: 'mallory' }, channelData: { botkitEventType: 'sla_escalation', botkitScheduler: true, job: { id: 'esc' } } });
+            assert.strictEqual(await scheduler.tick(t0 + 1000), 2);
+            assert.deepStrictEqual(seen, [['mallory', true, false], ['scheduler', true, true], ['u1', true, true]]);
+            assert.strictEqual(scheduler.isScheduledRun({ type: 'sla_escalation', botkitScheduler: true }), false);
+            assert.strictEqual(scheduler.isScheduledRun(undefined), false);
+        });
+
+        it('should let a recurring job skip a run while its conversation is in a dialog', async function() {
+            const standup = new BotkitConversation('standup', controller);
+            standup.ask('What did you do yesterday?', [], 'yesterday');
+            controller.addDialog(standup);
+            const finished = [];
+            controller.afterDialog(standup, async (bot, results) => {
+                finished.push(results.yesterday);
+            });
+            controller.on('daily', async (bot) => {
+                if (bot.hasActiveDialog()) {
+                    return;
+                }
+                await bot.beginDialog('standup');
+            });
+            await scheduler.every('daily', '1d', { event: 'daily', reference: reference('c1', 'u1') });
+            for (let day = 1; day <= 3; day++) {
+                assert.strictEqual(await scheduler.tick(t0 + day * 86400000), 1);
+            }
+            assert.deepStrictEqual(adapter.texts(), ['What did you do yesterday?']);
+            await adapter.turn({ text: 'shipped it' });
+            assert.deepStrictEqual(finished, ['shipped it']);
+            assert.deepStrictEqual(adapter.texts(), ['What did you do yesterday?']);
         });
     });
 
@@ -617,6 +718,40 @@ describe('BotkitScheduler', function() {
             assert.strictEqual(job.nextRunAt, iso(t0 + 180000));
         });
 
+        it('should stop protecting a run from overlap once it times out, unless turnTimeout is 0', async function() {
+            for (const turnTimeout of [30, 0]) {
+                await reset({ turnTimeout });
+                const gate = deferred();
+                let calls = 0;
+                controller.on('slow', async () => {
+                    calls++;
+                    await gate.promise;
+                });
+                await scheduler.every('s', '1m', { event: 'slow' });
+                const p1 = scheduler.tick(t0 + 60000);
+                if (turnTimeout) {
+                    assert.strictEqual(await p1, 1);
+                } else {
+                    await new Promise((resolve) => setImmediate(resolve));
+                }
+                const p2 = scheduler.tick(t0 + 120000);
+                await new Promise((resolve) => setImmediate(resolve));
+                const job = await scheduler.get('s');
+                gate.resolve();
+                await Promise.all([p1, p2]);
+                if (turnTimeout) {
+                    // the timed-out run no longer counts as in flight: the next run starts beside it
+                    assert.strictEqual(calls, 2);
+                    assert.strictEqual(job.runs, 2);
+                    assert.strictEqual(job.skipped, 0);
+                } else {
+                    assert.strictEqual(calls, 1);
+                    assert.strictEqual(job.runs, 1);
+                    assert.strictEqual(job.skipped, 1);
+                }
+            }
+        });
+
         it('should run both with overlap "allow"', async function() {
             const job = await overlapRuns('allow');
             assert.strictEqual(job.runs, 2);
@@ -644,6 +779,44 @@ describe('BotkitScheduler', function() {
             assert.strictEqual(job.nextRunAt, null);
             assert.strictEqual((await scheduler.resume('m')).nextRunAt, null);
             assert.strictEqual(await scheduler.tick(t0 + 600000), 0);
+        });
+
+        it('should schedule a job again when its maxRuns is raised during its last run', async function() {
+            let raised;
+            controller.on('e', async (bot, message) => {
+                if (message.job.runs === 2) {
+                    raised = await scheduler.every('p', '1m', { event: 'e', maxRuns: 5 });
+                }
+            });
+            await scheduler.every('p', '1m', { event: 'e', maxRuns: 2 });
+            clock.t = t0 + 60000;
+            assert.strictEqual(await scheduler.tick(), 1);
+            clock.t = t0 + 120000;
+            assert.strictEqual(await scheduler.tick(), 1);
+            assert.strictEqual(raised.nextRunAt, iso(t0 + 180000));
+            const job = await scheduler.get('p');
+            assert.strictEqual(job.runs, 2);
+            assert.strictEqual(job.maxRuns, 5);
+            assert.strictEqual(job.nextRunAt, iso(t0 + 180000));
+            assert.strictEqual(await scheduler.tick(t0 + 180000), 1);
+        });
+
+        it('should schedule a finished job again when its maxRuns is raised or removed', async function() {
+            await reset({ pruneCompleted: false });
+            controller.on('e', async () => {});
+            await scheduler.every('m', '1m', { event: 'e', maxRuns: 1 });
+            await scheduler.cron('c', '0 * * * *', { event: 'e', maxRuns: 1 });
+            assert.strictEqual(await scheduler.tick(t0 + 3600000), 2);
+            clock.t = t0 + 2 * 3600000 + 1000;
+            // the same limit keeps them finished
+            assert.strictEqual((await scheduler.every('m', '1m', { event: 'e', maxRuns: 1 })).nextRunAt, null);
+            let job = await scheduler.every('m', '1m', { event: 'e', maxRuns: 3 });
+            assert.strictEqual(job.nextRunAt, iso(clock.t + 60000));
+            assert.strictEqual(job.runs, 1);
+            job = await scheduler.cron('c', '0 * * * *', { event: 'e' });
+            assert.strictEqual(job.maxRuns, null);
+            assert.strictEqual(job.nextRunAt, iso(t0 + 3 * 3600000));
+            assert.strictEqual(await scheduler.tick(t0 + 3 * 3600000), 2);
         });
 
         it('should run a job that fell behind once and count the missed slots', async function() {
@@ -802,6 +975,79 @@ describe('BotkitScheduler', function() {
             assert.strictEqual((await scheduler.list()).length, 1);
         });
 
+        it('should keep a one-shot job that is scheduled again during its own run (snooze)', async function() {
+            for (const pruneCompleted of [true, false]) {
+                await reset({ pruneCompleted });
+                const runs = [];
+                let snoozed;
+                controller.on('reminder', async (bot, message) => {
+                    runs.push(message.job.scheduledAt);
+                    if (runs.length === 1) {
+                        snoozed = await bot.schedule({ id: message.job.id, in: '10m', event: 'reminder', payload: message.value });
+                    }
+                });
+                await scheduler.schedule({ id: 'r1', in: 1000, event: 'reminder', reference: reference('c7', 'ann'), payload: { what: 'stretch' } });
+                clock.t = t0 + 1000;
+                assert.strictEqual(await scheduler.tick(), 1);
+                assert.strictEqual(snoozed.nextRunAt, iso(t0 + 601000));
+                const job = await scheduler.get('r1');
+                assert.ok(job, `pruneCompleted ${ pruneCompleted }: the snoozed job is kept`);
+                assert.strictEqual(job.nextRunAt, iso(t0 + 601000));
+                assert.strictEqual(job.runs, 1);
+
+                assert.strictEqual(await scheduler.tick(t0 + 601000), 1);
+                assert.deepStrictEqual(runs, [iso(t0 + 1000), iso(t0 + 601000)]);
+                const done = await scheduler.get('r1');
+                if (pruneCompleted) {
+                    assert.strictEqual(done, undefined);
+                } else {
+                    assert.strictEqual(done.nextRunAt, null);
+                    assert.strictEqual(done.runs, 2);
+                }
+            }
+        });
+
+        it('should keep the new timing of a job that another turn schedules again during its run', async function() {
+            const gate = deferred();
+            const started = deferred();
+            controller.on('escalate', async () => {
+                started.resolve();
+                await gate.promise;
+            });
+            await scheduler.schedule({ id: 'sla', in: 1000, event: 'escalate' });
+            await scheduler.at('boot', t0 + 1000, { event: 'escalate' });
+            const running = scheduler.tick(t0 + 1000);
+            await started.promise;
+            await scheduler.schedule({ id: 'sla', in: '4h', event: 'escalate' });
+            // re-declaring a one-shot job with the same time, as at startup, does not keep it
+            await scheduler.at('boot', t0 + 1000, { event: 'escalate' });
+            gate.resolve();
+            assert.strictEqual(await running, 2);
+            assert.strictEqual((await scheduler.get('sla')).nextRunAt, iso(t0 + 4 * 3600000));
+            assert.strictEqual(await scheduler.get('boot'), undefined);
+        });
+
+        it('should stop making up runs of a job that is scheduled again during catch-up', async function() {
+            const storage = new MemoryStorage();
+            await reset({}, undefined, { storage });
+            await scheduler.every('hb', '1m', { event: 'hb' });
+            await controller.shutdown();
+            clock = new FakeClock(t0 + 330000);
+            scheduler = new BotkitScheduler({ clock, autoStart: false, catchUp: 'all' });
+            controller = new Botkit({ adapter: new FakeAdapter(), storage, disable_webserver: true, disable_console: true });
+            controller.usePlugin(scheduler);
+            const slots = [];
+            controller.on('hb', async (bot, message) => {
+                slots.push(message.job.scheduledAt);
+                if (slots.length === 2) {
+                    await scheduler.every('hb', '1h', { event: 'hb' });
+                }
+            });
+            assert.strictEqual(await scheduler.tick(), 2);
+            assert.deepStrictEqual(slots, [iso(t0 + 60000), iso(t0 + 120000)]);
+            assert.strictEqual((await scheduler.get('hb')).nextRunAt, iso(t0 + 330000 + 3600000));
+        });
+
         it('should finish a re-declared job whose new maxRuns is already reached', async function() {
             controller.on('e', async () => {});
             await scheduler.every('u', '1m', { event: 'e' });
@@ -860,7 +1106,11 @@ describe('BotkitScheduler', function() {
                 [{ event: 'e', at: 'not a date' }, /Invalid date/],
                 [{ event: 'e', at: {} }, /Invalid date/],
                 [{ event: 'e', in: 'soon' }, /Invalid duration/],
-                [{ event: 'e', in: '100000000000w' }, /Invalid date/],
+                [{ event: 'e', in: '100000000000w' }, /Invalid duration/],
+                [{ event: 'e', in: '9999999999999999999w' }, /Invalid duration/],
+                [{ event: 'e', in: 8.64e15 }, /Invalid duration "8640000000000000": it ends after the latest date/],
+                [{ event: 'e', every: 8.64e15 }, /Invalid duration/],
+                [{ event: 'e', every: 0.001 }, /Invalid duration/],
                 [{ event: 'e', every: 0 }, /Invalid duration/],
                 [{ event: 'e', every: '1m', startAt: 'never' }, /Invalid date/],
                 [{ event: 'e', in: 5, overlap: 'queue' }, /overlap/],
@@ -935,17 +1185,32 @@ describe('BotkitScheduler', function() {
             assert.strictEqual(clock.timers[0].at, t0 + 120000);
         });
 
-        it('should cap the delay for a job far in the future', async function() {
+        it('should check the clock at least once a minute for a job far in the future', async function() {
             await reset({ autoStart: true });
             await new Promise(setImmediate);
             await scheduler.at('far', t0 + 40 * 24 * 3600000, { event: 'far' });
             assert.strictEqual(clock.timers.length, 1);
-            assert.strictEqual(clock.timers[0].ms, 2147483647);
+            assert.strictEqual(clock.timers[0].ms, 60000);
 
-            // waking up early re-arms for the rest of the wait
+            // waking up early re-arms for the next check
             assert.strictEqual(await clock.fire(), 0);
             assert.strictEqual(clock.timers.length, 1);
-            assert.strictEqual(clock.timers[0].at, t0 + 40 * 24 * 3600000);
+            assert.strictEqual(clock.timers[0].at, t0 + 120000);
+        });
+
+        it('should run a job that came due while the machine slept at the next check', async function() {
+            await reset({ autoStart: true });
+            await new Promise(setImmediate);
+            let runs = 0;
+            controller.on('daily', async () => { runs++; });
+            await scheduler.every('d', '1d', { event: 'daily' });
+            // Node.js timers do not count time the machine spends asleep, so the timer never waits more than a minute.
+            assert.strictEqual(clock.timers.length, 1);
+            assert.strictEqual(clock.timers[0].ms, 60000);
+            clock.advance(34 * 3600000);
+            assert.strictEqual(await clock.fire(), 1);
+            assert.strictEqual(runs, 1);
+            assert.strictEqual((await scheduler.get('d')).nextRunAt, iso(t0 + 2 * 86400000));
         });
 
         it('should not arm for paused jobs, and disarm when nothing is left', async function() {

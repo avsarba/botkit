@@ -39,6 +39,7 @@ Use persistent storage, such as `botbuilder-storage-mongodb`, when jobs must sur
 ### Clock jobs
 
 A job without a conversation reference runs on the clock channel. Its turn comes from user `scheduler` in conversation `scheduler:<job id>`, and anything the bot sends there goes to the `output` function.
+When a clock job is deleted (cancelled, or finished and pruned), the scheduler also deletes the conversation state Botkit saved for its conversation.
 
 ```javascript
 const scheduler = new BotkitScheduler({
@@ -107,16 +108,19 @@ A job is given exactly one of these:
 
 | Option | Runs |
 |--- |---
-| `in: '10m'` | once, after a duration (milliseconds or `ms`, `s`, `m`, `h`, `d` and `w` units, such as `'1h30m'`) |
+| `in: '10m'` | once, after a duration (a whole number of milliseconds, or `ms`, `s`, `m`, `h`, `d` and `w` units, such as `'1h30m'`) |
 | `at: date` | once, at a Date, an ISO 8601 string or milliseconds since the epoch. A time in the past runs right away. |
 | `every: '1h'` | repeatedly, at a fixed interval. `startAt` sets the first run; later runs keep that rhythm. |
 | `cron: '0 9 * * MON-FRI'` | on a cron schedule, in `timezone` or the scheduler's default time zone |
 
 Other job options are `id` (generated when omitted), `payload` (stored as JSON), `maxRuns`, and `overlap`.
 By default (`overlap: 'skip'`), a run that comes due while the previous run of the same job is still going is skipped. Use `'allow'` to run both.
+A run that takes longer than `turnTimeout` stops counting as going when it times out, and the next run can then start beside it: for a job whose runs can be that slow, raise `turnTimeout` or set it to `0`.
 
 Scheduling an `id` that already exists updates that job. If its timing, event and reference are unchanged, it keeps its next run time and counters, and only its payload, `maxRuns` and `overlap` change.
 Because `in` is measured from each call, scheduling an `in` job again with the same id moves its run: a simple way to snooze or debounce.
+This works from the job's own handler too, so a reminder can snooze itself, or an escalation re-arm itself, with `bot.schedule({ id: message.job.id, in: '10m', event: message.type })`.
+A recurring job that reached its `maxRuns` runs again when it is scheduled with a higher `maxRuns`, or none.
 If the job cannot be saved, the call rejects with the storage error, but the change still applies in memory and is saved with the next successful write.
 
 ### Options
@@ -129,7 +133,7 @@ If the job cannot be saved, the call rejects with the storage error, but the cha
 | catchUp | `'once'` | What to do at startup with runs missed while the bot was down: `'skip'`, `'once'` or `'all'`. See below.
 | maxCatchUp | `10` | With `catchUp: 'all'`, the most missed runs to make up per job.
 | pruneCompleted | `true` | Delete one-shot jobs, and jobs that reached `maxRuns`, when they finish. When false, they are kept with `nextRunAt: null`.
-| turnTimeout | `30000` | Milliseconds a run may take before it is recorded as failed. `0` turns the limit off. The turn itself is not cancelled.
+| turnTimeout | `30000` | Milliseconds a run may take before it is recorded as failed. `0` turns the limit off. The turn itself is not cancelled, but it stops counting as running for `overlap: 'skip'`.
 | adapters | `{}` | The adapter to use for each `channelId`, for jobs bound to conversations.
 | output | debug log | `(activity, job) => {}`, called for every activity the bot sends on the clock channel.
 | clock | system clock | `{ now(), setTimeout(fn, ms), clearTimeout(handle) }`. Pass a fake clock in tests.
@@ -145,7 +149,7 @@ A job's turn is an `event` activity, and the handler's `message` includes:
 | `message.type` | The job's event.
 | `message.value` | A copy of the job's payload.
 | `message.job` | `{ id, event, kind, runs, scheduledAt, firedAt }`. `scheduledAt` is the slot the run belongs to and `firedAt` is when it started.
-| `message.botkitScheduler` | `true`.
+| `message.botkitScheduler` | `true`. A client can send an event with the same fields, so use `scheduler.isScheduledRun(message)` when that matters: see below.
 | `message.user`, `message.channel` | The reference's user and conversation, or `scheduler` and `scheduler:<job id>` for a clock job.
 | `message.reference` | The turn's conversation reference. Pass it to `bot.schedule()` or `scheduler.schedule()` to schedule a follow-up.
 
@@ -157,8 +161,25 @@ The scheduler registers a `controller.interrupts()` handler for each job event. 
 As a result:
 
 * **Handle scheduled events with `controller.on(event)`.** `hears()` or `interrupts()` registered for a job's event name do not see scheduled runs.
-* **A dialog waiting for an answer is left alone.** The job does not answer the question, and the user's next message still does. A handler may start a new dialog with `bot.beginDialog()`, as in any interrupt.
-* An event with the same name that arrives from a user (for example a `reminder` event sent by a web client) is not treated as a scheduled run, even if it sets `botkitScheduler`.
+* **A dialog waiting for an answer is left alone.** The job does not answer the question, and the user's next message still does.
+* **A handler may start a new dialog with `bot.beginDialog()`, as in any interrupt.** The new dialog goes on top of any dialog already waiting, which resumes, and asks its question again, when the new one ends. A recurring job that begins a dialog should check first; otherwise a user who ignores a daily question for three days has to answer it three times:
+  ```javascript
+  controller.on('standup', async (bot, message) => {
+      if (bot.hasActiveDialog()) {
+          return; // the user has not answered an earlier run yet
+      }
+      await bot.beginDialog('standup');
+  });
+  ```
+* **`on(event)` handlers also receive events of the same name that do not come from the scheduler**, such as a `reminder` event sent by a web client. The scheduler does not count them as runs, but on channels that let a client set `channelData` (the web adapter, for one) they can carry `botkitScheduler: true` and a made-up `message.job`. When a handler must only run on schedule, for example because it pages someone, check `isScheduledRun()`, which a client cannot forge:
+  ```javascript
+  controller.on('sla_escalation', async (bot, message) => {
+      if (!controller.plugins.scheduler.isScheduledRun(message)) {
+          return;
+      }
+      await pageOnCall(message.value.ticket);
+  });
+  ```
 
 ### Errors and time-outs
 
@@ -181,6 +202,7 @@ At startup, the `catchUp` option decides what happens to jobs whose run time pas
 * `'all'`: every missed slot runs, in order and one at a time, each with its own `scheduledAt`, up to `maxCatchUp` per job. Slots beyond that are counted in `skipped`.
 
 While the bot is running, a job that falls behind (because the process was busy or the machine slept) runs once, and the slots it missed are counted in `skipped`.
+The timer checks the clock at least once a minute, so a job that came due while the machine was asleep runs within a minute of it waking up.
 
 ### Cron syntax
 
@@ -223,7 +245,7 @@ To test the timer itself, pass a fake `clock` whose `setTimeout()` records the c
 ### Limitations
 
 * **One process.** The scheduler is designed for one bot process. If several processes share the same storage, each of them runs every job.
-* **At most once.** A job's next run time is saved before it runs, so a crash cannot run the same slot twice; a run interrupted by a crash is not retried.
+* **At most once.** A job's next run time is saved before it runs, so a crash cannot run the same slot twice; a run interrupted by a crash is not retried. A one-shot job whose run was interrupted is deleted at the next startup (or kept with `nextRunAt: null` when `pruneCompleted` is false).
 * **Personal data.** A job bound to a conversation stores its reference, which holds user and conversation ids. When a user asks to be forgotten, cancel their jobs:
   ```javascript
   for (const job of await scheduler.list({ user: userId })) {
@@ -232,7 +254,7 @@ To test the timer itself, pass a fake `clock` whose `setTimeout()` records the c
   ```
 * Finished one-shot jobs are deleted by default (`pruneCompleted`). A one-shot job declared at every startup with a time in the past therefore runs again at each startup; give it a future time, or set `pruneCompleted: false`.
 * `turnTimeout` records a failure but cannot stop a handler that is still running.
-* An adapter's own middleware (`adapter.use()`) sees the standard `continueConversation` event activity; Botkit turns it into the job's event after the middleware runs. If the adapter cannot continue a conversation (botbuilder's `TestAdapter`, for one), the scheduler runs the turn directly, as `bot.changeContext()` does, without the adapter's middleware.
+* An adapter's own middleware (`adapter.use()`) sees the standard `continueConversation` event activity; Botkit turns it into the job's event after the middleware runs. Middleware that throws refuses the run, which is recorded as failed. Only if the adapter cannot continue a conversation at all (it has no `continueConversation()`, or rejects with a "not implemented" error as botbuilder's `TestAdapter` does) does the scheduler run the turn directly, as `bot.changeContext()` does, without the adapter's middleware.
 * Do not await `scheduler.runNow(id)` inside a turn of the conversation that job is bound to, on an adapter that runs one turn at a time per conversation: the job's turn would wait for the current turn to end, and the current turn would wait for the job.
 * Register one scheduler per controller.
 * The plugin works with botkit 4.10, with two differences that come from Botkit itself. Botkit 4.10 wraps errors thrown by handlers, so `lastError` reads `Error: boom` instead of `boom`. And when a message fails to send, 4.10's `bot.say()` never settles and raises an unhandled rejection, so the run is recorded as a time-out. Botkit 4.11 fixes both.
@@ -272,7 +294,7 @@ await bot.cancelSchedule('follow-up-123');
 
 ### controller.plugins.scheduler
 
-The [BotkitScheduler](../docs/reference/scheduler.md#botkitscheduler) instance, with every method.
+The [BotkitScheduler](../docs/reference/scheduler.md#botkitscheduler) instance, with every method, including [isScheduledRun()](../docs/reference/scheduler.md#isscheduledrun) to tell a scheduled run from a client-sent event of the same name.
 
 ## Community & Support
 

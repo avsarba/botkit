@@ -85,6 +85,35 @@ describe('BotkitScheduler persistence', function() {
             assert.strictEqual(job.nextRunAt, iso(t0 + 120000));
         });
 
+        it('should not keep a one-shot job whose run was cut short by a crash', async function() {
+            for (const pruneCompleted of [true, false]) {
+                const storage = new MemoryStorage();
+                const a = make({}, { storage });
+                let snapshot;
+                a.controller.on('remind', async () => {
+                    // the process dies here, after the advanced run time was saved and before the run was
+                    snapshot = JSON.parse(JSON.stringify((await storage.read([KEY]))[KEY]));
+                });
+                await a.scheduler.at('r', t0 + 1000, { event: 'remind' });
+                await a.scheduler.every('hb', '1h', { event: 'hb' });
+                await a.scheduler.tick(t0 + 1000);
+                assert.strictEqual(snapshot.jobs.r.nextRunAt, null);
+                assert.strictEqual(snapshot.jobs.r.runs, 0);
+
+                const restarted = new MemoryStorage();
+                await restarted.write({ [KEY]: snapshot });
+                const b = make({ pruneCompleted, clock: new FakeClock(t0 + 60000) }, { storage: restarted });
+                const jobs = await b.scheduler.list();
+                if (pruneCompleted) {
+                    assert.deepStrictEqual(jobs.map((job) => job.id), ['hb']);
+                    await b.scheduler.stop();
+                    assert.deepStrictEqual(Object.keys((await restarted.read([KEY]))[KEY].jobs), ['hb']);
+                } else {
+                    assert.deepStrictEqual(jobs.map((job) => [job.id, job.nextRunAt]), [['hb', iso(t0 + 3600000)], ['r', null]]);
+                }
+            }
+        });
+
         it('should use the storage and key given in the options', async function() {
             const storage = new MemoryStorage();
             const { scheduler } = make({ storage, storageKey: 'custom/jobs' });

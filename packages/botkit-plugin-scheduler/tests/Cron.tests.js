@@ -100,6 +100,106 @@ describe('Cron', function() {
         it('should reject an unknown time zone', function() {
             assert.throws(() => nextRun('* * * * *', 0, 'Mars/Olympus'), /Invalid timezone "Mars\/Olympus"/);
         });
+
+        it('should run a time shifted by a spring-forward gap when searching from inside the shifted hour', function() {
+            // 03:10 EDT: today's 02:30 runs at 03:30 EDT, which is still ahead.
+            assert.strictEqual(iso(nextRun('30 2 * * *', Date.parse('2026-03-08T07:10:00Z'), 'America/New_York')), '2026-03-08T07:30:00.000Z');
+            const runs = [];
+            let from = Date.parse('2026-03-08T06:00:00Z'); // 01:00 EST
+            for (let i = 0; i < 5; i++) {
+                const next = nextRun('*/15 2 * * *', from, 'America/New_York');
+                runs.push(next.toISOString());
+                from = next.getTime();
+            }
+            // 02:00, 02:15, 02:30 and 02:45 do not exist that day: each runs once, an hour later, and then the next day.
+            assert.deepStrictEqual(runs, [
+                '2026-03-08T07:00:00.000Z',
+                '2026-03-08T07:15:00.000Z',
+                '2026-03-08T07:30:00.000Z',
+                '2026-03-08T07:45:00.000Z',
+                '2026-03-09T06:00:00.000Z'
+            ]);
+        });
+    });
+
+    describe('nextRun around daylight saving time changes in any zone', function() {
+        const table = [
+            // Pacific/Auckland springs forward on 2026-09-27 at 02:00 NZST (+12) to 03:00 NZDT (+13)
+            ['30 2 * * *', '2026-09-25T12:00:00Z', 'Pacific/Auckland', '2026-09-25T14:30:00.000Z'],
+            ['30 2 * * *', '2026-09-25T14:30:00Z', 'Pacific/Auckland', '2026-09-26T14:30:00.000Z'], // 03:30 NZDT
+            ['30 2 * * *', '2026-09-26T14:30:00Z', 'Pacific/Auckland', '2026-09-27T13:30:00.000Z'],
+            // ...and falls back on 2026-04-05 at 03:00 NZDT to 02:00 NZST: 02:30 runs at its first occurrence, in NZDT
+            ['30 2 * * *', '2026-04-03T12:00:00Z', 'Pacific/Auckland', '2026-04-03T13:30:00.000Z'],
+            ['30 2 * * *', '2026-04-03T13:30:00Z', 'Pacific/Auckland', '2026-04-04T13:30:00.000Z'],
+            ['30 2 * * *', '2026-04-04T13:30:00Z', 'Pacific/Auckland', '2026-04-05T14:30:00.000Z'],
+            ['0 * * * *', '2026-04-04T12:00:00Z', 'Pacific/Auckland', '2026-04-04T13:00:00.000Z'],
+            ['0 * * * *', '2026-04-04T13:00:00Z', 'Pacific/Auckland', '2026-04-04T15:00:00.000Z'],
+            // Pacific/Chatham (+12:45/+13:45) changes at 02:45 standard time
+            ['30 2 * * *', '2026-09-25T12:00:00Z', 'Pacific/Chatham', '2026-09-25T13:45:00.000Z'],
+            ['30 2 * * *', '2026-09-25T13:45:00Z', 'Pacific/Chatham', '2026-09-26T13:45:00.000Z'],
+            ['0 3 * * *', '2026-04-04T00:00:00Z', 'Pacific/Chatham', '2026-04-04T13:15:00.000Z'],
+            ['0 2 * * *', '2026-04-04T00:00:00Z', 'Pacific/Chatham', '2026-04-04T12:15:00.000Z']
+        ];
+
+        table.forEach(([expression, from, timezone, expected]) => {
+            it(`should run "${ expression }" in ${ timezone } after ${ from } at ${ expected }`, function() {
+                assert.strictEqual(iso(nextRun(expression, new Date(from), timezone)), expected);
+            });
+        });
+
+        /**
+         * The documented instant for a wall-clock time, found by brute force: the first instant that shows it,
+         * or, for a time skipped by a spring-forward gap, the time shifted by the change.
+         */
+        function expectedRuns(timezone, from, until) {
+            const format = new Intl.DateTimeFormat('en-US', { timeZone: timezone, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric' });
+            const wall = (ms) => {
+                const f = {};
+                format.formatToParts(ms).forEach((part) => { f[part.type] = parseInt(part.value, 10); });
+                return Date.UTC(f.year, f.month - 1, f.day, f.hour % 24, f.minute);
+            };
+            const first = new Map();
+            const step = 15 * 60000; // every UTC offset in use is a multiple of 15 minutes
+            for (let ms = from - 15 * 3600000; ms <= until + 15 * 3600000; ms += step) {
+                const naive = wall(ms);
+                if (!first.has(naive)) {
+                    first.set(naive, ms);
+                }
+            }
+            const offsetBefore = wall(from - 15 * 3600000) - (from - 15 * 3600000);
+            return (naive) => first.has(naive) ? first.get(naive) : naive - offsetBefore;
+        }
+
+        [
+            ['America/New_York', [2026, 2, 8]], ['America/New_York', [2026, 10, 1]],
+            ['Europe/London', [2026, 2, 29]], ['Europe/London', [2026, 9, 25]],
+            ['Australia/Sydney', [2026, 3, 5]], ['Australia/Sydney', [2026, 9, 4]],
+            ['Australia/Lord_Howe', [2026, 3, 5]], ['Australia/Lord_Howe', [2026, 9, 4]],
+            ['Pacific/Auckland', [2026, 3, 5]], ['Pacific/Auckland', [2026, 8, 27]],
+            ['Pacific/Chatham', [2026, 3, 5]], ['Pacific/Chatham', [2026, 8, 27]],
+            ['America/Santiago', [2026, 3, 5]], ['America/Santiago', [2026, 8, 6]],
+            ['America/Havana', [2026, 2, 8]], ['America/Havana', [2026, 10, 1]]
+        ].forEach(([timezone, [year, month, day]]) => {
+            it(`should run every quarter hour of the days around ${ year }-${ month + 1 }-${ day } in ${ timezone } once, at the documented time`, function() {
+                const start = Date.UTC(year, month, day - 1);
+                const end = Date.UTC(year, month, day + 1);
+                const expected = expectedRuns(timezone, start, end);
+                const wrong = [];
+                for (let naive = start; naive < end; naive += 15 * 60000) {
+                    const date = new Date(naive);
+                    const expression = `${ date.getUTCMinutes() } ${ date.getUTCHours() } ${ date.getUTCDate() } ${ date.getUTCMonth() + 1 } *`;
+                    const want = expected(naive);
+                    // from well before the run, and from just before it
+                    [want - 12 * 3600000, want - 1000].forEach((from) => {
+                        const got = nextRun(expression, from, timezone);
+                        if (!got || got.getTime() !== want) {
+                            wrong.push(`${ expression } from ${ iso(new Date(from)) }: ${ iso(got) } instead of ${ iso(new Date(want)) }`);
+                        }
+                    });
+                }
+                assert.deepStrictEqual(wrong, []);
+            });
+        });
     });
 
     describe('parseCron', function() {
@@ -191,7 +291,16 @@ describe('Cron', function() {
             });
         });
 
-        ['5x', '', '-1s', 0, -5, 'm', '0s', '1h 30m', '1.5h', NaN, Infinity, null, undefined].forEach((input) => {
+        it('should accept the longest duration a date can hold', function() {
+            assert.strictEqual(parseDuration(8.64e15), 8.64e15);
+            assert.strictEqual(parseDuration('8640000000000000'), 8.64e15);
+        });
+
+        ['5x', '', '-1s', 0, -5, 'm', '0s', '1h 30m', '1.5h', NaN, Infinity, null, undefined,
+            // fractions of a millisecond, which ISO times cannot hold
+            0.5, 0.001, 1500.5,
+            // longer than any date can be
+            8.64e15 + 1, 1e300, '9999999999999999999w', '10000000000000000'].forEach((input) => {
             it(`should reject ${ show(input) }`, function() {
                 assert.throws(() => parseDuration(input), /Invalid duration/);
             });

@@ -82,6 +82,7 @@ This class includes the following methods:
 * [get()](#get)
 * [getConfig()](#getConfig)
 * [init()](#init)
+* [isScheduledRun()](#isScheduledRun)
 * [list()](#list)
 * [pause()](#pause)
 * [resume()](#resume)
@@ -287,6 +288,38 @@ controller.usePlugin(scheduler);
 ```
 
 
+<a name="isScheduledRun"></a>
+### isScheduledRun()
+Tell whether a message is a run of a job started by this scheduler.
+
+**Parameters**
+
+| Argument | Type | description
+|--- |--- |---
+| message| BotkitMessage | The message passed to a handler.<br/>
+
+
+**Returns**
+
+True only in a turn this scheduler started for a job.
+
+
+
+
+`controller.on(event)` handlers also receive events of the same name that arrive from a user or a client, and on channels
+that let clients set `channelData` (such as the web adapter), such an event can carry `botkitScheduler: true` and a `job`.
+This check cannot be forged that way: it reads the turn's own state.
+
+```javascript
+controller.on('sla_escalation', async (bot, message) => {
+    if (!controller.plugins.scheduler.isScheduledRun(message)) {
+        return; // sent by a client, not by the scheduler
+    }
+    await pageOnCall(message.value.ticket);
+});
+```
+
+
 <a name="list"></a>
 ### list()
 List jobs, soonest first. Jobs that will not run again come last. Ties are sorted by id.
@@ -411,7 +444,9 @@ A copy of the job.
 Give exactly one of `in`, `at`, `every` or `cron`. When the id already exists with the same timing, event and reference,
 the job keeps its next run time and counters, and only `payload`, `maxRuns` and `overlap` change. That makes it safe to
 declare jobs at every startup. When the timing, event or reference changed, the next run time is worked out again,
-and the counters are kept.
+and the counters are kept. This also works while the job is running, for example from its own handler: a one-shot job
+scheduled again that way runs again at its new time. A recurring job that had reached `maxRuns` runs again from now
+when it is scheduled with a higher limit, or none.
 
 If the job cannot be saved, the promise rejects with the storage error. The job is still scheduled in memory,
 and it is saved by the next write that succeeds.
@@ -439,6 +474,9 @@ await scheduler.schedule({
 ### start()
 Start the timer that runs jobs when they are due. Botkit calls this when it is ready, unless `autoStart` is false.
 Calling it again after [stop()](#stop) starts the timer again.
+
+The timer checks the clock at least once a minute, because Node.js timers do not count time the machine spends asleep:
+after the machine wakes up, a job that came due while it slept runs within a minute.
 
 
 
@@ -741,14 +779,15 @@ Convert a duration into milliseconds.
 
 **Returns**
 
-The duration in milliseconds, always greater than 0. Throws Error('Invalid duration "&lt;value&gt;"') when the value cannot be read or is not greater than 0.
+The duration in milliseconds: a whole number from 1 to 8.64e15. Throws Error('Invalid duration "&lt;value&gt;"') when the value cannot be read or is out of that range.
 
 
 
 
-A finite number greater than 0 is read as milliseconds, and so is a string of digits.
+A whole number of milliseconds greater than 0 is read as is, and so is a string of digits.
 Any other string must be one or more `<integer><unit>` groups with no spaces between them,
-where the unit is `ms`, `s`, `m`, `h`, `d` or `w`.
+where the unit is `ms`, `s`, `m`, `h`, `d` or `w`. Fractions of a millisecond, and durations longer
+than a JavaScript Date can hold (8.64e15 milliseconds), are not valid.
 
 ```javascript
 const { parseDuration } = require('botkit-plugin-scheduler');
@@ -779,7 +818,7 @@ Options for the [BotkitScheduler](#BotkitScheduler) constructor. Every option is
 | storage | Storage | Where jobs are saved. Defaults to the controller's storage (`controller.storage`).<br/>
 | storageKey | string | The storage key of the document that holds every job. Defaults to `botkit-scheduler/jobs`.<br/>
 | timezone | string | The time zone for cron jobs that do not name one. Defaults to `UTC`.<br/>
-| turnTimeout | number | How long a job's turn may run, in milliseconds, before it is recorded as failed. Defaults to 30000. 0 turns the limit off.<br/>The turn itself is not cancelled.<br/>
+| turnTimeout | number | How long a job's turn may run, in milliseconds, before it is recorded as failed. Defaults to 30000. 0 turns the limit off.<br/>The turn itself is not cancelled, but it no longer counts as running for `overlap: 'skip'`, so the job's next run can start<br/>beside it. Set a limit longer than the slowest run, or 0, to keep the runs of a slow job from overlapping.<br/>
 | unref | boolean | Unref the timer, so that a pending job does not keep the Node.js process alive. Defaults to false.<br/>
 <a name="CronExpression"></a>
 ## Interface CronExpression
@@ -813,9 +852,9 @@ Options for [scheduler.schedule()](#schedule) and `bot.schedule()`. Give exactly
 | event | string | The Botkit event the job fires. Handle it with `controller.on(event, handler)`. It cannot be `message` or `shutdown`.<br/>
 | every |  | Run repeatedly, this often: milliseconds, or a duration such as `'5m'`.<br/>
 | id | string | The job id. Scheduling an id that already exists updates that job. Defaults to `job-` followed by 8 random hex characters.<br/>
-| in |  | Run once, after this long: milliseconds, or a duration such as `'90s'` or `'1h30m'`.<br/>It is measured from each call, so scheduling the same id again moves the run (to snooze or debounce it).<br/>
-| maxRuns | number | Stop after this many runs.<br/>
-| overlap |  | What to do when a run comes due while the previous run of the same job is still going.<br/>`skip` (the default) skips the new run and counts it in `skipped`; `allow` runs both.<br/>
+| in |  | Run once, after this long: milliseconds, or a duration such as `'90s'` or `'1h30m'`.<br/>It is measured from each call, so scheduling the same id again moves the run (to snooze or debounce it),<br/>even from the job's own handler.<br/>
+| maxRuns | number | Stop after this many runs. Scheduling a job that reached its limit again, with a higher limit or none, makes it run again.<br/>
+| overlap |  | What to do when a run comes due while the previous run of the same job is still going.<br/>`skip` (the default) skips the new run and counts it in `skipped`; `allow` runs both.<br/>A run that takes longer than the scheduler's `turnTimeout` stops counting as going when it times out.<br/>
 | payload | any | Data for the handler, available as `message.value`. It is stored as JSON.<br/>
 | reference |  | The conversation the job runs in, usually `message.reference`. Omit it, or pass null, for a clock job.<br/>It must include `channelId`, `conversation.id` and `user.id`.<br/>A reference on the scheduler's own `scheduler` channel (such as `message.reference` in a clock job's handler) also makes a clock job.<br/>
 | startAt |  | For every jobs: the time of the first run. Later runs follow at `every` intervals from it; a start in the past<br/>begins at the next slot that is not in the past. Defaults to one interval from now. Other jobs ignore it.<br/>

@@ -8,6 +8,7 @@
 
 import { Activity, BotAdapter, ConversationReference, Storage, TurnContext } from 'botbuilder';
 import { Botkit, BotkitMessage, BotWorker } from 'botkit';
+import { BotkitConversationState } from 'botkit/lib/conversationState';
 import * as crypto from 'crypto';
 import * as Debug from 'debug';
 import { ClockAdapter } from './clock_adapter';
@@ -20,6 +21,12 @@ const RESERVED_EVENTS = ['message', 'shutdown'];
 
 /** The longest delay setTimeout accepts. */
 const MAX_DELAY = 2147483647;
+
+/**
+ * The longest the timer waits before it checks the clock again. Node.js timers do not count time the machine spends asleep,
+ * so a longer wait would run a job that came due during a sleep only once the rest of the wait had passed.
+ */
+const MAX_WAIT = 60000;
 
 /** The latest instant a JavaScript Date can hold. */
 const MAX_TIME = 8.64e15;
@@ -83,7 +90,8 @@ export interface BotkitSchedulerOptions {
     pruneCompleted?: boolean;
     /**
      * How long a job's turn may run, in milliseconds, before it is recorded as failed. Defaults to 30000. 0 turns the limit off.
-     * The turn itself is not cancelled.
+     * The turn itself is not cancelled, but it no longer counts as running for `overlap: 'skip'`, so the job's next run can start
+     * beside it. Set a limit longer than the slowest run, or 0, to keep the runs of a slow job from overlapping.
      */
     turnTimeout?: number;
     /**
@@ -134,7 +142,8 @@ export interface ScheduleOptions {
     reference?: Partial<ConversationReference> | null;
     /**
      * Run once, after this long: milliseconds, or a duration such as `'90s'` or `'1h30m'`.
-     * It is measured from each call, so scheduling the same id again moves the run (to snooze or debounce it).
+     * It is measured from each call, so scheduling the same id again moves the run (to snooze or debounce it),
+     * even from the job's own handler.
      */
     in?: number | string;
     /**
@@ -159,12 +168,13 @@ export interface ScheduleOptions {
      */
     startAt?: Date | string | number;
     /**
-     * Stop after this many runs.
+     * Stop after this many runs. Scheduling a job that reached its limit again, with a higher limit or none, makes it run again.
      */
     maxRuns?: number;
     /**
      * What to do when a run comes due while the previous run of the same job is still going.
      * `skip` (the default) skips the new run and counts it in `skipped`; `allow` runs both.
+     * A run that takes longer than the scheduler's `turnTimeout` stops counting as going when it times out.
      */
     overlap?: 'skip' | 'allow';
 }
@@ -349,6 +359,8 @@ export class BotkitScheduler {
     private jobs: { [id: string]: ScheduledJob } = Object.create(null);
     private catchUpSlots: { [id: string]: string[] } = Object.create(null);
     private inFlight = new Map<ScheduledJob, number>();
+    // Bumped each time schedule() changes a job's timing, so that a run that was going at the time does not finish the job.
+    private revisions = new WeakMap<ScheduledJob, number>();
     private routes: { [event: string]: boolean } = Object.create(null);
     private learnedAdapters: { [channelId: string]: BotAdapter } = Object.create(null);
     private timer: any = null;
@@ -493,7 +505,9 @@ export class BotkitScheduler {
      * Give exactly one of `in`, `at`, `every` or `cron`. When the id already exists with the same timing, event and reference,
      * the job keeps its next run time and counters, and only `payload`, `maxRuns` and `overlap` change. That makes it safe to
      * declare jobs at every startup. When the timing, event or reference changed, the next run time is worked out again,
-     * and the counters are kept.
+     * and the counters are kept. This also works while the job is running, for example from its own handler: a one-shot job
+     * scheduled again that way runs again at its new time. A recurring job that had reached `maxRuns` runs again from now
+     * when it is scheduled with a higher limit, or none.
      *
      * If the job cannot be saved, the promise rejects with the storage error. The job is still scheduled in memory,
      * and it is saved by the next write that succeeds.
@@ -527,9 +541,14 @@ export class BotkitScheduler {
             target.payload = job.payload;
             target.maxRuns = job.maxRuns;
             target.overlap = job.overlap;
+            if (target.kind !== 'at' && target.nextRunAt === null && (target.maxRuns === null || target.runs < target.maxRuns)) {
+                // A recurring job that had reached its old maxRuns runs again from now.
+                target.nextRunAt = job.nextRunAt;
+            }
         } else {
             const { runs, errors, lastError, skipped, createdAt, lastRunAt, paused } = target;
             Object.assign(target, job, { runs, errors, lastError, skipped, createdAt, lastRunAt, paused });
+            this.revisions.set(target, this.revisionOf(target) + 1);
             delete this.catchUpSlots[target.id];
         }
         if (target.maxRuns !== null && target.runs >= target.maxRuns) {
@@ -606,13 +625,18 @@ export class BotkitScheduler {
      */
     public async cancel(id: string): Promise<boolean> {
         await this.whenLoaded();
-        if (!this.jobs[id]) {
+        const job = this.jobs[id];
+        if (!job) {
             return false;
         }
         delete this.jobs[id];
         delete this.catchUpSlots[id];
         await this.persist();
         this.arm();
+        if (!this.inFlight.get(job)) {
+            // A run that is going deletes the state itself when it ends, after Botkit has saved it.
+            await this.forgetClockConversation(job);
+        }
         return true;
     }
 
@@ -806,6 +830,9 @@ export class BotkitScheduler {
      * Start the timer that runs jobs when they are due. Botkit calls this when it is ready, unless `autoStart` is false.
      * Calling it again after [stop()](#stop) starts the timer again.
      *
+     * The timer checks the clock at least once a minute, because Node.js timers do not count time the machine spends asleep:
+     * after the machine wakes up, a job that came due while it slept runs within a minute.
+     *
      * ```javascript
      * const scheduler = new BotkitScheduler({ autoStart: false });
      * controller.usePlugin(scheduler);
@@ -857,6 +884,29 @@ export class BotkitScheduler {
     }
 
     /**
+     * Tell whether a message is a run of a job started by this scheduler.
+     *
+     * `controller.on(event)` handlers also receive events of the same name that arrive from a user or a client, and on channels
+     * that let clients set `channelData` (such as the web adapter), such an event can carry `botkitScheduler: true` and a `job`.
+     * This check cannot be forged that way: it reads the turn's own state.
+     *
+     * ```javascript
+     * controller.on('sla_escalation', async (bot, message) => {
+     *     if (!controller.plugins.scheduler.isScheduledRun(message)) {
+     *         return; // sent by a client, not by the scheduler
+     *     }
+     *     await pageOnCall(message.value.ticket);
+     * });
+     * ```
+     *
+     * @param message The message passed to a handler.
+     * @returns True only in a turn this scheduler started for a job.
+     */
+    public isScheduledRun(message: BotkitMessage): boolean {
+        return !!message && message.botkitScheduler === true && !!runRecordOf(message);
+    }
+
+    /**
      * Throw if the plugin is not registered, then wait for the jobs to load.
      */
     private async whenLoaded(): Promise<void> {
@@ -886,7 +936,18 @@ export class BotkitScheduler {
             }
         }
 
-        const changed = this.applyCatchUp(this._config.clock.now());
+        let changed = this.applyCatchUp(this._config.clock.now());
+        if (this._config.pruneCompleted) {
+            for (const id of Object.keys(this.jobs)) {
+                // Prune finished jobs, among them a one-shot job whose run was cut short (by a crash, say):
+                // it was saved without a next run before the run, and never finished.
+                const job = this.jobs[id];
+                if ((job.kind === 'at' && job.nextRunAt === null) || (job.maxRuns !== null && job.runs >= job.maxRuns)) {
+                    this.finish(job);
+                    changed = true;
+                }
+            }
+        }
         for (const id of Object.keys(this.jobs)) {
             this.route(this.jobs[id].event);
         }
@@ -995,10 +1056,11 @@ export class BotkitScheduler {
      * Run the chosen slots of one job in order. Returns the number of runs.
      */
     private async runSlots(job: ScheduledJob, slots: string[]): Promise<number> {
+        const revision = this.revisionOf(job);
         let runs = 0;
         for (const slot of slots) {
-            // Stop if the job was cancelled, replaced, paused or finished since it was chosen.
-            if (this.jobs[job.id] !== job || job.paused || (job.maxRuns !== null && job.runs >= job.maxRuns)) {
+            // Stop if the job was cancelled, replaced, scheduled again, paused or finished since it was chosen.
+            if (this.jobs[job.id] !== job || this.revisionOf(job) !== revision || job.paused || (job.maxRuns !== null && job.runs >= job.maxRuns)) {
                 break;
             }
             await this.fire(job, slot);
@@ -1016,6 +1078,7 @@ export class BotkitScheduler {
         const now = this._config.clock.now();
         const firedAt = toIso(now);
 
+        const revision = this.revisionOf(job);
         this.inFlight.set(job, (this.inFlight.get(job) || 0) + 1);
         job.runs += 1;
         job.lastRunAt = firedAt;
@@ -1041,9 +1104,10 @@ export class BotkitScheduler {
             }
         }
 
-        // A job cancelled or replaced during the run has already been saved without it.
+        // A job cancelled or replaced during the run has already been saved without it,
+        // and a job scheduled again with a new timing during the run keeps that timing.
         if (this.jobs[job.id] === job) {
-            if (job.kind === 'at' || (job.maxRuns !== null && job.runs >= job.maxRuns)) {
+            if (this.revisionOf(job) === revision && (job.kind === 'at' || (job.maxRuns !== null && job.runs >= job.maxRuns))) {
                 this.finish(job);
             }
             try {
@@ -1052,6 +1116,9 @@ export class BotkitScheduler {
                 console.error('botkit-plugin-scheduler: could not save scheduled jobs', err);
             }
             this.arm();
+        }
+        if (this.jobs[job.id] !== job && !this.inFlight.get(job)) {
+            await this.forgetClockConversation(job);
         }
     }
 
@@ -1067,40 +1134,34 @@ export class BotkitScheduler {
         };
 
         if (!job.reference) {
-            const activity: Partial<Activity> = {
-                type: 'event',
-                name: job.event,
-                id: `${ job.id }#${ info.runs }`,
-                channelId: 'scheduler',
-                conversation: { id: `scheduler:${ job.id }` } as any,
-                from: { id: 'scheduler' } as any,
-                recipient: { id: 'bot' } as any,
-                value,
-                channelData,
-                timestamp
-            };
+            const activity = { ...clockActivity(job, `${ job.id }#${ info.runs }`), value, channelData, timestamp };
             await this.clockAdapter.run(activity, logic, copy(job));
             return;
         }
 
         const adapter = this.adapterFor(job.reference.channelId);
-        let ran = false;
-        try {
-            await adapter.continueConversation(copy(job.reference), async (context) => {
-                ran = true;
-                Object.assign(context.activity, { type: 'event', name: job.event, value, channelData, timestamp });
-                await logic(context);
-            });
-        } catch (err) {
-            if (ran) {
-                throw err;
+        if (typeof adapter.continueConversation === 'function') {
+            let ran = false;
+            try {
+                await adapter.continueConversation(copy(job.reference), async (context) => {
+                    ran = true;
+                    Object.assign(context.activity, { type: 'event', name: job.event, value, channelData, timestamp });
+                    await logic(context);
+                });
+                return;
+            } catch (err) {
+                // Anything but an adapter that cannot continue conversations at all fails the run: in particular,
+                // middleware that throws to refuse the turn must not be bypassed.
+                if (ran || !notImplemented(err)) {
+                    throw err;
+                }
+                debug('continueConversation is not implemented, running the job without adapter middleware:', err);
             }
-            // The adapter could not continue the conversation (TestAdapter, for one, does not implement it).
-            // Build the context directly, as bot.changeContext() does; this skips the adapter's middleware.
-            debug('continueConversation failed, running the job without adapter middleware:', err);
-            const activity = TurnContext.applyConversationReference({ type: 'event', name: job.event, value, channelData, timestamp }, copy(job.reference), true);
-            await logic(new TurnContext(adapter, activity));
         }
+        // The adapter cannot continue a conversation (botbuilder's TestAdapter, for one, rejects with "not implemented").
+        // Build the context directly, as bot.changeContext() does; this skips the adapter's middleware.
+        const activity = TurnContext.applyConversationReference({ type: 'event', name: job.event, value, channelData, timestamp }, copy(job.reference), true);
+        await logic(new TurnContext(adapter, activity));
     }
 
     /**
@@ -1195,6 +1256,26 @@ export class BotkitScheduler {
         return this._config.adapters[channelId] || this.learnedAdapters[channelId] || this.controller.adapter;
     }
 
+    private revisionOf(job: ScheduledJob): number {
+        return this.revisions.get(job) || 0;
+    }
+
+    /**
+     * Delete the conversation state Botkit saved for a clock job's `scheduler:<id>` conversation, once the job is gone.
+     * Without this, every one-shot clock job would leave a state document in storage.
+     */
+    private async forgetClockConversation(job: ScheduledJob): Promise<void> {
+        if (job.reference) {
+            return;
+        }
+        const context = new TurnContext(this.clockAdapter, clockActivity(job, 'forget'));
+        try {
+            await new BotkitConversationState(this.controller.storage).delete(context);
+        } catch (err) {
+            debug('Could not delete the conversation state of job', job.id, err);
+        }
+    }
+
     /**
      * A job that will not run again: delete it, or keep it with nextRunAt null.
      */
@@ -1225,7 +1306,7 @@ export class BotkitScheduler {
             return;
         }
         const { clock, unref } = this._config;
-        const delay = Math.min(Math.max(next - clock.now(), 0), MAX_DELAY);
+        const delay = Math.min(Math.max(next - clock.now(), 0), MAX_WAIT);
         // The callback returns the tick's promise so that a fake clock can await it; setTimeout ignores it.
         this.timer = clock.setTimeout(() => {
             this.timer = null;
@@ -1329,7 +1410,7 @@ export class BotkitScheduler {
         };
 
         if (timing[0] === 'in') {
-            job.at = toIso(now + parseDuration(options.in));
+            job.at = toIso(afterDuration(now, options.in));
             job.nextRunAt = job.at;
         } else if (timing[0] === 'at') {
             job.at = toIso(toTime(options.at));
@@ -1339,7 +1420,7 @@ export class BotkitScheduler {
             job.kind = 'every';
             job.every = every;
             if (startAt === null) {
-                job.nextRunAt = toIso(now + every);
+                job.nextRunAt = toIso(afterDuration(now, options.every));
             } else {
                 job.startAt = toIso(startAt);
                 job.nextRunAt = toIso(startAt >= now ? startAt : startAt + Math.ceil((now - startAt) / every) * every);
@@ -1412,6 +1493,39 @@ export class BotkitScheduler {
  */
 function runRecordOf(message: BotkitMessage): RunRecord | undefined {
     return message.context && message.context.turnState ? message.context.turnState.get(RUN_KEY) : undefined;
+}
+
+/**
+ * The activity fields of a clock job's turn: the `scheduler` channel and the job's own conversation.
+ */
+function clockActivity(job: ScheduledJob, id: string): Partial<Activity> {
+    return {
+        type: 'event',
+        name: job.event,
+        id,
+        channelId: 'scheduler',
+        conversation: { id: `scheduler:${ job.id }` } as any,
+        from: { id: 'scheduler' } as any,
+        recipient: { id: 'bot' } as any
+    };
+}
+
+/**
+ * True for the error of an adapter whose continueConversation() is not implemented, such as botbuilder's TestAdapter.
+ */
+function notImplemented(err: any): boolean {
+    return !!err && typeof err.message === 'string' && /not implemented/i.test(err.message);
+}
+
+/**
+ * The time a duration after `now`, in milliseconds.
+ */
+function afterDuration(now: number, duration: number | string): number {
+    const ms = now + parseDuration(duration);
+    if (ms > MAX_TIME) {
+        throw new Error(`Invalid duration "${ duration }": it ends after the latest date JavaScript can hold`);
+    }
+    return ms;
 }
 
 function checkEvent(event: any): void {

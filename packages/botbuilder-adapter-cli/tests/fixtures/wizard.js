@@ -1,5 +1,5 @@
 // A small terminal app used by the child-process tests. It reads the real process.stdin and writes to process.stdout.
-// Usage: node wizard.js [--json] [--non-interactive] [--run <dialog>] [--answers <json>]
+// Usage: node wizard.js [--json] [--non-interactive] [--run <dialog>] [--answers <json>] [--timeout <ms>] [--shutdown-after <ms>] [--no-timer]
 const { Botkit, BotkitConversation } = require('botkit');
 const { CliAdapter } = require('../../');
 
@@ -13,6 +13,7 @@ const adapter = new CliAdapter({
     format: args.includes('--json') ? 'json' : 'text',
     nonInteractive: args.includes('--non-interactive'),
     answers: option('--answers') ? JSON.parse(option('--answers')) : undefined,
+    turnTimeout: option('--timeout') ? Number(option('--timeout')) : undefined,
     user: 'ann',
     greeting: false
 });
@@ -28,12 +29,27 @@ controller.hears('hello', 'message', async (bot) => {
     console.log('log line from a handler');
     await bot.say('Hi');
 });
+controller.hears('boom', 'message', async () => {
+    throw new Error('kaboom');
+});
+controller.hears('hang', 'message', async () => {
+    // a lost callback: nothing keeps the process alive while this waits
+    await new Promise(() => {});
+});
+controller.hears('bye', 'message', async (bot) => {
+    await bot.say('Goodbye!');
+    bot.cli.close();
+});
 
 // keep a timer alive until shutdown, like a plugin would
-const timer = setInterval(() => {}, 1000);
+const timer = args.includes('--no-timer') ? undefined : setInterval(() => {}, 1000);
 controller.on('shutdown', async () => {
     clearInterval(timer);
+    console.log('shutdown handler log');
 });
+if (option('--shutdown-after')) {
+    setTimeout(() => controller.shutdown(), Number(option('--shutdown-after')));
+}
 
 const run = option('--run');
 adapter.run(run ? { dialog: run } : {}).then((result) => {

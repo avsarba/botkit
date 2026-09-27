@@ -100,8 +100,10 @@ adapter.run({ dialog: 'setup' }).then((result) => { process.exitCode = result.ex
 ## CliAdapter Class Methods
 <a name="close"></a>
 ### close()
-End the session: stop reading input, drop queued lines (their `submit()` promises reject), restore the console,
-and resolve an active [run()](#run) with status `quit`. It does not call `controller.shutdown()`; Botkit calls this method on shutdown.
+End the session from code, as `/quit` does: stop reading input, drop queued lines (their `submit()` promises reject),
+resolve an active [run()](#run) with status `quit`, and, unless `shutdownOnClose` is false, call `controller.shutdown()`
+so that plugins and timers stop and the process can exit. The console is restored once the session and the shutdown are over.
+The session also ends, without calling `controller.shutdown()` again, when Botkit shuts down.
 
 
 
@@ -169,6 +171,8 @@ await bot.say('Background job finished.');
 <a name="idle"></a>
 ### idle()
 Wait until every queued line and turn, including answers that turns queue, has been processed.
+Lines written to the input stream are queued once the stream delivers them, which can take a tick.
+Do not await `idle()` inside a bot handler or a custom command (see [submit()](#submit)).
 
 
 **Returns**
@@ -233,11 +237,14 @@ A [CliRunResult](#CliRunResult). Rejects if a run is already in progress, the se
 With a `dialog`, any dialog pending in the conversation is canceled and the dialog begins fresh with `vars`.
 Its questions are answered by the person at the keyboard, by the `answers` option, or, when `nonInteractive` is set, by their defaults.
 The run resolves when the dialog ends (`completed`, `canceled` or `timeout`), and then, unless `closeOnComplete` is false, the session ends too.
-It also resolves if the session ends first (`eof`, `quit`, `interrupted` or `failed`).
+A dialog that is removed without ending, for example by `bot.cancelAllDialogs()` in an interrupt, also counts as `canceled`.
+The run also resolves if the session ends first (`eof`, `quit`, `interrupted` or `failed`).
+`/as` and `/new` do not end the run: it waits until you switch back to its user and conversation.
 The `answers` are reset at the start of each run with a dialog.
 
 Without a `dialog`, the promise resolves when the session ends. Starts the session if needed; the greeting is sent only without a dialog.
 If your code awaits I/O before calling `run()`, create the adapter with `autoStart: false`, or the session may start (and greet) first.
+Do not await `run()` inside a bot handler or a custom command (see [submit()](#submit)).
 
 ```javascript
 // An installer that also runs unattended in CI:
@@ -312,7 +319,9 @@ The output lines. Rejects if the turn fails or the session is closed.
 
 
 
-Do not await `submit()` inside a bot handler or a custom command: it waits for the queue, which is waiting for that handler.
+Do not await `submit()`, [run()](#run) or [idle()](#idle) inside a bot handler or a custom command: they wait for the queue,
+which is waiting for that handler, so the turn or command fails with a `TurnTimeoutError` after `turnTimeout`.
+To queue work that runs after the current turn, call them without `await`, and handle a rejection with `.catch()`.
 
 ```javascript
 const lines = await adapter.submit('hello');
@@ -372,7 +381,7 @@ Create a new BotWorker instance. Do not call this directly - instead, use [contr
 
 | Name | Type | Description
 |--- |--- |---
-| cli | [CliAdapter](#CliAdapter) | The CliAdapter this bot talks through. Use it to read the current user and conversation, or to submit input from code.
+| cli | [CliAdapter](#CliAdapter) | The CliAdapter this bot talks through. Use it to read the current user and conversation, or to queue input from code<br/>with `bot.cli.submit(line).catch(console.error)`, without `await`: the line runs after the current turn, which awaiting it would wait for.
 
 ## CliBotWorker Class Methods
 <a name="progress"></a>
@@ -446,7 +455,7 @@ Options passed to the CliAdapter constructor. Every option is optional.
 | answers |  | Answers for dialog questions, keyed by the question's `key`. A string answers once; an array answers several times in order.<br/>The value may be a choice's value, its title or its number. Used after every turn in which a question is waiting.<br/>
 | autoStart | boolean | Start reading input automatically once Botkit is ready. Defaults to true. Set to false to call [start()](#start) or [run()](#run) yourself.<br/>
 | botName | string | The name in front of bot messages, as in `bot> Hello`. Defaults to `'bot'`.<br/>
-| color | boolean | Use ANSI colors. Defaults to true when the output is a TTY and the `NO_COLOR` environment variable is not set.<br/>
+| color | boolean | Use ANSI colors. Defaults to true when the output is a TTY and the `NO_COLOR` environment variable is not set.<br/>Errors are colored when `errorOutput` is a TTY, unless this option is set.<br/>
 | commands |  | Custom slash-commands, keyed by name without the slash. Each is a function `(args, adapter) => result` or an object `{ description, run }`;<br/>a returned string or array of strings is printed, and `/help` lists the descriptions.<br/>
 | conversation | string | The conversation id (`message.channel`). Defaults to a random id such as `cli-1a2b3c4d`, so every session starts fresh. Change it later with `/new`.<br/>
 | errorOutput | WritableStream | The stream errors are written to. Defaults to `process.stderr`.<br/>
@@ -455,13 +464,13 @@ Options passed to the CliAdapter constructor. Every option is optional.
 | honorDelays | boolean | Pause for `delay` activities. Defaults to true when the output is a TTY.<br/>
 | input | ReadableStream | The stream to read user input from, one line per message. Defaults to `process.stdin`.<br/>
 | maxDelay | number | The longest pause for a `delay` activity, in milliseconds. Defaults to 3000.<br/>
-| nonInteractive | boolean | Never wait for a person: when a question has no answer in `answers` (and no more input is queued), use its `channelData.default`<br/>or end the session with status `failed` and exit code 2. Turn errors also end the session. Defaults to false.<br/>
+| nonInteractive | boolean | Never wait for a person: when a question has no answer in `answers` and no more input is queued, use its `channelData.default`<br/>or end the session with status `failed` and exit code 2. Input that is not a TTY, such as a pipe or a file, is read to its end first,<br/>so piped lines can answer questions. A default is not used again for a question that the dialog asks again straight after it.<br/>Turn errors also end the session. Defaults to false.<br/>
 | output | WritableStream | The stream the bot's messages are written to. Defaults to `process.stdout`.<br/>
 | prompt | string | The prompt shown in terminal mode and used to echo input. Defaults to `'you> '`.<br/>
-| redirectConsole | boolean | Send `console.log`, `console.info`, `console.debug` and `console.dir` to `errorOutput` until the session closes,<br/>so they cannot corrupt the output. Defaults to true when `format` is `'json'` and the output is `process.stdout`.<br/>
-| shutdownOnClose | boolean | Call `controller.shutdown()` when the session ends (end of input, `/quit`, Ctrl+C, a finished run or a failure), so timers and plugins stop<br/>and the process can exit. Defaults to true.<br/>
+| redirectConsole | boolean | Send `console.log`, `console.info`, `console.debug` and `console.dir` to `errorOutput` from the moment the adapter is created<br/>until the session ends and Botkit has shut down, so they cannot corrupt the output.<br/>Defaults to true when `format` is `'json'` and the output is `process.stdout`.<br/>
+| shutdownOnClose | boolean | Call `controller.shutdown()` when the session ends (end of input, `/quit`, [close()](#close), Ctrl+C, a finished run or a failure),<br/>so timers and plugins stop and the process can exit. Defaults to true.<br/>
 | terminal | boolean | Run readline in terminal mode, with a prompt, line editing, history, Tab completion of commands and Ctrl+C handling.<br/>Defaults to true when both input and output are TTYs. When false, each line read is echoed as `you> <line>`.<br/>
-| turnTimeout | number | The longest a turn may take, in milliseconds, before it fails with a `TurnTimeoutError`. Defaults to 30000; 0 disables the limit.<br/>
+| turnTimeout | number | The longest a turn or a custom command may take, in milliseconds, before it fails with a `TurnTimeoutError`. Defaults to 30000; 0 disables the limit.<br/>
 | unescapeHtml | boolean | Decode the HTML entities mustache adds to `{{vars.x}}` in dialog templates, such as `&#x2F;` in URLs. Defaults to true.<br/>
 | user | string | The id of the user at the keyboard (`message.user`). Defaults to `$USER`, `$USERNAME` or `'user'`. Change it later with `/as <user>`.<br/>
 | verbose | boolean | Show extra `channelData` fields as `data: <json>` and print error stacks. Defaults to false.<br/>
@@ -496,7 +505,7 @@ The result of [run()](#run).
 |--- |--- |---
 | error | Error | The error that ended the run, when the status is `failed` because of an error.<br/>
 | exitCode | number | A suggested process exit code: 0 for success, 1 for a canceled, timed out, unfinished or failed dialog, 2 for a missing answer and 130 for Ctrl+C.<br/>
-| status | CliRunStatus | How the run ended: `completed`, `canceled` or `timeout` (the dialog ended with that status), `eof` (the input ended),<br/>`quit` (`/quit`, `/exit` or `close()`), `interrupted` (Ctrl+C) or `failed` (an error, or a missing answer in non-interactive mode).<br/>
+| status | CliRunStatus | How the run ended: `completed`, `canceled` or `timeout` (the dialog ended with that status, or `canceled` when it was removed without ending),<br/>`eof` (the input ended), `quit` (`/quit`, `/exit` or `close()`), `interrupted` (Ctrl+C)<br/>or `failed` (an error, or a missing answer in non-interactive mode).<br/>
 | vars |  | The dialog's variables, including the collected answers, when the dialog ended or an answer was missing.<br/>
 <a name="RenderOptions"></a>
 ## Interface RenderOptions

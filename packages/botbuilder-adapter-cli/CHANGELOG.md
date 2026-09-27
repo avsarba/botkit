@@ -8,7 +8,8 @@ This is the first public release!
 * NEW: Quick replies, suggested actions and card buttons render as numbered menus. Type a number or a title to pick a choice, or press Enter for `channelData.default`.
 * NEW: Slash-commands `/help`, `/quit`, `/event`, `/as`, `/new`, `/state`, `/raw` and `/json`, plus custom commands with the `commands` option.
 * NEW: `adapter.run({ dialog, vars })` runs a BotkitConversation as a wizard and resolves with `{ status, vars, exitCode }`.
-* NEW: Unattended mode for CI: `answers` answers questions by key, and `nonInteractive` uses defaults or fails with exit code 2 instead of waiting.
+* NEW: Unattended mode for CI: `answers` answers questions by key, and `nonInteractive` uses defaults or fails with exit code 2 instead of waiting for a person.
+  Piped input is read to its end first, so `printf 'sqlite\n' | node install.js` works too.
 * NEW: `format: 'json'` writes one JSON object per line for other programs.
 * NEW: `adapter.submit(line)` processes a line and resolves with the printed lines, for offline tests.
 * NEW: `CliBotWorker` with `bot.progress()`, `bot.startConversationWithUser()` and `bot.cli`.

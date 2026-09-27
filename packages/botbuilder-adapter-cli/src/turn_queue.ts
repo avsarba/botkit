@@ -11,9 +11,12 @@ const debug = Debug('botkit:cli');
 
 /**
  * Race a promise against a timer. If the promise has not settled after `ms` milliseconds,
- * the returned promise rejects with an Error named `TurnTimeoutError` and the message `Turn timed out after <ms>ms`.
+ * the returned promise rejects with an Error named `TurnTimeoutError` and the message `<what> timed out after <ms>ms`.
  * The original promise keeps running; its eventual result or rejection is ignored.
- * The timer is cleared as soon as the promise settles and never keeps the process alive.
+ *
+ * The timer is cleared as soon as the promise settles. While it runs it keeps the process alive, so that work which never settles
+ * (a lost callback) ends in a timeout error instead of a silent exit once nothing else is left to do.
+ * Pass a `timers` set to track the pending timers, so their owner can `unref()` them when it no longer needs them.
  *
  * ```javascript
  * await withTimeout(adapter.runMiddleware(context, logic), 30000);
@@ -21,27 +24,38 @@ const debug = Debug('botkit:cli');
  *
  * @param promise The work to wait for.
  * @param ms The time limit in milliseconds. 0, a negative number or Infinity disables the limit.
+ * @param timers An optional set that holds the timer while it is pending.
+ * @param what What is timed, for the error message. Defaults to `'Turn'`.
  * @returns A promise that settles like `promise`, or rejects when the time is up.
  * @ignore
  */
-export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+export function withTimeout<T>(promise: Promise<T>, ms: number, timers?: Set<any>, what = 'Turn'): Promise<T> {
     if (!(ms > 0) || ms === Infinity) {
         return promise;
     }
     return new Promise<T>((resolve, reject) => {
         const timer = setTimeout(() => {
-            const err = new Error(`Turn timed out after ${ ms }ms`);
+            if (timers) {
+                timers.delete(timer);
+            }
+            const err = new Error(`${ what } timed out after ${ ms }ms`);
             err.name = 'TurnTimeoutError';
             reject(err);
         }, ms);
-        if (typeof timer.unref === 'function') {
-            timer.unref();
+        if (timers) {
+            timers.add(timer);
         }
-        promise.then((value) => {
+        const settle = (): void => {
             clearTimeout(timer);
+            if (timers) {
+                timers.delete(timer);
+            }
+        };
+        promise.then((value) => {
+            settle();
             resolve(value);
         }, (err) => {
-            clearTimeout(timer);
+            settle();
             reject(err);
         });
     });

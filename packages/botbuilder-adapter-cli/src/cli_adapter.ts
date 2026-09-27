@@ -76,6 +76,7 @@ export interface CliAdapterOptions {
 
     /**
      * Use ANSI colors. Defaults to true when the output is a TTY and the `NO_COLOR` environment variable is not set.
+     * Errors are colored when `errorOutput` is a TTY, unless this option is set.
      */
     color?: boolean;
 
@@ -97,8 +98,10 @@ export interface CliAdapterOptions {
     answers?: { [key: string]: string | string[] };
 
     /**
-     * Never wait for a person: when a question has no answer in `answers` (and no more input is queued), use its `channelData.default`
-     * or end the session with status `failed` and exit code 2. Turn errors also end the session. Defaults to false.
+     * Never wait for a person: when a question has no answer in `answers` and no more input is queued, use its `channelData.default`
+     * or end the session with status `failed` and exit code 2. Input that is not a TTY, such as a pipe or a file, is read to its end first,
+     * so piped lines can answer questions. A default is not used again for a question that the dialog asks again straight after it.
+     * Turn errors also end the session. Defaults to false.
      */
     nonInteractive?: boolean;
 
@@ -113,7 +116,7 @@ export interface CliAdapterOptions {
     maxDelay?: number;
 
     /**
-     * The longest a turn may take, in milliseconds, before it fails with a `TurnTimeoutError`. Defaults to 30000; 0 disables the limit.
+     * The longest a turn or a custom command may take, in milliseconds, before it fails with a `TurnTimeoutError`. Defaults to 30000; 0 disables the limit.
      */
     turnTimeout?: number;
 
@@ -129,8 +132,8 @@ export interface CliAdapterOptions {
     autoStart?: boolean;
 
     /**
-     * Call `controller.shutdown()` when the session ends (end of input, `/quit`, Ctrl+C, a finished run or a failure), so timers and plugins stop
-     * and the process can exit. Defaults to true.
+     * Call `controller.shutdown()` when the session ends (end of input, `/quit`, [close()](#close), Ctrl+C, a finished run or a failure),
+     * so timers and plugins stop and the process can exit. Defaults to true.
      */
     shutdownOnClose?: boolean;
 
@@ -145,8 +148,9 @@ export interface CliAdapterOptions {
     verbose?: boolean;
 
     /**
-     * Send `console.log`, `console.info`, `console.debug` and `console.dir` to `errorOutput` until the session closes,
-     * so they cannot corrupt the output. Defaults to true when `format` is `'json'` and the output is `process.stdout`.
+     * Send `console.log`, `console.info`, `console.debug` and `console.dir` to `errorOutput` from the moment the adapter is created
+     * until the session ends and Botkit has shut down, so they cannot corrupt the output.
+     * Defaults to true when `format` is `'json'` and the output is `process.stdout`.
      */
     redirectConsole?: boolean;
 }
@@ -176,8 +180,9 @@ export interface CliRunOptions {
  */
 export interface CliRunResult {
     /**
-     * How the run ended: `completed`, `canceled` or `timeout` (the dialog ended with that status), `eof` (the input ended),
-     * `quit` (`/quit`, `/exit` or `close()`), `interrupted` (Ctrl+C) or `failed` (an error, or a missing answer in non-interactive mode).
+     * How the run ended: `completed`, `canceled` or `timeout` (the dialog ended with that status, or `canceled` when it was removed without ending),
+     * `eof` (the input ended), `quit` (`/quit`, `/exit` or `close()`), `interrupted` (Ctrl+C)
+     * or `failed` (an error, or a missing answer in non-interactive mode).
      */
     status: CliRunStatus;
 
@@ -206,6 +211,8 @@ interface CliPrompt {
     text?: string;
     /** Identifies the pending question the prompt belongs to; null when none was pending, undefined when unknown. */
     question?: string | null;
+    /** Increases with every menu shown, to tell which of two menus came last. */
+    seq: number;
 }
 
 /**
@@ -237,6 +244,8 @@ interface CliQueueItem {
     line?: string;
     activity?: Partial<Activity>;
     source: 'input' | 'submit' | 'answer' | 'internal';
+    /** An automatic answer that uses the question's default. */
+    isDefault?: boolean;
     echo?: string;
     run?: CliActiveRun;
     resolve?: (lines: string[]) => void;
@@ -285,6 +294,37 @@ function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+type StreamErrorHandler = (err: any) => void;
+
+/**
+ * The sessions listening for errors on each stream. A stream gets one 'error' listener, shared by every adapter that uses it,
+ * so adapters do not pile up listeners on process.stdout, and an error after the session has closed cannot crash the process.
+ */
+const streamErrorHandlers = new WeakMap<object, Set<StreamErrorHandler>>();
+
+/**
+ * Call `handler` for errors on `stream` until the returned function is called.
+ */
+function onStreamError(stream: NodeJS.EventEmitter, handler: StreamErrorHandler): () => void {
+    let handlers = streamErrorHandlers.get(stream);
+    if (!handlers) {
+        const created = new Set<StreamErrorHandler>();
+        streamErrorHandlers.set(stream, created);
+        stream.on('error', (err: any) => {
+            if (!created.size) {
+                debug('Ignored an error on a stream that no CLI session uses any more:', errorMessage(err));
+            }
+            created.forEach((listener) => listener(err));
+        });
+        handlers = created;
+    }
+    const set = handlers;
+    set.add(handler);
+    return (): void => {
+        set.delete(handler);
+    };
+}
+
 /**
  * Connect [Botkit](https://www.npmjs.com/package/botkit) to the command line.
  * Every line typed (or piped) becomes a message that runs through the full Botkit pipeline: middleware, `hears()`, `interrupts()`,
@@ -324,16 +364,28 @@ export class CliAdapter extends BotAdapter {
     private queue: TurnQueue<CliQueueItem>;
     private started = false;
     private closed = false;
+    private inputEnded = false;
     private outputBroken = false;
+    private errorOutputBroken = false;
+    private errorColor: boolean;
     private shutdownRequested = false;
     private activeRun: CliActiveRun = null;
     private watchedDialogs: string[] = [];
     private answers: { [key: string]: string | string[] } = {};
     private prompts = new Map<string, CliPrompt>();
+    private promptSeq = 0;
+    /** `${ key }#${ questionId }` of questions answered with their default since the last answer that was not a default. */
+    private defaultsUsed = new Set<string>();
+    /** The last message text shown by a turn, used to describe a question with a missing answer. */
+    private lastAsked: { key: string; text: string };
     private lastSent: Partial<Activity>;
     private incomingCount = 0;
     private outgoingCount = 0;
+    /** Pending turn and command timers, unref'd when the session closes so they do not keep the process alive. */
+    private timers = new Set<any>();
+    private unsubscribers: (() => void)[] = [];
     private restoreConsole: () => void;
+    private restoreOnShutdown = false;
 
     /**
      * Create an adapter that reads messages from a stream (stdin by default) and writes the bot's replies to another (stdout by default).
@@ -381,17 +433,19 @@ export class CliAdapter extends BotAdapter {
             }
         });
         const pick = <T>(value: T, fallback: T): T => (value === undefined || value === null) ? fallback : value;
+        const errorOutput = options.errorOutput || process.stderr;
+        const noColor = !!process.env.NO_COLOR;
 
         this.options = {
             input: input,
             output: output,
-            errorOutput: options.errorOutput || process.stderr,
+            errorOutput: errorOutput,
             user: options.user || process.env.USER || process.env.USERNAME || 'user',
             conversation: options.conversation || newConversationId(),
             prompt: pick(options.prompt, 'you> '),
             botName: pick(options.botName, 'bot'),
             format: format,
-            color: pick(options.color, !!(output as any).isTTY && !process.env.NO_COLOR),
+            color: pick(options.color, !!(output as any).isTTY && !noColor),
             terminal: pick(options.terminal, !!((input as any).isTTY && (output as any).isTTY)),
             greeting: pick(options.greeting, true),
             answers: options.answers || {},
@@ -407,12 +461,14 @@ export class CliAdapter extends BotAdapter {
             redirectConsole: pick(options.redirectConsole, format === 'json' && output === process.stdout)
         };
 
+        // errors go to their own stream, so they are colored when that stream is a terminal
+        this.errorColor = pick(options.color, !!(errorOutput as any).isTTY && !noColor);
         this.user = this.options.user;
         this.conversationId = this.options.conversation;
         this.answers = this.copyAnswers();
         this.queue = new TurnQueue<CliQueueItem>((item) => this.processItem(item), () => this.promptIfIdle());
 
-        output.on('error', (err: any) => {
+        this.unsubscribers.push(onStreamError(output, (err: any) => {
             if (err && err.code === 'EPIPE') {
                 debug('Output closed (EPIPE), ending the session');
                 this.outputBroken = true;
@@ -420,8 +476,15 @@ export class CliAdapter extends BotAdapter {
             } else {
                 this.printError(`output stream: ${ errorMessage(err) }`);
             }
-        });
+        }));
+        this.unsubscribers.push(onStreamError(errorOutput, (err: any) => {
+            // there is nowhere left to report errors: stop writing them
+            debug('Error output failed, no longer writing errors:', errorMessage(err));
+            this.errorOutputBroken = true;
+        }));
 
+        // Redirect from the start, so that logs written while Botkit and its plugins boot cannot corrupt the output either.
+        // The session restores the console when it ends, including when Botkit shuts down before it started.
         if (this.options.redirectConsole) {
             this.redirectConsole();
         }
@@ -445,7 +508,10 @@ export class CliAdapter extends BotAdapter {
         });
 
         botkit.on('shutdown', async () => {
-            this.close();
+            // End the session without calling controller.shutdown() again. When start() has added a later shutdown handler
+            // that restores the console, the console stays redirected until the app's own shutdown handlers have run.
+            this.shutdownRequested = true;
+            this.closeSession(this.restoreOnShutdown);
         });
 
         if (this.options.autoStart) {
@@ -495,6 +561,16 @@ export class CliAdapter extends BotAdapter {
         this.rl.on('close', () => {
             this.onInputClosed().catch((err) => this.printError(err));
         });
+        // Node 16+ readline re-emits input errors; older versions leave them on the input stream
+        const onInputError = (err: any): void => {
+            if (!this.closed) {
+                this.printError(`input stream: ${ errorMessage(err) }`);
+                this.finish('failed', { exitCode: 1, error: err instanceof Error ? err : new Error(errorMessage(err)) });
+            }
+        };
+        this.rl.on('error', onInputError);
+        this.unsubscribers.push(onStreamError(this.options.input, onInputError));
+        this.restoreConsoleOnShutdown();
         if (terminal) {
             this.rl.on('SIGINT', () => {
                 if (this.options.format === 'text') {
@@ -521,7 +597,9 @@ export class CliAdapter extends BotAdapter {
      * which are also written to the output. Messages the bot sends outside the turn (proactive messages) are not included.
      * In JSON format, each line is a JSON string.
      *
-     * Do not await `submit()` inside a bot handler or a custom command: it waits for the queue, which is waiting for that handler.
+     * Do not await `submit()`, [run()](#run) or [idle()](#idle) inside a bot handler or a custom command: they wait for the queue,
+     * which is waiting for that handler, so the turn or command fails with a `TurnTimeoutError` after `turnTimeout`.
+     * To queue work that runs after the current turn, call them without `await`, and handle a rejection with `.catch()`.
      *
      * ```javascript
      * const lines = await adapter.submit('hello');
@@ -535,6 +613,7 @@ export class CliAdapter extends BotAdapter {
         if (this.closed) {
             return Promise.reject(new Error('The CLI session is closed'));
         }
+        this.restoreConsoleOnShutdown();
         return new Promise<string[]>((resolve, reject) => {
             this.queue.push({ line: String(line === undefined || line === null ? '' : line), source: 'submit', resolve: resolve, reject: reject });
         });
@@ -546,11 +625,14 @@ export class CliAdapter extends BotAdapter {
      * With a `dialog`, any dialog pending in the conversation is canceled and the dialog begins fresh with `vars`.
      * Its questions are answered by the person at the keyboard, by the `answers` option, or, when `nonInteractive` is set, by their defaults.
      * The run resolves when the dialog ends (`completed`, `canceled` or `timeout`), and then, unless `closeOnComplete` is false, the session ends too.
-     * It also resolves if the session ends first (`eof`, `quit`, `interrupted` or `failed`).
+     * A dialog that is removed without ending, for example by `bot.cancelAllDialogs()` in an interrupt, also counts as `canceled`.
+     * The run also resolves if the session ends first (`eof`, `quit`, `interrupted` or `failed`).
+     * `/as` and `/new` do not end the run: it waits until you switch back to its user and conversation.
      * The `answers` are reset at the start of each run with a dialog.
      *
      * Without a `dialog`, the promise resolves when the session ends. Starts the session if needed; the greeting is sent only without a dialog.
      * If your code awaits I/O before calling `run()`, create the adapter with `autoStart: false`, or the session may start (and greet) first.
+     * Do not await `run()` inside a bot handler or a custom command (see [submit()](#submit)).
      *
      * ```javascript
      * // An installer that also runs unattended in CI:
@@ -591,11 +673,12 @@ export class CliAdapter extends BotAdapter {
             if (dialog) {
                 this.watchDialog(dialog);
                 this.answers = this.copyAnswers();
-            }
-            if (!this.started) {
-                this.start({ greeting: !dialog && this.options.greeting });
-            }
-            if (dialog) {
+                if (this.started && this.canPrompt() && !this.queue.busy && this.queue.size === 0) {
+                    // the prompt is showing: the dialog's first question replaces it
+                    readline.clearLine(this.options.output, 0);
+                    readline.cursorTo(this.options.output, 0);
+                }
+                // queued before start(), so that start() does not draw a prompt in front of the first question
                 this.enqueue({
                     activity: {
                         type: ActivityTypes.Event,
@@ -607,11 +690,16 @@ export class CliAdapter extends BotAdapter {
                     run: run
                 });
             }
+            if (!this.started) {
+                this.start({ greeting: !dialog && this.options.greeting });
+            }
         });
     }
 
     /**
      * Wait until every queued line and turn, including answers that turns queue, has been processed.
+     * Lines written to the input stream are queued once the stream delivers them, which can take a tick.
+     * Do not await `idle()` inside a bot handler or a custom command (see [submit()](#submit)).
      *
      * ```javascript
      * input.write('hello\n');
@@ -625,8 +713,10 @@ export class CliAdapter extends BotAdapter {
     }
 
     /**
-     * End the session: stop reading input, drop queued lines (their `submit()` promises reject), restore the console,
-     * and resolve an active [run()](#run) with status `quit`. It does not call `controller.shutdown()`; Botkit calls this method on shutdown.
+     * End the session from code, as `/quit` does: stop reading input, drop queued lines (their `submit()` promises reject),
+     * resolve an active [run()](#run) with status `quit`, and, unless `shutdownOnClose` is false, call `controller.shutdown()`
+     * so that plugins and timers stop and the process can exit. The console is restored once the session and the shutdown are over.
+     * The session also ends, without calling `controller.shutdown()` again, when Botkit shuts down.
      *
      * ```javascript
      * controller.hears('bye', 'message', async (bot, message) => {
@@ -636,25 +726,7 @@ export class CliAdapter extends BotAdapter {
      * ```
      */
     public close(): void {
-        if (this.closed) {
-            return;
-        }
-        this.closed = true;
-
-        const dropped = this.queue.clear();
-        dropped.forEach((item) => {
-            if (item.reject) {
-                item.reject(new Error('The CLI session is closed'));
-            }
-        });
-        if (this.rl) {
-            this.rl.close();
-        }
-        if (this.restoreConsole) {
-            this.restoreConsole();
-            this.restoreConsole = null;
-        }
-        this.settleRun('quit');
+        this.finish('quit');
     }
 
     /**
@@ -760,8 +832,14 @@ export class CliAdapter extends BotAdapter {
             true
         );
         const context = new TurnContext(this, request);
+        // A queued turn running at the same time may not have saved its state yet, so only a turn on its own can tell that the run's dialog is gone.
+        // The logic need not save state, so read what was saved with a new context.
+        const alone = !this.queue.busy;
         try {
             await this.runMiddleware(context, logic);
+            if (alone && !this.queue.busy) {
+                await this.checkRunDialog(new TurnContext(this, context.activity)).catch((err) => debug('Could not check the dialog of the run:', err));
+            }
         } finally {
             this.settleCompletedRun();
         }
@@ -796,11 +874,19 @@ export class CliAdapter extends BotAdapter {
     }
 
     private async processItem(item: CliQueueItem): Promise<void> {
+        if (item.source === 'answer') {
+            // Automatic answers can follow each other without ever waiting for I/O: let timers, signals and input run in between.
+            await new Promise((resolve) => setImmediate(resolve));
+        }
         if (this.closed) {
             if (item.reject) {
                 item.reject(new Error('The CLI session is closed'));
             }
             return;
+        }
+        if (!item.isDefault) {
+            // a real answer (or any other input) makes progress, so defaults may be used again
+            this.defaultsUsed.clear();
         }
         const sink: string[] = [];
         try {
@@ -845,10 +931,14 @@ export class CliAdapter extends BotAdapter {
         const context = new TurnContext(this, activity);
         const collector: CliTurnCollector = { lines: sink, done: false };
         context.turnState.set(TURN_STATE_KEY, collector);
+        const startSeq = this.promptSeq;
         try {
-            await withTimeout(this.runMiddleware(context, controller.handleTurn.bind(controller)), this.options.turnTimeout);
+            await withTimeout(this.runMiddleware(context, controller.handleTurn.bind(controller)), this.options.turnTimeout, this.timers);
         } finally {
             collector.done = true;
+        }
+        if (collector.lastText) {
+            this.lastAsked = { key: key, text: collector.lastText };
         }
 
         let question: BotkitPendingQuestion | null;
@@ -861,15 +951,19 @@ export class CliAdapter extends BotAdapter {
             return question;
         };
 
-        if (collector.prompt) {
+        // a menu sent proactively while this turn ran (by a timer or a scheduler) is on screen after anything the turn printed before it
+        const current = this.prompts.get(key);
+        const proactive = !!current && current.seq > startSeq;
+        if (collector.prompt && !(proactive && current.seq > collector.prompt.seq)) {
             this.prompts.set(key, { ...collector.prompt, question: questionId(await getQuestion()) });
-        } else if (this.prompts.has(key)) {
-            const current = this.prompts.get(key);
+        } else if (current && !proactive) {
             const pending = await getQuestion();
             if (!pending || (current.question !== undefined && current.question !== questionId(pending))) {
                 this.prompts.delete(key);
             }
         }
+
+        await this.checkRunDialog(context);
 
         const unattended = this.options.nonInteractive || Object.keys(this.options.answers).length > 0;
         if (unattended && !this.closed && !(this.activeRun && this.activeRun.outcome)) {
@@ -888,8 +982,10 @@ export class CliAdapter extends BotAdapter {
         const hasDefault = !!prompt && prompt.default !== undefined;
         const text = this.options.format === 'text';
         const answer = this.takeAnswer(question.key);
+        const asked = `${ key }#${ questionId(question) }`;
         const useDefault = (): void => {
-            this.queue.unshift({ line: prompt.default, source: 'answer', echo: text ? `${ this.options.prompt }${ prompt.default } (default)` : undefined });
+            this.defaultsUsed.add(asked);
+            this.queue.unshift({ line: prompt.default, source: 'answer', isDefault: true, echo: text ? `${ this.options.prompt }${ prompt.default } (default)` : undefined });
         };
 
         if (answer !== undefined && answer.trim() !== '') {
@@ -901,18 +997,29 @@ export class CliAdapter extends BotAdapter {
             useDefault();
             return;
         }
-        if (!this.options.nonInteractive || this.queue.size > 0) {
-            // wait for a person, or for input that is already queued
+        if (!this.options.nonInteractive || this.queue.size > 0 || this.inputMayFollow()) {
+            // Wait for a person, for input that is already queued, or for piped input that has not arrived yet.
+            // The question is looked at again after the next turn, or when the input ends.
             return;
         }
-        if (hasDefault) {
+        // Using the same default again, with only defaults in between, would repeat what the dialog has already rejected.
+        const rejected = this.defaultsUsed.has(asked);
+        if (hasDefault && !rejected) {
             useDefault();
             return;
         }
         const label = question.key || '(unnamed question)';
-        const asked = (prompt && prompt.text) || lastText;
-        this.printError(`Missing answer for "${ label }"` + (asked ? `: ${ asked }` : ''));
+        const shown = (prompt && prompt.text) || lastText;
+        const note = rejected && hasDefault ? ` (the default, ${ prompt.default }, was not accepted)` : '';
+        this.printError(`Missing answer for "${ label }"${ note }` + (shown ? `: ${ shown }` : ''));
         this.finish('failed', { exitCode: 2, vars: question.vars });
+    }
+
+    /**
+     * True while more lines may still arrive from input that is not a person at a terminal, such as a pipe or a file.
+     */
+    private inputMayFollow(): boolean {
+        return !!this.rl && !this.inputEnded && !(this.options.input as any).isTTY;
     }
 
     private takeAnswer(key: string): string | undefined {
@@ -995,7 +1102,8 @@ export class CliAdapter extends BotAdapter {
     }
 
     /**
-     * Find the choice a line selects: by value (automatic answers only), by number, or by title, ignoring case.
+     * Find the choice a line selects: by value (automatic answers only), by title, ignoring case, or by number.
+     * The title comes before the number, so that typing a title shown in the menu, such as `2` in `[1] 2  [2] 4`, picks that choice.
      */
     private matchChoice(text: string, prompt: CliPrompt, byValue: boolean): number {
         if (!prompt || !prompt.choices.length) {
@@ -1008,14 +1116,18 @@ export class CliAdapter extends BotAdapter {
                 return index;
             }
         }
+        const lower = text.toLowerCase();
+        const titled = choices.findIndex((choice) => choice.title.toLowerCase() === lower);
+        if (titled >= 0) {
+            return titled;
+        }
         if (/^[0-9]+$/.test(text)) {
             const n = parseInt(text, 10);
             if (n >= 1 && n <= choices.length) {
                 return n - 1;
             }
         }
-        const lower = text.toLowerCase();
-        return choices.findIndex((choice) => choice.title.toLowerCase() === lower);
+        return -1;
     }
 
     private choiceActivity(choice: CliChoice, index: number): Partial<Activity> {
@@ -1102,6 +1214,25 @@ export class CliAdapter extends BotAdapter {
         });
     }
 
+    /**
+     * After a turn for the run's user and conversation: if the run's dialog left the stack without ending
+     * (`bot.cancelAllDialogs()`, or `replaceDialog()` with another dialog), afterDialog never fires, so record the run as canceled.
+     */
+    private async checkRunDialog(context: TurnContext): Promise<void> {
+        const run = this.activeRun;
+        const activity = context.activity;
+        if (!run || !run.dialog || run.outcome || !run.address || `${ activity.conversation?.id }|${ activity.from?.id }` !== run.address) {
+            return;
+        }
+        const dialogContext = await this.requireController().dialogSet.createContext(context);
+        const wrapper = `${ run.dialog }:botkit-wrapper`;
+        const active = dialogContext.stack.some((frame) => frame.id === run.dialog || frame.id === wrapper);
+        if (!active && run === this.activeRun && !run.outcome) {
+            debug(`Dialog "${ run.dialog }" left the stack without ending: the run is canceled`);
+            run.outcome = { status: 'canceled', vars: undefined };
+        }
+    }
+
     private settleCompletedRun(): void {
         const run = this.activeRun;
         if (!run || !run.outcome) {
@@ -1156,6 +1287,7 @@ export class CliAdapter extends BotAdapter {
     }
 
     private async onInputClosed(): Promise<void> {
+        this.inputEnded = true;
         if (this.closed) {
             return;
         }
@@ -1164,6 +1296,15 @@ export class CliAdapter extends BotAdapter {
             this.write('\n');
         }
         await this.queue.idle();
+        if (this.options.nonInteractive && this.controller && !this.closed) {
+            // every piped line has been used: a question still waiting gets its default, or the run fails
+            const key = this.promptKey();
+            const question = await this.getPendingQuestion(this.probeContext());
+            if (!this.closed && !(this.activeRun && this.activeRun.outcome)) {
+                this.autoAnswer(key, question, this.lastAsked && this.lastAsked.key === key ? this.lastAsked.text : undefined);
+                await this.queue.idle();
+            }
+        }
         this.finish('eof');
     }
 
@@ -1180,17 +1321,55 @@ export class CliAdapter extends BotAdapter {
 
     /**
      * End the session: resolve the active run, close, and shut Botkit down once if shutdownOnClose is set.
+     * The console stays redirected until the shutdown has finished, so shutdown handlers cannot write into the output either.
      */
     private finish(status: CliRunStatus, extra: { exitCode?: number; error?: Error; vars?: any } = {}): void {
         if (this.closed) {
             return;
         }
         this.settleRun(status, extra);
-        this.close();
-        if (this.options.shutdownOnClose && this.controller && !this.shutdownRequested) {
+        const shutdown = this.options.shutdownOnClose && !!this.controller && !this.shutdownRequested;
+        this.closeSession(shutdown);
+        if (shutdown) {
             this.shutdownRequested = true;
-            this.controller.shutdown().catch((err) => this.printError(err));
+            this.controller.shutdown()
+                .catch((err) => this.printError(err))
+                .then(() => this.releaseConsole());
         }
+    }
+
+    /**
+     * Stop reading input, drop queued lines, let pending timers go, and resolve an active run with 'quit'.
+     * Never calls controller.shutdown(): the shutdown handler calls this.
+     * @param keepConsole Leave the console redirected, because a shutdown is under way that restores it when it is done.
+     */
+    private closeSession(keepConsole: boolean): void {
+        if (this.closed) {
+            return;
+        }
+        this.closed = true;
+
+        const dropped = this.queue.clear();
+        dropped.forEach((item) => {
+            if (item.reject) {
+                item.reject(new Error('The CLI session is closed'));
+            }
+        });
+        if (this.rl) {
+            this.rl.close();
+        }
+        // a turn that never settles must not keep the process alive once the session is over
+        this.timers.forEach((timer) => {
+            if (typeof timer.unref === 'function') {
+                timer.unref();
+            }
+        });
+        this.unsubscribers.forEach((unsubscribe) => unsubscribe());
+        this.unsubscribers = [];
+        if (!keepConsole) {
+            this.releaseConsole();
+        }
+        this.settleRun('quit');
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -1213,7 +1392,9 @@ export class CliAdapter extends BotAdapter {
         if (hasOwn(this.options.commands, name)) {
             const command = this.options.commands[name];
             const run = typeof command === 'function' ? command : command.run;
-            const result = await run(args, this);
+            // Commands run in the queue like turns, so they get the same time limit:
+            // a command that awaits submit(), run() or idle() would otherwise block the session for good.
+            const result = await withTimeout(Promise.resolve().then(() => run(args, this)), this.options.turnTimeout, this.timers, `Command /${ name }`);
             let lines: string[] = [];
             if (typeof result === 'string') {
                 lines = result.split(/\r?\n/);
@@ -1379,7 +1560,7 @@ export class CliAdapter extends BotAdapter {
         const isMessage = (activity.type || ActivityTypes.Message) === ActivityTypes.Message;
         const text = isMessage && activity.text ? this.decode(activity.text) : undefined;
         const prompt: CliPrompt = (isMessage && (rendered.choices.length || rendered.defaultValue !== undefined))
-            ? { choices: rendered.choices, default: rendered.defaultValue, text: text }
+            ? { choices: rendered.choices, default: rendered.defaultValue, text: text, seq: ++this.promptSeq }
             : undefined;
 
         const collector: CliTurnCollector = context.turnState.get(TURN_STATE_KEY);
@@ -1415,7 +1596,7 @@ export class CliAdapter extends BotAdapter {
         if (!lines.length) {
             return;
         }
-        const redraw = this.rl && !this.closed && this.options.terminal && this.options.format === 'text';
+        const redraw = this.canPrompt();
         if (redraw) {
             readline.clearLine(this.options.output, 0);
             readline.cursorTo(this.options.output, 0);
@@ -1462,8 +1643,12 @@ export class CliAdapter extends BotAdapter {
         if (this.options.verbose && err && err.stack) {
             text = text + '\n' + err.stack;
         }
+        if (this.errorOutputBroken) {
+            debug(text);
+            return;
+        }
         try {
-            this.options.errorOutput.write(this.paint(RED, text) + '\n');
+            this.options.errorOutput.write((this.errorColor ? RED + text + RESET : text) + '\n');
         } catch (writeError) {
             debug('Could not write to errorOutput', writeError);
         }
@@ -1477,9 +1662,16 @@ export class CliAdapter extends BotAdapter {
     }
 
     private promptIfIdle(): void {
-        if (this.rl && !this.closed && this.options.terminal && this.options.format === 'text' && !this.queue.busy && this.queue.size === 0) {
+        if (this.canPrompt() && !this.queue.busy && this.queue.size === 0) {
             this.rl.prompt();
         }
+    }
+
+    /**
+     * True while a person can type into the prompt: terminal text mode, until the session closes or the input ends (Ctrl+D).
+     */
+    private canPrompt(): boolean {
+        return !!this.rl && !this.closed && !this.inputEnded && this.options.terminal && this.options.format === 'text';
     }
 
     private botPrefix(): string {
@@ -1502,11 +1694,16 @@ export class CliAdapter extends BotAdapter {
     private redirectConsole(): void {
         const target = this.options.errorOutput;
         const original = { log: console.log, info: console.info, debug: console.debug, dir: console.dir };
+        const send = (text: string): void => {
+            if (!this.errorOutputBroken) {
+                target.write(text + '\n');
+            }
+        };
         const write = (...args: any[]): void => {
-            target.write((args.length ? util.format(args[0], ...args.slice(1)) : '') + '\n');
+            send(args.length ? util.format(args[0], ...args.slice(1)) : '');
         };
         const dir = (obj: any, options?: util.InspectOptions): void => {
-            target.write(util.inspect(obj, options) + '\n');
+            send(util.inspect(obj, options));
         };
         console.log = write;
         console.info = write;
@@ -1527,5 +1724,25 @@ export class CliAdapter extends BotAdapter {
                 console.dir = original.dir;
             }
         };
+    }
+
+    private releaseConsole(): void {
+        if (this.restoreConsole) {
+            this.restoreConsole();
+            this.restoreConsole = null;
+        }
+    }
+
+    /**
+     * When the console is redirected, add a shutdown handler that restores it. Added when the session starts,
+     * after the app has registered its own shutdown handlers, so that it runs after them and they cannot write into the output.
+     */
+    private restoreConsoleOnShutdown(): void {
+        if (this.restoreConsole && this.controller && !this.restoreOnShutdown && !this.closed) {
+            this.restoreOnShutdown = true;
+            this.controller.on('shutdown', async () => {
+                this.releaseConsole();
+            });
+        }
     }
 }

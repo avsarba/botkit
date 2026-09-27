@@ -29,7 +29,8 @@ const { CliAdapter } = require('botbuilder-adapter-cli');
 
 CliAdapter works with Botkit only. Pass it to the Botkit constructor with `disable_webserver: true`, since a terminal app needs no webserver,
 and `disable_console: true`, so Botkit's startup messages do not appear in the conversation.
-By default the adapter reads `process.stdin` as soon as Botkit is ready, and it shuts Botkit down when the input ends or the user types `/quit`, so the process exits by itself.
+By default the adapter reads `process.stdin` as soon as Botkit is ready, and it shuts Botkit down when the input ends, the user types `/quit` or your code calls `adapter.close()`,
+so the process exits by itself.
 
 [A full description of the CliAdapter options and example code can be found in the class reference docs.](../reference/cli.md#create-a-new-cliadapter)
 
@@ -64,6 +65,7 @@ you> 2
 ```
 
 Typing `2` (or `production`, ignoring case) sends the choice's value, `production`, as the message text, so dialogs and `hears()` patterns work unchanged.
+A line that is a choice's title picks that choice even when the title is a number: in `[1] 2  [2] 4  [3] 8`, typing `2` picks `2` and typing `3` picks `8`.
 
 ### A wizard with run()
 
@@ -109,9 +111,11 @@ The same wizard runs without a person when you pass `answers`, keyed by each que
 A string answers once; an array answers the same question several times, in order (for example when a validation handler calls `convo.repeat()`).
 An answer may be a choice's value, its title or its number, and an empty string asks for the question's default.
 
-With `nonInteractive: true`, a question that has no answer (and no more queued input) uses its default, or the run fails with exit code 2 and
-`error: Missing answer for "<key>": <question>` on stderr. Because a string answer is used only once, a bad answer in a validation loop ends the run instead of looping forever.
-Turn errors also end a non-interactive session with status `failed`.
+With `nonInteractive: true`, a question that has no answer (and no more input) uses its default, or the run fails with exit code 2 and
+`error: Missing answer for "<key>": <question>` on stderr. Input that is not a terminal, such as a pipe or a file, is read to its end first,
+and its lines answer the questions that `answers` does not: with an empty answers file, `printf 'sqlite\nhunter2222\n' | node install.js` completes the wizard above.
+Because a string answer is used only once, and a default is not used again when the dialog asks the same question straight back, a bad answer in a validation loop
+ends the run instead of looping forever. Turn errors also end a non-interactive session with status `failed`.
 
 ```javascript
 const adapter = new CliAdapter({
@@ -135,7 +139,7 @@ $ echo $?
 | Status | Meaning | exitCode
 |--- |--- |---
 | completed | The dialog finished | 0
-| canceled | The dialog stopped (`addAction('stop')`) | 1
+| canceled | The dialog stopped (`addAction('stop')`), or was canceled without ending (`bot.cancelAllDialogs()`) | 1
 | timeout | The dialog timed out (`addAction('timeout')`) | 1
 | eof | The input ended | 0, or 1 if the requested dialog had not finished
 | quit | `/quit`, `/exit` or `adapter.close()` | 0, or 1 if the requested dialog had not finished
@@ -155,7 +159,8 @@ $ echo "deploy" | node bot.js --json
 
 Each object has `type`, `text`, `choices`, `attachments` (`[{ contentType, name, url, content }]`), `data` (other `channelData` fields),
 `name` and `value` (events only), `to` and `conversation`; fields without a value are left out. Command output is written as `{"type":"cli","command":"<name>","lines":[...]}`,
-and errors still go to stderr as plain text. When the output is `process.stdout`, `console.log()` and friends are sent to stderr so they cannot corrupt the stream.
+and errors still go to stderr as plain text. When the output is `process.stdout`, `console.log()` and friends are sent to stderr from the moment the adapter is created
+until Botkit has shut down, so they cannot corrupt the stream, not even from `controller.on('shutdown')` handlers.
 
 ### Testing with submit()
 
@@ -169,6 +174,9 @@ controller.hears('hello', 'message', async (bot, message) => { await bot.reply(m
 
 assert.deepStrictEqual(await adapter.submit('hello'), ['bot> Hi Ann!']);
 ```
+
+Do not await `submit()`, `run()` or `idle()` inside a bot handler or a custom command: they wait for the input queue, which is waiting for that handler,
+so the turn or command fails with a `TurnTimeoutError` after `turnTimeout`. To queue a line that runs after the current turn, call `bot.cli.submit(line).catch(console.error)` without `await`.
 
 ### Commands
 
@@ -196,6 +204,7 @@ const adapter = new CliAdapter({
 ```
 
 A `/word` that is not a command is sent to the bot as text. In terminal mode, Tab completes command names.
+Commands run in the input queue like turns, with the same `turnTimeout`. To start a dialog from a command, queue a line without awaiting it, such as `cli.submit('setup').catch(console.error)` for a `hears('setup')` trigger.
 
 ### How messages are shown
 
@@ -221,20 +230,20 @@ A `/word` that is not a command is sent to the bot as text. In terminal mode, Ta
 | prompt | `'you> '` | The prompt, also used to echo input
 | botName | `'bot'` | The name in front of bot messages
 | format | `'text'` | `'text'` or `'json'`
-| color | output is a TTY and `NO_COLOR` is not set | ANSI colors
+| color | output is a TTY and `NO_COLOR` is not set | ANSI colors. Unless it is set, errors are colored when `errorOutput` is a TTY
 | terminal | input and output are TTYs | Readline terminal mode: prompt, line editing, history, Tab completion of commands and Ctrl+C. When false, each line read is echoed as `you> <line>`
 | greeting | `true` | Send `conversationUpdate` with `membersAdded: [{ id: user }]` when the session starts (not for `run({ dialog })`)
 | answers | `{}` | Answers for dialog questions, keyed by question key
-| nonInteractive | `false` | Never wait for a person: use defaults or fail
+| nonInteractive | `false` | Never wait for a person: use defaults or fail. Piped input is read to its end first
 | honorDelays | output is a TTY | Pause for `delay` activities
 | maxDelay | `3000` | Longest pause in milliseconds
-| turnTimeout | `30000` | Longest turn in milliseconds before it fails with `TurnTimeoutError`; 0 disables it
+| turnTimeout | `30000` | Longest turn or custom command in milliseconds before it fails with `TurnTimeoutError`; 0 disables it
 | commands | `{}` | Custom slash-commands
 | autoStart | `true` | Start reading input when Botkit is ready
-| shutdownOnClose | `true` | Call `controller.shutdown()` when the session ends
+| shutdownOnClose | `true` | Call `controller.shutdown()` when the session ends, including by `adapter.close()`
 | unescapeHtml | `true` | Decode the HTML entities mustache adds
 | verbose | `false` | Show extra `channelData` as `data: <json>`, and error stacks
-| redirectConsole | `format` is `'json'` and output is `process.stdout` | Send `console.log`, `info`, `debug` and `dir` to `errorOutput` until the session closes
+| redirectConsole | `format` is `'json'` and output is `process.stdout` | Send `console.log`, `info`, `debug` and `dir` to `errorOutput` from the start until the session ends and Botkit has shut down
 
 ### Things to know
 
@@ -243,9 +252,14 @@ A `/word` that is not a command is sent to the bot as text. In terminal mode, Ta
   or send them to another conversation.
 * **Turns run one at a time.** Lines are queued and processed strictly in order, so piped input never produces overlapping turns.
   Turns started by `adapter.continueConversation()` (for example by a scheduler) are not queued and run immediately.
-* **Turns time out.** A turn that takes longer than `turnTimeout` fails with a `TurnTimeoutError`, and the next line is processed. The slow handler keeps running in the background.
+* **Turns time out.** A turn or custom command that takes longer than `turnTimeout` fails with a `TurnTimeoutError`, and the next line is processed.
+  The slow handler keeps running in the background. While a turn runs, its timer keeps the process alive, so a handler that never finishes ends in an error instead of a silent exit.
 * **Errors do not end an interactive session.** A failing handler prints `error: <message>` and the session carries on. In non-interactive mode or during `run({ dialog })`, the run ends with status `failed`.
 * **Proactive messages** from `bot.startConversationWithUser()` or `bot.changeContext(adapter.getReference())` are printed straight away; in terminal mode the prompt and any half-typed line are redrawn below them.
+  A menu sent this way is the one that numbers and titles pick from, even when it arrives while a turn is running.
+* **`/as` and `/new` during a run.** A `run({ dialog })` keeps waiting for its own user and conversation; switch back to them to carry on.
+* **Broken streams.** When stdout is closed (for example by `| head`), the session ends quietly with status `eof`. When stderr is closed, errors are no longer written.
+  An error reading the input ends the session with status `failed`.
 
 ## Class Reference
 
@@ -292,7 +306,7 @@ await bot.say('The nightly build finished.');
 
 ### [bot.cli](../reference/cli.md#CliBotWorker)
 
-The CliAdapter, to read `bot.cli.user` and `bot.cli.conversationId`.
+The CliAdapter, to read `bot.cli.user` and `bot.cli.conversationId`, or to end the session with `bot.cli.close()`.
 
 ## Community & Support
 

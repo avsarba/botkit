@@ -1,6 +1,7 @@
 const assert = require('assert');
 const { spawn } = require('child_process');
 const path = require('path');
+const { PassThrough } = require('stream');
 const { BotkitConversation } = require('botkit');
 const { setup, lines, tick } = require('./shared');
 
@@ -119,8 +120,19 @@ describe('CliAdapter unattended runs', function() {
         assert.strictEqual(result.vars.n, '2');
     });
 
+    it('should prefer a choice title over a choice number', async function() {
+        init({ answers: { n: '2' } });
+        const pick = new BotkitConversation('pick', controller);
+        pick.ask({ text: ['Replicas?'], quick_replies: [{ title: '2', payload: 'two' }, { title: '4', payload: 'four' }] }, [], 'n');
+        controller.addDialog(pick);
+        const result = await adapter.run({ dialog: 'pick' });
+        assert.strictEqual(result.vars.n, 'two');
+    });
+
     it('should fail with exit code 2 when an answer is missing in non-interactive mode', async function() {
         init({ answers: { db: 'sqlite' }, nonInteractive: true });
+        // no more input will come, as with `< /dev/null`
+        env.input.end();
         addSetup(controller);
         const result = await adapter.run({ dialog: 'setup' });
         assert.strictEqual(result.status, 'failed');
@@ -144,6 +156,7 @@ describe('CliAdapter unattended runs', function() {
 
     it('should use a string answer only once, so a validation loop cannot spin forever', async function() {
         init({ answers: { db: 'sqlite', password: 'short' }, nonInteractive: true });
+        env.input.end();
         addSetup(controller);
         const result = await adapter.run({ dialog: 'setup' });
         assert.strictEqual(result.status, 'failed');
@@ -154,6 +167,7 @@ describe('CliAdapter unattended runs', function() {
 
     it('should use the default for an unanswered question in non-interactive mode', async function() {
         init({ answers: { password: 'hunter2222' }, nonInteractive: true });
+        env.input.end();
         addSetup(controller, { defaultDb: 'sqlite' });
         const result = await adapter.run({ dialog: 'setup' });
         assert.strictEqual(result.status, 'completed');
@@ -172,6 +186,7 @@ describe('CliAdapter unattended runs', function() {
 
     it('should treat an empty answer without a default as missing', async function() {
         init({ answers: { db: '  ' }, nonInteractive: true });
+        env.input.end();
         addSetup(controller);
         const result = await adapter.run({ dialog: 'setup' });
         assert.deepStrictEqual({ status: result.status, exitCode: result.exitCode }, { status: 'failed', exitCode: 2 });
@@ -226,6 +241,180 @@ describe('CliAdapter unattended runs', function() {
         assert.deepStrictEqual(await run, { status: 'eof', exitCode: 0 });
         assert.strictEqual(results.db, 'sqlite');
         assert.strictEqual(env.err(), '');
+    });
+
+    it('should wait for piped input that has not arrived yet in non-interactive mode', async function() {
+        init({ nonInteractive: true });
+        addSetup(controller);
+        const run = adapter.run({ dialog: 'setup' });
+        await adapter.idle();
+        await tick();
+        // the input is still open, so the first question waits for it instead of failing
+        assert.strictEqual(env.err(), '');
+        env.input.write('2\n');
+        await tick();
+        await adapter.idle();
+        env.input.write('hunter2222\n');
+        const result = await run;
+        assert.strictEqual(result.status, 'completed');
+        assert.strictEqual(result.vars.db, 'sqlite');
+        assert.strictEqual(result.vars.password, 'hunter2222');
+        assert.strictEqual(env.err(), '');
+    });
+
+    it('should not wait for a person at a terminal in non-interactive mode', async function() {
+        const input = new PassThrough();
+        input.isTTY = true;
+        init({ input, answers: { db: 'sqlite' }, nonInteractive: true });
+        addSetup(controller);
+        const result = await adapter.run({ dialog: 'setup' });
+        assert.deepStrictEqual({ status: result.status, exitCode: result.exitCode }, { status: 'failed', exitCode: 2 });
+        assert.ok(env.err().includes('Missing answer for "password"'));
+    });
+
+    it('should decide about a question still waiting when the input ends in non-interactive mode', async function() {
+        init({ nonInteractive: true });
+        addSetup(controller, { defaultDb: 'postgres' });
+        const run = adapter.run({ dialog: 'setup' });
+        await adapter.idle();
+        env.input.write('/state\n');
+        env.input.end();
+        const result = await run;
+        assert.deepStrictEqual({ status: result.status, exitCode: result.exitCode }, { status: 'failed', exitCode: 2 });
+        assert.strictEqual(result.vars.db, 'postgres');
+        assert.ok(env.out().includes('you> postgres (default)\n'));
+        assert.strictEqual(env.err(), 'error: Missing answer for "password": Admin password (8+ chars)?\n');
+    });
+
+    it('should not use a default again for a question the dialog asks again', async function() {
+        const addPort = () => {
+            const dialog = new BotkitConversation('port', controller);
+            dialog.ask({ text: ['Port?'], channelData: { default: '80' } }, async (answer, convo, bot) => {
+                if (Number(answer) < 1024) {
+                    await bot.say('Pick a port >= 1024.');
+                    await convo.repeat();
+                }
+            }, 'port');
+            controller.addDialog(dialog);
+        };
+        init({ nonInteractive: true });
+        env.input.end();
+        addPort();
+        let result = await adapter.run({ dialog: 'port' });
+        assert.deepStrictEqual({ status: result.status, exitCode: result.exitCode }, { status: 'failed', exitCode: 2 });
+        assert.strictEqual(count(env.out(), 'you> 80 (default)'), 1);
+        assert.strictEqual(count(env.out(), 'Pick a port >= 1024.'), 1);
+        assert.strictEqual(env.err(), 'error: Missing answer for "port" (the default, 80, was not accepted): Port?\n');
+        await controller.shutdown();
+
+        // an empty answer asks for the default once
+        init({ nonInteractive: true, answers: { port: '' } });
+        env.input.end();
+        addPort();
+        result = await adapter.run({ dialog: 'port' });
+        assert.strictEqual(result.exitCode, 2);
+        assert.strictEqual(count(env.out(), 'Pick a port >= 1024.'), 1);
+        await controller.shutdown();
+
+        // after a real answer, the default may be tried again
+        init({ nonInteractive: true, answers: { port: ['22'] } });
+        env.input.end();
+        const dialog = new BotkitConversation('port', controller);
+        dialog.ask({ text: ['Port?'], channelData: { default: '8080' } }, async (answer, convo) => {
+            if (Number(answer) < 1024) {
+                await convo.repeat();
+            }
+        }, 'port');
+        controller.addDialog(dialog);
+        result = await adapter.run({ dialog: 'port' });
+        assert.strictEqual(result.status, 'completed');
+        assert.strictEqual(result.vars.port, '8080');
+    });
+
+    it('should not cycle between questions that only get their defaults', async function() {
+        init({ nonInteractive: true });
+        env.input.end();
+        const dialog = new BotkitConversation('cycle', controller);
+        dialog.ask({ text: ['Name?'], channelData: { default: 'x' } }, async (answer, convo) => {
+            await convo.gotoThread('more');
+        }, 'name');
+        dialog.addQuestion({ text: ['Add another?'], channelData: { default: 'yes' } }, async (answer, convo) => {
+            if (answer === 'yes') {
+                await convo.gotoThread('default');
+            }
+        }, 'more', 'more');
+        controller.addDialog(dialog);
+        const result = await adapter.run({ dialog: 'cycle' });
+        assert.deepStrictEqual({ status: result.status, exitCode: result.exitCode }, { status: 'failed', exitCode: 2 });
+        assert.strictEqual(count(env.out(), 'you> x (default)'), 1);
+        assert.strictEqual(count(env.out(), 'you> yes (default)'), 1);
+        assert.ok(env.err().startsWith('error: Missing answer for "name" (the default, x, was not accepted)'), env.err());
+    });
+
+    it('should let timers run between automatic answers', async function() {
+        const answers = [];
+        for (let a = 0; a < 20; a++) {
+            answers.push('no');
+        }
+        answers.push('yes');
+        init({ answers: { done: answers } });
+        const dialog = new BotkitConversation('loop', controller);
+        dialog.ask('Done?', async (answer, convo) => {
+            if (answer !== 'yes') {
+                await convo.repeat();
+            }
+        }, 'done');
+        controller.addDialog(dialog);
+        let fired = false;
+        let firedBeforeEnd;
+        controller.afterDialog('loop', async () => {
+            firedBeforeEnd = fired;
+        });
+        setTimeout(() => {
+            fired = true;
+        }, 0);
+        // make sure the timer is due before the run starts
+        const until = Date.now() + 5;
+        while (Date.now() < until) {
+            // busy wait
+        }
+        const result = await adapter.run({ dialog: 'loop' });
+        assert.strictEqual(result.status, 'completed');
+        assert.strictEqual(firedBeforeEnd, true);
+    });
+
+    it('should end a run as canceled when its dialog is canceled without ending', async function() {
+        init();
+        addSetup(controller);
+        controller.interrupts('cancel', 'message', async (bot, message) => {
+            await bot.cancelAllDialogs();
+            await bot.reply(message, 'Canceled.');
+        });
+        const run = adapter.run({ dialog: 'setup' });
+        await adapter.idle();
+        assert.deepStrictEqual(await adapter.submit('cancel'), ['bot> Canceled.']);
+        assert.deepStrictEqual(await run, { status: 'canceled', exitCode: 1 });
+        await tick();
+        assert.strictEqual(shutdowns, 1);
+    });
+
+    it('should end a run as canceled when a proactive turn cancels its dialog', async function() {
+        init();
+        addSetup(controller);
+        controller.interrupts(async () => true, 'expire', async (bot) => {
+            await bot.cancelAllDialogs();
+            await bot.say('Session expired.');
+        });
+        const run = adapter.run({ dialog: 'setup', closeOnComplete: false });
+        await adapter.idle();
+        // a timer or a scheduled job
+        await adapter.continueConversation(adapter.getReference(), async (context) => {
+            context.activity.channelData = { botkitEventType: 'expire' };
+            await controller.handleTurn(context);
+        });
+        assert.deepStrictEqual(await run, { status: 'canceled', exitCode: 1 });
+        assert.ok(env.out().endsWith('bot> Session expired.\n'));
+        assert.strictEqual(shutdowns, 0);
     });
 
     it('should reject unknown dialogs and concurrent runs', async function() {
@@ -398,9 +587,12 @@ describe('CliAdapter as a process', function() {
 
     /**
      * Run tests/fixtures/wizard.js with the given arguments and stdin, and collect its exit code and output.
+     * Options: keepStdinOpen writes stdin without ending it; closeStderr closes the reading end of the child's stderr at once.
+     * A child still running after 10s is killed and resolves with code null.
      */
-    function runWizard(args, stdin) {
+    function runWizard(args, stdin, options = {}) {
         return new Promise((resolve, reject) => {
+            const started = Date.now();
             const child = spawn(process.execPath, [path.join(__dirname, 'fixtures', 'wizard.js'), ...args], {
                 cwd: __dirname,
                 env: { ...process.env, NO_COLOR: '1' },
@@ -408,11 +600,23 @@ describe('CliAdapter as a process', function() {
             });
             let stdout = '';
             let stderr = '';
+            const killer = setTimeout(() => child.kill('SIGKILL'), 10000);
             child.stdout.on('data', (chunk) => { stdout += chunk; });
-            child.stderr.on('data', (chunk) => { stderr += chunk; });
+            if (options.closeStderr) {
+                child.stderr.destroy();
+            } else {
+                child.stderr.on('data', (chunk) => { stderr += chunk; });
+            }
             child.on('error', reject);
-            child.on('close', (code) => resolve({ code, stdout, stderr }));
-            child.stdin.end(stdin);
+            child.on('close', (code) => {
+                clearTimeout(killer);
+                resolve({ code, stdout, stderr, ms: Date.now() - started });
+            });
+            if (options.keepStdinOpen) {
+                child.stdin.write(stdin);
+            } else {
+                child.stdin.end(stdin);
+            }
         });
     }
 
@@ -439,7 +643,45 @@ describe('CliAdapter as a process', function() {
     it('should run piped REPL input and exit on /quit', async function() {
         const result = await runWizard([], 'hello\n/quit\nhello\n');
         assert.strictEqual(result.code, 0);
-        assert.strictEqual(result.stdout, 'you> hello\nlog line from a handler\nbot> Hi\nyou> /quit\n');
+        assert.strictEqual(result.stdout, 'you> hello\nlog line from a handler\nbot> Hi\nyou> /quit\nshutdown handler log\n');
+    });
+
+    it('should read piped answers in non-interactive mode', async function() {
+        const result = await runWizard(['--run', 'setup', '--non-interactive'], '2\nsecret\n');
+        assert.strictEqual(result.code, 0, result.stderr);
+        assert.ok(result.stdout.includes('you> 2\nbot> Admin password?\nyou> secret\nbot> Configured sqlite.\n'), result.stdout);
+        assert.ok(!/error/i.test(result.stderr), result.stderr);
+    });
+
+    it('should fail a turn that never finishes instead of exiting quietly', async function() {
+        // with no plugin timer, only the turn timeout is left to keep the process alive
+        let result = await runWizard(['--non-interactive', '--timeout', '300', '--no-timer'], 'hang\n');
+        assert.strictEqual(result.code, 1);
+        assert.ok(result.stderr.includes('error: Turn timed out after 300ms\n'), result.stderr);
+
+        result = await runWizard(['--timeout', '300', '--no-timer'], 'hang\nhello\n');
+        assert.strictEqual(result.code, 0);
+        assert.ok(result.stderr.includes('error: Turn timed out after 300ms\n'), result.stderr);
+        assert.ok(result.stdout.includes('you> hello\nlog line from a handler\nbot> Hi\n'), result.stdout);
+    });
+
+    it('should not let a turn that never finishes keep the process alive after the session ends', async function() {
+        // the default turnTimeout is 30s
+        const result = await runWizard(['--shutdown-after', '300'], 'hang\n');
+        assert.strictEqual(result.code, 0);
+        assert.ok(result.ms < 8000, `exited after ${ result.ms }ms`);
+    });
+
+    it('should shut down and exit when the session is closed from code', async function() {
+        const result = await runWizard([], 'bye\n', { keepStdinOpen: true });
+        assert.strictEqual(result.code, 0);
+        assert.strictEqual(result.stdout, 'you> bye\nbot> Goodbye!\nshutdown handler log\n');
+    });
+
+    it('should keep going when stderr is closed', async function() {
+        const result = await runWizard([], 'boom\nhello\n', { closeStderr: true });
+        assert.strictEqual(result.code, 0);
+        assert.ok(result.stdout.includes('you> boom\nyou> hello\nlog line from a handler\nbot> Hi\n'), result.stdout);
     });
 
     it('should keep stdout pure JSON in json format', async function() {
@@ -448,5 +690,7 @@ describe('CliAdapter as a process', function() {
         const output = result.stdout.split('\n').filter((line) => line !== '');
         assert.deepStrictEqual(output.map((line) => JSON.parse(line)), [{ type: 'message', text: 'Hi', to: 'ann', conversation: JSON.parse(output[0]).conversation }]);
         assert.ok(result.stderr.includes('log line from a handler'));
+        // shutdown handlers run after the session has ended, and still cannot write into the JSON
+        assert.ok(result.stderr.includes('shutdown handler log'), result.stderr);
     });
 });

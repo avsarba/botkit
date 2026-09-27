@@ -2,9 +2,16 @@ const assert = require('assert');
 const { PassThrough } = require('stream');
 const { BotkitConversation } = require('botkit');
 const { CliAdapter, CliBotWorker, stripAnsi } = require('../');
-const { setup, deferred, lines, tick } = require('./shared');
+const { setup, deferred, capture, lines, tick } = require('./shared');
 
 const ESC = '\u001b';
+
+/**
+ * Remove every ANSI escape sequence, including readline's cursor movements.
+ */
+function plain(text) {
+    return text.replace(/\u001b\[[0-9;]*[A-Za-z]/g, '');
+}
 
 /**
  * Wait until lines written to the input stream have been read and processed.
@@ -160,6 +167,65 @@ describe('CliAdapter', function() {
             addRelease(controller);
             await adapter.submit('release');
             assert.deepStrictEqual(await adapter.submit('3'), ['bot> Deploying to 3.']);
+        });
+
+        it('should pick a choice by its title before its number', async function() {
+            init();
+            const menu = { text: 'How many replicas?', quick_replies: [{ title: '2', payload: '2' }, { title: '4', payload: '4' }, { title: '8', payload: '8' }] };
+            const picked = [];
+            controller.hears('menu', 'message', async (bot, message) => {
+                await bot.reply(message, menu);
+            });
+            controller.on('message', async (bot, message) => {
+                picked.push(message.cli_choice);
+                await bot.reply(message, menu);
+            });
+            assert.deepStrictEqual(await adapter.submit('menu'), ['bot> How many replicas?', '     [1] 2  [2] 4  [3] 8']);
+            // "2" is shown as a title, so it picks that choice, not the second one
+            await adapter.submit('2');
+            // no choice has the title "3": it picks the third choice
+            await adapter.submit('3');
+            assert.deepStrictEqual(picked, [{ index: 0, title: '2', value: '2' }, { index: 2, title: '8', value: '8' }]);
+        });
+
+        it('should keep a menu sent proactively while a turn runs', async function() {
+            init();
+            const snooze = { text: 'Snooze?', quick_replies: [{ title: '5 minutes', payload: 'snooze_5' }, { title: '1 hour', payload: 'snooze_60' }] };
+            let gate = deferred();
+            let started = deferred();
+            let reply;
+            controller.hears('slow', 'message', async (bot, message) => {
+                started.resolve();
+                await gate.promise;
+                await bot.reply(message, reply);
+            });
+            let choice;
+            controller.on('message', async (bot, message) => {
+                choice = message.cli_choice;
+            });
+            const bot = await controller.spawn({}, adapter);
+            await bot.startConversationWithUser();
+
+            reply = 'slow done';
+            let slow = adapter.submit('slow');
+            await started.promise;
+            await bot.say(snooze);
+            gate.resolve();
+            await slow;
+            await adapter.submit('1');
+            assert.deepStrictEqual(choice, { index: 0, title: '5 minutes', value: 'snooze_5' });
+
+            // a menu the turn prints after the proactive one is the one on screen
+            gate = deferred();
+            started = deferred();
+            reply = { text: 'Pick', quick_replies: [{ title: 'Alpha', payload: 'a' }] };
+            slow = adapter.submit('slow');
+            await started.promise;
+            await bot.say(snooze);
+            gate.resolve();
+            await slow;
+            await adapter.submit('1');
+            assert.deepStrictEqual(choice, { index: 0, title: 'Alpha', value: 'a' });
         });
 
         it('should answer with the default on an empty line', async function() {
@@ -476,6 +542,23 @@ describe('CliAdapter', function() {
             assert.throws(() => new CliAdapter({ format: 'xml' }), /Unknown CliAdapter format "xml"/);
         });
 
+        it('should time out a custom command that waits for the queue, and keep going', async function() {
+            init({
+                turnTimeout: 50,
+                commands: {
+                    wait: async (args, cli) => {
+                        await cli.idle();
+                        return 'waited';
+                    }
+                }
+            });
+            controller.hears('hello', 'message', async (bot) => {
+                await bot.say('Hi');
+            });
+            await assert.rejects(adapter.submit('/wait'), (err) => err.name === 'TurnTimeoutError' && err.message === 'Command /wait timed out after 50ms');
+            assert.deepStrictEqual(await adapter.submit('hello'), ['bot> Hi']);
+        });
+
         it('should reject a failing custom command like a failing turn', async function() {
             init({ commands: { boom: () => { throw new Error('bad command'); } } });
             await assert.rejects(adapter.submit('/boom'), /bad command/);
@@ -537,6 +620,83 @@ describe('CliAdapter', function() {
             init({ color: true });
             await adapter.submit('/event x {');
             assert.ok(env.err().startsWith(`${ ESC }[31merror: invalid JSON`));
+        });
+
+        it('should color errors when the error stream is a terminal, whatever the output is', async function() {
+            const noColor = process.env.NO_COLOR;
+            delete process.env.NO_COLOR;
+            try {
+                for (const tty of ['output', 'errorOutput']) {
+                    const output = new PassThrough();
+                    const errorOutput = new PassThrough();
+                    const out = capture(output);
+                    const err = capture(errorOutput);
+                    (tty === 'output' ? output : errorOutput).isTTY = true;
+                    init({ output, errorOutput, color: undefined });
+                    controller.hears('hello', 'message', async (bot) => {
+                        await bot.say('Hi');
+                    });
+                    await adapter.submit('hello');
+                    await adapter.submit('/event x {');
+                    assert.strictEqual(out().includes(ESC), tty === 'output', out());
+                    assert.strictEqual(err().includes(`${ ESC }[31merror: invalid JSON`), tty === 'errorOutput', err());
+                    await controller.shutdown();
+                }
+            } finally {
+                if (noColor !== undefined) {
+                    process.env.NO_COLOR = noColor;
+                }
+            }
+        });
+
+        it('should keep console output redirected while Botkit shuts down', async function() {
+            const original = console.log;
+            init({ redirectConsole: true });
+            controller.on('shutdown', async () => {
+                await tick();
+                console.log('closing the database');
+            });
+            const done = deferred();
+            const run = adapter.run();
+            // the session ends by itself at the end of the input
+            env.input.end();
+            await run;
+            while (console.log !== original) {
+                await tick();
+            }
+            assert.ok(env.err().includes('closing the database\n'));
+            assert.strictEqual(env.out(), '');
+
+            // the same when something else shuts Botkit down
+            init({ redirectConsole: true });
+            controller.on('shutdown', async () => {
+                if (!done.resolved) {
+                    // afterEach shuts down again, after the console is back
+                    done.resolved = true;
+                    await tick();
+                    console.log('flushing the queue');
+                    done.resolve();
+                }
+            });
+            adapter.start();
+            await controller.shutdown();
+            await done.promise;
+            assert.strictEqual(console.log, original);
+            assert.ok(env.err().includes('flushing the queue\n'));
+            assert.strictEqual(env.out(), '');
+        });
+
+        it('should share one error listener per stream between adapters', async function() {
+            const input = new PassThrough();
+            const output = new PassThrough();
+            const adapters = [];
+            for (let a = 0; a < 12; a++) {
+                adapters.push(new CliAdapter({ input, output, errorOutput: output, autoStart: false }));
+            }
+            assert.strictEqual(output.listenerCount('error'), 1);
+            adapters.forEach((each) => each.close());
+            // an error once every session has closed does not crash the process
+            output.emit('error', new Error('late'));
         });
 
         it('should print proactive messages but not return them from submit', async function() {
@@ -759,6 +919,114 @@ describe('CliAdapter', function() {
             await assert.rejects(after, /The CLI session is closed/);
             await tick();
             assert.strictEqual(shutdowns, 1);
+        });
+
+        it('should end the session with an error when the input stream fails', async function() {
+            init();
+            const run = adapter.run();
+            await tick();
+            env.input.destroy(new Error('read EIO'));
+            const result = await run;
+            assert.strictEqual(result.status, 'failed');
+            assert.strictEqual(result.exitCode, 1);
+            assert.strictEqual(result.error.message, 'read EIO');
+            assert.strictEqual(env.err(), 'error: input stream: read EIO\n');
+        });
+
+        it('should stop writing errors when the error stream fails', async function() {
+            init();
+            controller.hears('boom', 'message', async () => {
+                throw new Error('kaboom');
+            });
+            controller.hears('hello', 'message', async (bot) => {
+                await bot.say('Hi');
+            });
+            adapter.start();
+            const error = new Error('write EPIPE');
+            error.code = 'EPIPE';
+            env.errorOutput.emit('error', error);
+            env.input.write('boom\nhello\n');
+            await settle(adapter);
+            assert.strictEqual(env.err(), '');
+            assert.ok(env.out().endsWith('you> boom\nyou> hello\nbot> Hi\n'));
+        });
+
+        it('should shut Botkit down when the session is closed from code', async function() {
+            init();
+            let shutdowns = 0;
+            controller.on('shutdown', async () => {
+                shutdowns++;
+            });
+            controller.hears('bye', 'message', async (bot, message) => {
+                await bot.reply(message, 'Goodbye!');
+                bot.cli.close();
+            });
+            const run = adapter.run();
+            env.input.write('bye\n');
+            assert.deepStrictEqual(await run, { status: 'quit', exitCode: 0 });
+            await tick();
+            assert.strictEqual(shutdowns, 1);
+            await assert.rejects(adapter.submit('hello'), /closed/);
+            await controller.shutdown();
+
+            init({ shutdownOnClose: false });
+            shutdowns = 0;
+            controller.on('shutdown', async () => {
+                shutdowns++;
+            });
+            adapter.close();
+            await tick();
+            assert.strictEqual(shutdowns, 0);
+        });
+
+        it('should show the first question of a run before the prompt in terminal mode', async function() {
+            init({ terminal: true });
+            const db = new BotkitConversation('db', controller);
+            db.ask('Which database?', [], 'db');
+            controller.addDialog(db);
+            const run = adapter.run({ dialog: 'db' });
+            await tick();
+            await adapter.idle();
+            assert.strictEqual(plain(env.out()), 'bot> Which database?\nyou> ');
+            env.input.end();
+            assert.deepStrictEqual(await run, { status: 'eof', exitCode: 1 });
+
+            // a run started while the prompt is showing replaces it
+            init({ terminal: true });
+            const again = new BotkitConversation('db', controller);
+            again.ask('Which database?', [], 'db');
+            controller.addDialog(again);
+            adapter.start();
+            await tick();
+            const replaced = adapter.run({ dialog: 'db' });
+            await adapter.idle();
+            assert.ok(env.out().includes(`you> ${ ESC }[6G${ ESC }[2K${ ESC }[1Gbot> Which database?\n`), JSON.stringify(env.out()));
+            env.input.end();
+            await replaced;
+        });
+
+        it('should not draw a prompt after Ctrl+D while a turn is running', async function() {
+            init({ terminal: true });
+            const slow = deferred();
+            const started = deferred();
+            controller.hears('slow', 'message', async (bot) => {
+                started.resolve();
+                await slow.promise;
+                await bot.say('slow done');
+            });
+            const run = adapter.run();
+            await tick();
+            env.input.write('slow\r');
+            await started.promise;
+            env.input.write('\u0004');
+            await tick();
+            // a proactive message now is printed without drawing a prompt either
+            const bot = await controller.spawn({}, adapter);
+            await bot.startConversationWithUser();
+            await bot.say('from timer');
+            slow.resolve();
+            assert.deepStrictEqual(await run, { status: 'eof', exitCode: 0 });
+            assert.ok(plain(env.out()).endsWith('slow\r\n\nbot> from timer\nbot> slow done\n'), JSON.stringify(env.out()));
         });
 
         it('should end the session quietly when the output pipe closes', async function() {

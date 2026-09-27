@@ -17,7 +17,8 @@ import { CliAdapter } from './cli_adapter';
  */
 export class CliBotWorker extends BotWorker {
     /**
-     * The CliAdapter this bot talks through. Use it to read the current user and conversation, or to submit input from code.
+     * The CliAdapter this bot talks through. Use it to read the current user and conversation, or to queue input from code
+     * with `bot.cli.submit(line).catch(console.error)`, without `await`: the line runs after the current turn, which awaiting it would wait for.
      *
      * ```javascript
      * controller.hears('whoami', 'message', async (bot, message) => {

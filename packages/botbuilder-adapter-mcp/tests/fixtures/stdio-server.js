@@ -18,3 +18,8 @@ controller.hears('hello', 'message', async (bot, message) => {
     console.info({ user: message.user });
     await bot.reply(message, 'Hi from stdio');
 });
+
+// The usual Botkit shutdown pattern. It runs after the adapter has stopped, and must still not write to stdout.
+controller.on('shutdown', async () => {
+    console.log('Bot is shutting down!');
+});

@@ -503,6 +503,68 @@ describe('McpAdapter', function() {
             assert.strictEqual(next.structuredContent.proactive[0].text, 'finally done');
         });
 
+        it('should not start the next call of a session until a timed-out turn has finished', async function() {
+            t = setup({ turnTimeout: 100 });
+            addOrderDialog(t.controller);
+            const gate = deferred();
+            const log = [];
+            t.controller.middleware.receive.use(async (bot, message) => {
+                log.push(`start ${ message.text }`);
+            });
+            t.controller.hears('slow', 'message', async (bot) => {
+                await gate.promise;
+                await bot.say('slow done');
+                log.push('end slow');
+            });
+            await t.initialize();
+            const slow = t.chat('slow', 's1');
+            const order = t.chat('order', 's1');
+            const first = await slow;
+            assert.match(first.content[0].text, /timed out after 100ms/);
+            assert.deepStrictEqual(log, ['start slow']);
+
+            gate.resolve();
+            const second = await order;
+            assert.deepStrictEqual(log, ['start slow', 'end slow', 'start order']);
+            assert.strictEqual(second.isError, undefined);
+            assert.strictEqual(second.structuredContent.proactive[0].text, 'slow done');
+            assert.strictEqual(second.structuredContent.pendingQuestion.key, 'size');
+            // the slow turn saved its state before the dialog began, so it did not undo the dialog
+            const later = await t.chat('', 's1');
+            assert.strictEqual(later.structuredContent.pendingQuestion.key, 'size');
+        });
+
+        it('should fail a call, without running it, while the timed-out turn before it is still running', async function() {
+            t = setup({ turnTimeout: 50 });
+            const gate = deferred();
+            const heard = [];
+            t.controller.hears('.*', 'message', async (bot, message) => {
+                heard.push(`${ message.channel } ${ message.text }`);
+                if (message.text === 'hang') {
+                    await gate.promise;
+                }
+                await bot.say(`done ${ message.text }`);
+            });
+            await t.initialize();
+            const first = await t.chat('hang', 's1');
+            assert.match(first.content[0].text, /timed out after 50ms/);
+
+            const second = await t.chat('hello', 's1');
+            assert.strictEqual(second.isError, true);
+            assert.strictEqual(second.content[0].text, 'The bot is still busy with an earlier message in session "s1", which timed out, so this call did nothing. Try again later.');
+            assert.deepStrictEqual(second.structuredContent.replies, []);
+            assert.deepStrictEqual(heard, ['session:s1 hang']);
+
+            // other sessions are not held up
+            assert.strictEqual((await t.chat('hello', 's2')).content[0].text, 'done hello');
+
+            gate.resolve();
+            const third = await t.chat('hello', 's1');
+            assert.strictEqual(third.isError, undefined);
+            assert.deepStrictEqual(third.structuredContent.proactive.map((reply) => reply.text), ['done hang']);
+            assert.deepStrictEqual(third.structuredContent.replies.map((reply) => reply.text), ['done hello']);
+        });
+
         it('should time out a handler that never finishes', async function() {
             t = setup({ turnTimeout: 100 });
             t.controller.hears('never', 'message', () => new Promise(() => {
@@ -568,6 +630,55 @@ describe('McpAdapter', function() {
             const memory = t.controller.storage.memory;
             const kept = Object.keys(memory).filter((key) => key.includes('/conversations/tool:') && memory[key] !== undefined);
             assert.deepStrictEqual(kept, []);
+        });
+
+        it('should reuse the conversations of finished calls, so storage does not grow with every call', async function() {
+            for (let i = 0; i < 3; i++) {
+                await t.callTool('menu', { filter: 'veg' });
+            }
+            const keys = Object.keys(t.controller.storage.memory).filter((key) => key.includes('/conversations/tool:'));
+            assert.deepStrictEqual(keys, ['mcp/conversations/tool:menu:1-test-client/']);
+        });
+
+        it('should not reuse the conversation of a call whose turn is still running', async function() {
+            await t.close();
+            t = setup({ turnTimeout: 50 });
+            const gate = deferred();
+            const channels = [];
+            t.adapter.tool('hang');
+            t.controller.on('tool:hang', async (bot, message) => {
+                channels.push(message.channel);
+                if (message.value.wait) {
+                    await gate.promise;
+                }
+            });
+            await t.initialize();
+            const first = await t.callTool('hang', { wait: true });
+            assert.match(first.content[0].text, /timed out after 50ms/);
+            await t.callTool('hang', {});
+            gate.resolve();
+            await sleep(20);
+            await t.callTool('hang', {});
+            assert.deepStrictEqual(channels, ['tool:hang:1', 'tool:hang:2', 'tool:hang:1']);
+        });
+
+        it('should reject a result that does not match the outputSchema', async function() {
+            t.adapter.tool('track', {
+                outputSchema: { type: 'object', properties: { status: { type: 'string' }, eta: { type: 'number' } }, required: ['status'] }
+            });
+            t.controller.on('tool:track', async (bot, message) => {
+                bot.toolResult(message.value.good ? { status: 'baking', eta: 12 } : { status: 5, eta: null });
+            });
+            const bad = await t.callTool('track', {});
+            assert.strictEqual(bad.isError, true);
+            assert.strictEqual(bad.structuredContent, undefined);
+            assert.deepStrictEqual(texts(bad), [
+                '{"status":5,"eta":null}',
+                'Tool "track" returned a result that does not match its outputSchema: property "status" must be string; property "eta" must be number'
+            ]);
+            const good = await t.callTool('track', { good: true });
+            assert.strictEqual(good.isError, undefined);
+            assert.deepStrictEqual(good.structuredContent, { status: 'baking', eta: 12 });
         });
 
         it('should return a tool error for invalid arguments', async function() {
@@ -763,6 +874,75 @@ describe('McpAdapter', function() {
             assert.strictEqual(next.structuredContent.pendingQuestion.key, 'address');
         });
 
+        it('should forget the choices of a proactive question once it is answered', async function() {
+            addOrderDialog(t.controller);
+            let seen;
+            t.controller.middleware.receive.use(async (bot, message) => {
+                seen = message.text;
+            });
+            const bot = await t.controller.spawn({}, t.adapter);
+            for (const session of ['s1', 's2']) {
+                await bot.startConversationWithUser(session);
+                await bot.beginDialog('order');
+            }
+
+            // collect the question first
+            const peek = await t.chat('', 's1');
+            assert.deepStrictEqual(peek.structuredContent.choices.map((choice) => choice.value), ['small', 'large']);
+            const answer = await t.chat('Large', 's1');
+            assert.strictEqual(answer.structuredContent.pendingQuestion.key, 'address');
+            assert.deepStrictEqual(answer.structuredContent.choices, []);
+            const done = await t.chat('Small', 's1');
+            assert.strictEqual(seen, 'Small');
+            assert.ok(done.content[0].text.includes('Ordered a large pizza to Small.'));
+
+            // or answer it right away
+            const direct = await t.chat('Large', 's2');
+            assert.strictEqual(seen, 'large');
+            assert.strictEqual(direct.structuredContent.pendingQuestion.key, 'address');
+            assert.deepStrictEqual(direct.structuredContent.choices, []);
+        });
+
+        it('should keep the choices of a waiting question when a proactive message offers others', async function() {
+            addOrderDialog(t.controller);
+            await t.chat('order', 's1');
+            const bot = await t.controller.spawn({}, t.adapter);
+            await bot.startConversationWithUser('s1');
+            await bot.say({ text: 'Standup in 5 minutes', quick_replies: [{ title: 'Snooze', payload: 'snooze' }, { title: 'Done', payload: 'done' }] });
+
+            const peek = await t.chat('', 's1');
+            assert.strictEqual(peek.structuredContent.pendingQuestion.key, 'size');
+            assert.deepStrictEqual(peek.structuredContent.choices.map((choice) => choice.value), ['small', 'large']);
+            assert.deepStrictEqual(peek.structuredContent.proactive[0].choices.map((choice) => choice.value), ['snooze', 'done']);
+            const answer = await t.chat('Large', 's1');
+            assert.strictEqual(answer.structuredContent.pendingQuestion.key, 'address');
+            assert.deepStrictEqual(answer.structuredContent.choices, []);
+        });
+
+        it('should drop the choices of a question that was cancelled between calls', async function() {
+            addOrderDialog(t.controller);
+            const heard = [];
+            t.controller.hears('.*', 'message', async (bot, message) => {
+                heard.push(message.text);
+            });
+            await t.chat('order', 's1');
+            await t.chat('order', 's2');
+            // a scheduled job cancels both dialogs
+            for (const session of ['s1', 's2']) {
+                const bot = await t.controller.spawn({}, t.adapter);
+                await bot.startConversationWithUser(session);
+                await bot.cancelAllDialogs();
+                await t.controller.saveState(bot);
+            }
+
+            const peek = await t.chat('', 's1');
+            assert.strictEqual(peek.structuredContent.pendingQuestion, null);
+            assert.deepStrictEqual(peek.structuredContent.choices, []);
+            await t.chat('Large', 's1');
+            await t.chat('Large', 's2');
+            assert.deepStrictEqual(heard, ['Large', 'Large']);
+        });
+
         it('should validate sessions in getReference()', function() {
             assert.deepStrictEqual(t.adapter.getReference(), {
                 channelId: 'mcp',
@@ -882,6 +1062,33 @@ describe('McpAdapter', function() {
             await settled(t);
             assert.deepStrictEqual(heard, ['first']);
             assert.strictEqual(t.responses.filter((m) => m.id === 'b').length, 0);
+        });
+
+        it('should keep the messages of a cancelled chat call for the next call', async function() {
+            t = setup();
+            const started = deferred();
+            const gate = deferred();
+            t.controller.hears('deploy', 'message', async (bot) => {
+                started.resolve();
+                await gate.promise;
+                await bot.say('Deployed api v2 to production.');
+            });
+            const bot = await t.controller.spawn({}, t.adapter);
+            await bot.startConversationWithUser('default');
+            await bot.say('Standup in 5 minutes');
+
+            t.raw(JSON.stringify({ jsonrpc: '2.0', id: 'deploy', method: 'tools/call', params: { name: 'chat', arguments: { message: 'deploy' } } }) + '\n');
+            await started.promise;
+            t.notify('notifications/cancelled', { requestId: 'deploy', reason: 'The user pressed Esc' });
+            await t.rpc('ping');
+            gate.resolve();
+            const note = await t.waitFor((m) => m.method === 'notifications/message' && m.params.data.text === 'Deployed api v2 to production.');
+            assert.strictEqual(note.params.data.session, 'default');
+            await settled(t);
+
+            const next = await t.chat('');
+            assert.deepStrictEqual(next.structuredContent.proactive.map((reply) => reply.text), ['Standup in 5 minutes', 'Deployed api v2 to production.']);
+            assert.strictEqual(t.responses.filter((m) => m.id === 'deploy').length, 0);
         });
 
         it('should ignore cancellation of requests that are not running', async function() {
@@ -1016,6 +1223,67 @@ describe('McpAdapter', function() {
             }
             assert.deepStrictEqual(writes, ['hello stderr\n', 'info\n', '{ a: 1 }\n', 'still redirected\n']);
             assert.strictEqual(console.log, originalLog);
+        });
+
+        it('should keep the console redirected while Botkit shuts down', async function() {
+            const writes = [];
+            const originalWrite = process.stderr.write;
+            const originalLog = console.log;
+            let shuttingDown = true;
+            t = setup({ redirectConsole: true });
+            t.controller.on('shutdown', async () => {
+                if (shuttingDown) {
+                    console.log('Bot is shutting down!');
+                }
+            });
+            await t.rpc('ping');
+            try {
+                process.stderr.write = (chunk) => {
+                    writes.push(String(chunk));
+                    return true;
+                };
+                await t.controller.shutdown();
+                console.log('after shutdown');
+            } finally {
+                process.stderr.write = originalWrite;
+                shuttingDown = false;
+                t.adapter.close();
+            }
+            assert.deepStrictEqual(writes, ['Bot is shutting down!\n', 'after shutdown\n']);
+            assert.strictEqual(console.log, originalLog);
+        });
+
+        it('should restore the console once the shutdown that follows the end of the input has finished', async function() {
+            const writes = [];
+            const originalWrite = process.stderr.write;
+            const originalLog = console.log;
+            const shutdown = deferred();
+            let shuttingDown = true;
+            t = setup({ redirectConsole: true });
+            t.controller.on('shutdown', async () => {
+                if (shuttingDown) {
+                    await sleep(5);
+                    console.log('Bot is shutting down!');
+                    shutdown.resolve();
+                }
+            });
+            await t.rpc('ping');
+            try {
+                process.stderr.write = (chunk) => {
+                    writes.push(String(chunk));
+                    return true;
+                };
+                t.input.end();
+                await shutdown.promise;
+                while (console.log !== originalLog) {
+                    await sleep(1);
+                }
+            } finally {
+                process.stderr.write = originalWrite;
+                shuttingDown = false;
+                t.adapter.close();
+            }
+            assert.deepStrictEqual(writes, ['Bot is shutting down!\n']);
         });
 
         it('should redirect the console by default when writing to stdout', function() {

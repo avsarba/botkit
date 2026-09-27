@@ -66,12 +66,17 @@ const STRUCTURED_OUTPUT_VERSION = '2025-06-18';
 const DEFAULT_CLIENT_ID = 'mcp-client';
 
 /**
- * The choices a chat session was last offered, and the question that offered them:
- * `dialog|thread|index`, null when no question was waiting, or undefined when unknown (a proactive message).
+ * The name of the Error a chat call fails with while an earlier turn of its session that timed out is still running.
+ */
+const SESSION_BUSY_ERROR = 'SessionBusyError';
+
+/**
+ * What a chat session last offered the agent: the question that was waiting (`dialog|thread|index`, or null when none was)
+ * and the choices that go with it. A session with neither has no entry.
  */
 interface RememberedChoices {
     choices: McpChoice[];
-    question?: string | null;
+    question: string | null;
 }
 
 /**
@@ -200,10 +205,17 @@ function errorResponse(id: any, code: number, message: string, data?: any): any 
 }
 
 /**
- * True for an id a JSON-RPC request may carry.
+ * True for an id an MCP request may carry: a string or a number. Unlike plain JSON-RPC, MCP does not allow null.
  */
 function isValidId(id: any): boolean {
-    return id === null || typeof id === 'string' || (typeof id === 'number' && isFinite(id));
+    return typeof id === 'string' || (typeof id === 'number' && isFinite(id));
+}
+
+/**
+ * Identify a pending question within its session, or null when no question is waiting.
+ */
+function questionId(pending: BotkitPendingQuestion | null): string | null {
+    return pending ? `${ pending.dialog }|${ pending.thread }|${ pending.index }` : null;
 }
 
 /**
@@ -244,6 +256,8 @@ export class McpAdapter extends BotAdapter {
     private minLogLevel: McpLogLevel = 'info';
     private tools = new Map<string, McpToolDefinition>();
     private queues = new Map<string, Promise<void>>();
+    private runningTurns = new Map<string, Promise<void>>();
+    private busyToolSlots = new Set<number>();
     private lastChoices = new Map<string, RememberedChoices>();
     private outboxes = new Map<string, McpReply[]>();
     private inflight = new Set<string | number>();
@@ -350,7 +364,9 @@ export class McpAdapter extends BotAdapter {
 
     /**
      * The user id of the client in Botkit (`message.user`): its `clientInfo.name` with characters other than letters, digits, `_`, `.` and `-`
-     * replaced by `-`, at most 64 characters, or `mcp-client` if it sent no name.
+     * replaced by `-`, at most 64 characters, or `mcp-client` if it sent no name, or before it sent `initialize`.
+     * Botkit stores the dialog state of chat sessions under this id, so a client cannot answer a question asked by a proactive dialog
+     * that started under another id, such as one started before `initialize`.
      */
     public get clientId(): string {
         return this.currentClientId;
@@ -418,7 +434,7 @@ export class McpAdapter extends BotAdapter {
 
     /**
      * Botkit-only: called automatically by Botkit when the adapter is passed to `new Botkit({ adapter })` or `controller.usePlugin(adapter)`.
-     * Makes the adapter available as `controller.plugins.mcp`, closes it on `controller.shutdown()`,
+     * Makes the adapter available as `controller.plugins.mcp`, stops it on `controller.shutdown()`,
      * and, unless `autoStart` is false, calls [listen()](#listen) once Botkit is ready.
      * @param botkit The Botkit controller.
      */
@@ -426,7 +442,9 @@ export class McpAdapter extends BotAdapter {
         this.controller = botkit;
         botkit.addPluginExtension('mcp', this);
         botkit.on('shutdown', async () => {
-            this.close();
+            // Leave the console on stderr: the shutdown handlers registered after this one have not run yet,
+            // and the client may still be reading stdout.
+            this.stop();
         });
         if (this.options.autoStart) {
             botkit.ready(() => {
@@ -469,27 +487,24 @@ export class McpAdapter extends BotAdapter {
 
     /**
      * Stop serving: stop reading input, drop the responses of requests still in progress, and restore the console.
-     * Botkit calls this on `controller.shutdown()`. It does not shut Botkit down. Calling it again does nothing.
+     * It does not shut Botkit down. Calling it again does nothing.
+     *
+     * `controller.shutdown()` stops the adapter too, but leaves the console redirected, so that the `shutdown` handlers that run
+     * after the adapter's cannot write to stdout. Call `close()` afterwards to restore it. When the input ends and the adapter
+     * shuts Botkit down itself (`shutdownOnClose`), it restores the console once every `shutdown` handler has finished.
      *
      * ```javascript
      * process.on('SIGTERM', async () => {
-     *     await controller.shutdown(); // closes the adapter
+     *     await controller.shutdown(); // stops the adapter
      * });
      * ```
      */
     public close(): void {
-        if (this.closed) {
-            return;
-        }
-        this.closed = true;
-        if (this.connection) {
-            this.connection.close();
-        }
+        this.stop();
         if (this.consoleRedirected) {
             this.consoleRedirected = false;
             restoreConsole();
         }
-        debug('Closed');
     }
 
     /**
@@ -1039,7 +1054,8 @@ export class McpAdapter extends BotAdapter {
      */
     private async runChat(session: string, key: string, args: { [key: string]: any }, meta: McpCallMeta): Promise<McpCallToolResult> {
         const toolName = this.options.chatTool.name;
-        if (meta.requestId !== undefined && this.cancelled.has(meta.requestId)) {
+        const cancelled = (): boolean => meta.requestId !== undefined && this.cancelled.has(meta.requestId);
+        if (cancelled()) {
             // the client cancelled this call while it waited for the one before it
             return { content: [text('Cancelled')], isError: true };
         }
@@ -1051,16 +1067,24 @@ export class McpAdapter extends BotAdapter {
         let failure: Error = null;
 
         try {
+            await this.waitForRunningTurn(session, key);
+            if (cancelled()) {
+                return { content: [text('Cancelled')], isError: true };
+            }
             if (args.reset === true) {
                 await this.resetSession(session, key);
             }
             proactive = this.takeOutbox(SESSION_PREFIX + session);
             if (message === '') {
                 pending = await this.peekPendingQuestion(session);
+                this.reconcileChoices(key, pending, proactive);
             } else {
+                if (this.lastChoices.has(key) || proactive.some((reply) => !!reply.choices)) {
+                    this.reconcileChoices(key, await this.peekPendingQuestion(session), proactive);
+                }
                 request = this.createRequest(toolName, true, meta);
                 const context = new TurnContext(this, this.createChatActivity(session, message, key, meta));
-                await this.runTurn(context, request);
+                await this.runTurn(context, request, this.trackTurn(key));
                 pending = await this.controller.getPendingQuestion(context);
             }
         } catch (err) {
@@ -1088,7 +1112,7 @@ export class McpAdapter extends BotAdapter {
             unescapeHtml: this.options.unescapeHtml,
             empty: failure ? '' : undefined
         });
-        const lines = failure ? [`The bot failed to handle this message: ${ failure.message }`] : [];
+        const lines = !failure ? [] : [failure.name === SESSION_BUSY_ERROR ? failure.message : `The bot failed to handle this message: ${ failure.message }`];
         if (rendered) {
             lines.push(rendered);
         }
@@ -1118,7 +1142,83 @@ export class McpAdapter extends BotAdapter {
         if (failure || (request && request.isError)) {
             result.isError = true;
         }
+        if (cancelled()) {
+            // the client gave up on this call and never sees the result: keep its messages for the session's next call
+            this.returnToOutbox(session, proactive, replies);
+        }
         return result;
+    }
+
+    /**
+     * Wait until a turn of this session that timed out has really finished, so the next call never runs beside it
+     * (both would save the session's state, and the later save would undo the other's changes).
+     * It waits for up to turnTimeout, then fails with an error for the agent.
+     */
+    private async waitForRunningTurn(session: string, key: string): Promise<void> {
+        const running = this.runningTurns.get(key);
+        if (!running) {
+            return;
+        }
+        debug('Waiting for the earlier turn of session', session);
+        try {
+            await withTimeout(running, this.options.turnTimeout);
+        } catch (err) {
+            const busy = new Error(`The bot is still busy with an earlier message in session "${ session }", which timed out, so this call did nothing. Try again later.`);
+            busy.name = SESSION_BUSY_ERROR;
+            throw busy;
+        }
+    }
+
+    /**
+     * Mark a chat session as busy until its turn has really finished, even if the call times out first.
+     * Returns the `afterTurn` function for runTurn() that removes the mark.
+     */
+    private trackTurn(key: string): () => Promise<void> {
+        let finished: () => void;
+        const running = new Promise<void>((resolve) => {
+            finished = resolve;
+        });
+        this.runningTurns.set(key, running);
+        return async (): Promise<void> => {
+            if (this.runningTurns.get(key) === running) {
+                this.runningTurns.delete(key);
+            }
+            finished();
+        };
+    }
+
+    /**
+     * Remember what a chat session offers. A session with no waiting question and no choices has no entry.
+     */
+    private rememberChoices(key: string, question: string | null, choices: McpChoice[]): void {
+        if (question === null && !choices.length) {
+            this.lastChoices.delete(key);
+        } else {
+            this.lastChoices.set(key, { choices: choices, question: question });
+        }
+    }
+
+    /**
+     * Before a call runs its turn, bring the remembered choices up to date with the question waiting now,
+     * which proactive turns may have changed since the last call. `proactive` holds the messages the call delivers.
+     * A question that was already waiting at the last call keeps its own choices. Otherwise the choices of the last
+     * proactive message that offers any belong to the question waiting now (or to none), and older choices are dropped.
+     */
+    private reconcileChoices(key: string, pending: BotkitPendingQuestion | null, proactive: McpReply[]): void {
+        const question = questionId(pending);
+        let offered: McpChoice[] = null;
+        proactive.forEach((reply) => {
+            if (reply.choices) {
+                offered = reply.choices;
+            }
+        });
+        const remembered = this.lastChoices.get(key);
+        const knownQuestion = remembered ? remembered.question : null;
+        if (question !== knownQuestion) {
+            this.rememberChoices(key, question, offered || []);
+        } else if (question === null && offered) {
+            this.rememberChoices(key, null, offered);
+        }
     }
 
     /**
@@ -1127,22 +1227,12 @@ export class McpAdapter extends BotAdapter {
      * so the choices of an answered question are never offered for the next one.
      */
     private updateChoices(key: string, choicesInTurn: McpChoice[] | null, pending: BotkitPendingQuestion | null): void {
-        const question = pending ? `${ pending.dialog }|${ pending.thread }|${ pending.index }` : null;
-        if (choicesInTurn) {
-            this.lastChoices.set(key, { choices: choicesInTurn, question: question });
-            return;
-        }
+        const question = questionId(pending);
         const remembered = this.lastChoices.get(key);
-        if (!remembered) {
-            return;
-        }
-        if (!pending) {
-            this.lastChoices.delete(key);
-        } else if (remembered.question === undefined) {
-            // offered by a proactive message: tie them to the question that is waiting now
-            remembered.question = question;
-        } else if (remembered.question !== question) {
-            this.lastChoices.delete(key);
+        if (choicesInTurn) {
+            this.rememberChoices(key, question, choicesInTurn);
+        } else if (question === null || !remembered || remembered.question !== question) {
+            this.rememberChoices(key, question, []);
         }
     }
 
@@ -1216,16 +1306,16 @@ export class McpAdapter extends BotAdapter {
         }
 
         const request = this.createRequest(name, false, meta);
-        const n = ++this.inboundCount;
+        const slot = this.claimToolSlot();
         const activity: Partial<Activity> = {
             type: ActivityTypes.Event,
             name: name,
             value: args,
-            id: 'mcp-in-' + n,
+            id: 'mcp-in-' + (++this.inboundCount),
             timestamp: new Date(),
             channelId: CHANNEL_ID,
             // a conversation of its own, so no dialog waiting for an answer in a chat session can swallow the event
-            conversation: { id: `tool:${ name }:${ n }` } as ConversationAccount,
+            conversation: { id: `tool:${ name }:${ slot }` } as ConversationAccount,
             from: { id: this.clientId, name: this.clientName() },
             recipient: { id: 'bot', name: this.options.serverInfo.name },
             channelData: { botkitEventType: 'tool:' + name, mcp: { requestId: meta.requestId, tool: name } }
@@ -1234,8 +1324,12 @@ export class McpAdapter extends BotAdapter {
 
         let failure: Error = null;
         try {
-            // nothing can ever continue this conversation, so remove the state Botkit saved for it
-            await this.runTurn(context, request, () => this.forgetConversation(context));
+            // Nothing can ever continue this conversation, so remove the state Botkit saved for it,
+            // then let a later call use its id. Waits for the turn to really finish, even after a timeout.
+            await this.runTurn(context, request, async () => {
+                await this.forgetConversation(context);
+                this.busyToolSlots.delete(slot);
+            });
         } catch (err) {
             failure = toError(err);
             debug('Tool call failed', name, failure);
@@ -1256,6 +1350,16 @@ export class McpAdapter extends BotAdapter {
             isError = true;
             content.push(text(`Tool "${ name }" failed: ${ failure.message }`));
         }
+        let structured = request.structured;
+        if (structured !== undefined && definition.outputSchema !== undefined) {
+            // clients check structuredContent against the outputSchema, and reject the whole result when it does not match
+            const problems = validateArguments(definition.outputSchema, structured);
+            if (problems.length) {
+                isError = true;
+                structured = undefined;
+                content.push(text(`Tool "${ name }" returned a result that does not match its outputSchema: ${ problems.join('; ') }`));
+            }
+        }
         if (!isError && definition.outputSchema !== undefined && request.structured === undefined) {
             isError = true;
             content.push(text(`Tool "${ name }" declared an outputSchema but its handler did not call bot.toolResult()`));
@@ -1265,13 +1369,27 @@ export class McpAdapter extends BotAdapter {
         }
 
         const result: McpCallToolResult = { content: content };
-        if (request.structured !== undefined && this.atLeast(STRUCTURED_OUTPUT_VERSION)) {
-            result.structuredContent = request.structured;
+        if (structured !== undefined && this.atLeast(STRUCTURED_OUTPUT_VERSION)) {
+            result.structuredContent = structured;
         }
         if (isError) {
             result.isError = true;
         }
         return result;
+    }
+
+    /**
+     * The lowest number that no running tool call uses. Tool calls put it in their conversation id, so the ids,
+     * and the storage keys Botkit creates for them, are reused instead of growing with every call.
+     * (MemoryStorage, Botkit's default, keeps the key of deleted state.)
+     */
+    private claimToolSlot(): number {
+        let slot = 1;
+        while (this.busyToolSlots.has(slot)) {
+            slot++;
+        }
+        this.busyToolSlots.add(slot);
+        return slot;
     }
 
     /**
@@ -1300,23 +1418,39 @@ export class McpAdapter extends BotAdapter {
         const isSession = typeof conversationId === 'string' && conversationId.startsWith(SESSION_PREFIX);
         const session = isSession ? conversationId.slice(SESSION_PREFIX.length) : conversationId;
         if (isSession) {
-            const outbox = this.outboxes.get(conversationId) || [];
-            outbox.push(reply);
-            while (outbox.length > this.options.maxOutbox) {
-                outbox.shift();
-            }
-            if (outbox.length) {
-                this.outboxes.set(conversationId, outbox);
-            } else {
-                this.outboxes.delete(conversationId);
-            }
-            if (reply.choices && activity.recipient && activity.recipient.id) {
-                this.lastChoices.set(`${ activity.recipient.id }|${ session }`, { choices: reply.choices, question: undefined });
-            }
+            // any choices it offers are matched to the session's question when the next chat call delivers it
+            this.addToOutbox(conversationId, [reply], false);
         } else {
             debug('Message for %s is not in a chat session and is only sent as a notification', conversationId);
         }
         this.log('info', { session: session, ...reply });
+    }
+
+    /**
+     * Keep the messages of a chat call that the client cancelled, which it never sees, for the session's next call:
+     * the waiting messages it collected go back to the front of the outbox, and the bot's replies are delivered like late replies.
+     */
+    private returnToOutbox(session: string, proactive: McpReply[], replies: McpReply[]): void {
+        const conversationId = SESSION_PREFIX + session;
+        this.addToOutbox(conversationId, proactive, true);
+        this.addToOutbox(conversationId, replies, false);
+        replies.forEach((reply) => this.log('info', { session: session, ...reply }));
+    }
+
+    /**
+     * Add messages to the front or the back of a conversation's outbox, dropping the oldest beyond maxOutbox.
+     */
+    private addToOutbox(conversationId: string, replies: McpReply[], atFront: boolean): void {
+        const current = this.outboxes.get(conversationId) || [];
+        const outbox = atFront ? replies.concat(current) : current.concat(replies);
+        while (outbox.length > this.options.maxOutbox) {
+            outbox.shift();
+        }
+        if (outbox.length) {
+            this.outboxes.set(conversationId, outbox);
+        } else {
+            this.outboxes.delete(conversationId);
+        }
     }
 
     /**
@@ -1336,11 +1470,26 @@ export class McpAdapter extends BotAdapter {
     }
 
     /**
+     * Stop reading input and writing output. Unlike close(), this leaves the console redirected.
+     */
+    private stop(): void {
+        if (this.closed) {
+            return;
+        }
+        this.closed = true;
+        if (this.connection) {
+            this.connection.close();
+        }
+        debug('Closed');
+    }
+
+    /**
      * The input stream ended and every request has been answered.
      */
     private onInputClosed(): void {
         debug('Input closed');
         if (this.options.shutdownOnClose && this.controller) {
+            // restore the console only once every shutdown handler has run, so none of them can write to stdout
             this.controller.shutdown().catch((err) => {
                 console.error('Error while shutting down the bot after the MCP client disconnected', err);
             }).then(() => this.close());
@@ -1381,13 +1530,14 @@ export interface McpAdapterOptions {
     chatTool?: false | { name?: string; title?: string; description?: string };
 
     /**
-     * The longest a tool call may take, in milliseconds, before it returns an error. The turn keeps running in the background. 0 means no limit. Defaults to 15000.
+     * The longest a tool call may take, in milliseconds, before it returns an error. The turn keeps running in the background,
+     * and the next chat call in its session waits for it to finish (again for up to this long) before it runs. 0 means no limit. Defaults to 15000.
      */
     turnTimeout?: number;
 
     /**
      * Send `console.log`, `console.info`, `console.debug` and `console.dir` to stderr until the adapter is closed, so they cannot corrupt the protocol stream.
-     * Defaults to true when `output` is `process.stdout`.
+     * `controller.shutdown()` leaves them redirected (see [close()](#close)). Defaults to true when `output` is `process.stdout`.
      */
     redirectConsole?: boolean;
 

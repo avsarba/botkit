@@ -57,5 +57,6 @@ describe('MCP over stdio', function() {
         assert.ok(stderr.includes('noise from handler'), stderr);
         assert.ok(stderr.includes('stdio-test'), stderr);
         assert.ok(stderr.includes('Enabling plugin'), stderr);
+        assert.ok(stderr.includes('Bot is shutting down!'), stderr);
     });
 });

@@ -105,7 +105,7 @@ to stderr until the adapter is closed (see the `redirectConsole` option).
 
 | Name | Type | Description
 |--- |--- |---
-| clientId | string | The user id of the client in Botkit (`message.user`): its `clientInfo.name` with characters other than letters, digits, `_`, `.` and `-` replaced by `-`, at most 64 characters, or `mcp-client` if it sent no name.
+| clientId | string | The user id of the client in Botkit (`message.user`): its `clientInfo.name` with characters other than letters, digits, `_`, `.` and `-` replaced by `-`, at most 64 characters, or `mcp-client` if it sent no name, or before it sent `initialize`. Botkit stores the dialog state of chat sessions under this id, so a client cannot answer a question asked by a proactive dialog that started under another id, such as one started before `initialize`.
 | clientInfo |  | The `clientInfo` the client sent with `initialize`, such as `{ name: 'claude-code', version: '2.0.0' }`, or null before that.
 | initialized | boolean | True once the client has sent `notifications/initialized`.
 | protocolVersion | string | The protocol version agreed with the client during `initialize`, or null before that.
@@ -141,13 +141,17 @@ console.log(result.structuredContent.awaitingInput);
 <a name="close"></a>
 ### close()
 Stop serving: stop reading input, drop the responses of requests still in progress, and restore the console.
-Botkit calls this on `controller.shutdown()`. It does not shut Botkit down. Calling it again does nothing.
+It does not shut Botkit down. Calling it again does nothing.
+
+`controller.shutdown()` stops the adapter too, but leaves the console redirected, so that the `shutdown` handlers that run
+after the adapter's cannot write to stdout. Call `close()` afterwards to restore it. When the input ends and the adapter
+shuts Botkit down itself (`shutdownOnClose`), it restores the console once every `shutdown` handler has finished.
 
 
 
 ```javascript
 process.on('SIGTERM', async () => {
-    await controller.shutdown(); // closes the adapter
+    await controller.shutdown(); // stops the adapter
 });
 ```
 
@@ -234,7 +238,7 @@ console.log(response.result.tools.map((tool) => tool.name)); // ['chat', 'menu']
 <a name="init"></a>
 ### init()
 Botkit-only: called automatically by Botkit when the adapter is passed to `new Botkit({ adapter })` or `controller.usePlugin(adapter)`.
-Makes the adapter available as `controller.plugins.mcp`, closes it on `controller.shutdown()`,
+Makes the adapter available as `controller.plugins.mcp`, stops it on `controller.shutdown()`,
 and, unless `autoStart` is false, calls [listen()](#listen) once Botkit is ready.
 
 **Parameters**
@@ -673,10 +677,10 @@ This interface defines the options that can be passed into the McpAdapter constr
 | instructions | string | Instructions for the agent, sent in the `initialize` result. Defaults to a short text that explains the chat tool and lists the declared tools.<br/>
 | maxOutbox | number | The most proactive messages kept per chat session until the agent's next chat call. Older messages are dropped first. Defaults to 50.<br/>
 | output | WritableStream | The stream to write JSON-RPC messages to. Defaults to `process.stdout`.<br/>
-| redirectConsole | boolean | Send `console.log`, `console.info`, `console.debug` and `console.dir` to stderr until the adapter is closed, so they cannot corrupt the protocol stream.<br/>Defaults to true when `output` is `process.stdout`.<br/>
+| redirectConsole | boolean | Send `console.log`, `console.info`, `console.debug` and `console.dir` to stderr until the adapter is closed, so they cannot corrupt the protocol stream.<br/>`controller.shutdown()` leaves them redirected (see [close()](#close)). Defaults to true when `output` is `process.stdout`.<br/>
 | serverInfo |  | The name and version the server reports to clients. Defaults to `{ name: 'botkit-mcp', version: <this package's version> }`.<br/>`title` is a human-readable name, sent to clients that negotiated protocol version 2025-06-18 or later.<br/>
 | shutdownOnClose | boolean | Call `controller.shutdown()` when the input stream ends, so the process can exit when the client disconnects. Defaults to true.<br/>
-| turnTimeout | number | The longest a tool call may take, in milliseconds, before it returns an error. The turn keeps running in the background. 0 means no limit. Defaults to 15000.<br/>
+| turnTimeout | number | The longest a tool call may take, in milliseconds, before it returns an error. The turn keeps running in the background,<br/>and the next chat call in its session waits for it to finish (again for up to this long) before it runs. 0 means no limit. Defaults to 15000.<br/>
 | unescapeHtml | boolean | Decode the HTML entities that mustache adds when dialog templates render `{{vars.x}}`. Defaults to true.<br/>
 
 <a name="McpRenderOptions"></a>
@@ -784,5 +788,5 @@ Describes a tool declared with [McpAdapter.tool()](#tool). The tool's handler is
 | annotations | [McpToolAnnotations](#McpToolAnnotations) | Hints that describe how the tool behaves.<br/>
 | description | string | What the tool does and when to use it. Agents read this to decide when to call the tool, so be specific.<br/>
 | inputSchema |  | A JSON Schema for the tool's arguments. It must have `type: 'object'`. Defaults to `{ type: 'object', properties: {} }`.<br/>Arguments are checked with `validateArguments()` before the handler runs.<br/>
-| outputSchema |  | A JSON Schema for the structured result the handler passes to `bot.toolResult()`. It must have `type: 'object'`.<br/>Sent to clients that negotiated protocol version 2025-06-18 or later.<br/>A tool with an outputSchema whose handler does not call `bot.toolResult()` returns an error.<br/>
+| outputSchema |  | A JSON Schema for the structured result the handler passes to `bot.toolResult()`. It must have `type: 'object'`.<br/>Sent to clients that negotiated protocol version 2025-06-18 or later.<br/>The result is checked against it with `validateArguments()`. A call whose handler does not call `bot.toolResult()`,<br/>or passes a result that does not match, returns an error without `structuredContent`.<br/>
 | title | string | A human-readable name for the tool. Sent to clients that negotiated protocol version 2025-06-18 or later.<br/>

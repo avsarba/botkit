@@ -102,7 +102,8 @@ export interface McpToolDefinition {
     /**
      * A JSON Schema for the structured result the handler passes to `bot.toolResult()`. It must have `type: 'object'`.
      * Sent to clients that negotiated protocol version 2025-06-18 or later.
-     * A tool with an outputSchema whose handler does not call `bot.toolResult()` returns an error.
+     * The result is checked against it with `validateArguments()`. A call whose handler does not call `bot.toolResult()`,
+     * or passes a result that does not match, returns an error without `structuredContent`.
      */
     outputSchema?: { [key: string]: any };
 

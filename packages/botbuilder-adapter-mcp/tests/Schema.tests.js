@@ -101,6 +101,22 @@ describe('validateArguments', function() {
         assert.deepStrictEqual(validateArguments(numbers, { n: '2' }), ['property "n" must be one of 1, 2, {"x":1}']);
     });
 
+    it('should allow and check properties that match patternProperties', function() {
+        const schema = {
+            type: 'object',
+            properties: { name: { type: 'string' } },
+            patternProperties: { '^x-': { type: 'string' }, '^\\p{Lu}': {} },
+            additionalProperties: false
+        };
+        assert.deepStrictEqual(validateArguments(schema, { name: 'a', 'x-trace': 'b', Émile: 1 }), []);
+        assert.deepStrictEqual(validateArguments(schema, { name: 'a', 'x-trace': 1, other: true }), ['property "x-trace" must be string', 'unexpected property "other"']);
+        // a property is checked against both its own schema and every pattern it matches
+        const both = { type: 'object', properties: { 'x-id': { type: 'string' } }, patternProperties: { '^x-': { enum: ['a', 'b'] } } };
+        assert.deepStrictEqual(validateArguments(both, { 'x-id': 'c' }), ['property "x-id" must be one of a, b']);
+        // with a pattern that is not a regular expression, there is no telling which properties are additional
+        assert.deepStrictEqual(validateArguments({ type: 'object', patternProperties: { '(': {} }, additionalProperties: false }, { any: 1 }), []);
+    });
+
     it('should accept anything without a schema, and ignore keywords it does not support', function() {
         assert.deepStrictEqual(validateArguments(undefined, { a: 1 }), []);
         assert.deepStrictEqual(validateArguments({ type: 'object', properties: { n: { type: 'number', minimum: 10 } } }, { n: 1 }), []);

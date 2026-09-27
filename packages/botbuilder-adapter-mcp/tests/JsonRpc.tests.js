@@ -72,6 +72,14 @@ describe('JsonRpc framing and dispatch', function() {
         assert.deepStrictEqual(errors.map((m) => [m.id, m.error.code]), [[null, -32600], ['m', -32600], [null, -32600], ['p', -32600]]);
     });
 
+    it('should answer a request with a null id with -32600, as MCP does not allow null ids', async function() {
+        t.raw(JSON.stringify({ jsonrpc: '2.0', id: null, method: 'ping' }) + '\n');
+        const response = await t.waitFor((m) => m.id === null);
+        assert.deepStrictEqual(response, { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } });
+        assert.deepStrictEqual(await t.adapter.handleMessage({ jsonrpc: '2.0', id: null, method: 'ping' }), response);
+        assert.deepStrictEqual(await t.adapter.handleMessage({ jsonrpc: '2.0', id: 0, method: 'ping' }), { jsonrpc: '2.0', id: 0, result: {} });
+    });
+
     it('should answer a batch with an array of responses, skipping notifications', async function() {
         t.raw(JSON.stringify([
             { jsonrpc: '2.0', id: 1, method: 'ping' },

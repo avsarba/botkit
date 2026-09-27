@@ -60,6 +60,22 @@ function jsonEqual(a: any, b: any): boolean {
 }
 
 /**
+ * Compile a `patternProperties` pattern: as JSON Schema tools do (with the `u` flag) if possible, else as a plain regular expression.
+ * Returns null for a pattern that is not a regular expression at all.
+ */
+function compilePattern(pattern: string): RegExp | null {
+    try {
+        return new RegExp(pattern, 'u');
+    } catch (err) {
+        try {
+            return new RegExp(pattern);
+        } catch (err2) {
+            return null;
+        }
+    }
+}
+
+/**
  * Check one value against a schema and add any problems to `problems`.
  * @param label How the value is named in messages, such as `property "size"` or `arguments`.
  * @param path The dotted path of the value, used to name nested properties. Empty for the arguments object itself.
@@ -86,6 +102,19 @@ function check(schema: any, value: any, label: string, path: string, problems: s
 
     if (isPlainObject(value)) {
         const properties = isPlainObject(schema.properties) ? schema.properties : {};
+        const patterns: { regex: RegExp; schema: any }[] = [];
+        // with a pattern that cannot be compiled, there is no telling which properties are additional
+        let unknownPatterns = false;
+        if (isPlainObject(schema.patternProperties)) {
+            Object.keys(schema.patternProperties).forEach((pattern) => {
+                const regex = compilePattern(pattern);
+                if (regex) {
+                    patterns.push({ regex: regex, schema: schema.patternProperties[pattern] });
+                } else {
+                    unknownPatterns = true;
+                }
+            });
+        }
         if (Array.isArray(schema.required)) {
             schema.required.forEach((key) => {
                 if (!Object.prototype.hasOwnProperty.call(value, key) || value[key] === undefined) {
@@ -97,9 +126,17 @@ function check(schema: any, value: any, label: string, path: string, problems: s
             if (value[key] === undefined) {
                 return;
             }
-            if (Object.prototype.hasOwnProperty.call(properties, key)) {
+            const named = Object.prototype.hasOwnProperty.call(properties, key);
+            if (named) {
                 check(properties[key], value[key], `property "${ child(key) }"`, child(key), problems, depth + 1);
-            } else if (schema.additionalProperties === false) {
+            }
+            // as in JSON Schema, a property is checked against every pattern it matches, and is additional only if it matches none
+            const matching = patterns.filter((pattern) => pattern.regex.test(key));
+            matching.forEach((pattern) => check(pattern.schema, value[key], `property "${ child(key) }"`, child(key), problems, depth + 1));
+            if (named || matching.length || unknownPatterns) {
+                return;
+            }
+            if (schema.additionalProperties === false) {
                 problems.push(`unexpected property "${ child(key) }"`);
             } else if (isPlainObject(schema.additionalProperties)) {
                 check(schema.additionalProperties, value[key], `property "${ child(key) }"`, child(key), problems, depth + 1);
@@ -121,7 +158,7 @@ function check(schema: any, value: any, label: string, path: string, problems: s
  *
  * * `type`: `string`, `number`, `integer`, `boolean`, `object`, `array`, `null`, or an array of these;
  * * `enum`;
- * * `required`, `properties` and `additionalProperties` (`false`, or a schema for the extra properties), for nested objects too;
+ * * `required`, `properties`, `patternProperties` and `additionalProperties` (`false`, or a schema for the extra properties), for nested objects too;
  * * `items` (a single schema) for arrays.
  *
  * Other keywords, such as `minimum`, `pattern` or `oneOf`, are not checked: validate those in the tool's handler.

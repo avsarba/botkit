@@ -125,6 +125,8 @@ Choices: "Small" (send "small"), "Large" (send "large")
 (Waiting for your answer to "size". Call chat again with session "s1".)
 ```
 
+The text is written for the model: it shows the replies, their choices and the question the bot is waiting on. Unlike declared tools, the chat tool does not repeat its `structuredContent` as JSON text, which would double what the model reads on every turn.
+
 Clients that negotiated protocol version 2025-06-18 or later also receive `structuredContent`, which matches the tool's `outputSchema`:
 
 ```json
@@ -151,9 +153,9 @@ Clients that negotiated protocol version 2025-06-18 or later also receive `struc
 
 Things to know about the chat tool:
 
-* **Choices.** An agent should answer with a choice's `value`. If it sends a choice's title instead (ignoring case), the adapter sends the value, and `message.value` holds it too. The choices are forgotten once the question they belong to is answered.
+* **Choices.** An agent should answer with a choice's `value`. If it sends a choice's title instead (ignoring case), the adapter sends the value, and `message.value` holds it too. The choices are forgotten once the question they belong to is answered, or once it stops waiting for another reason, such as a scheduled job cancelling the dialog. The choices of a proactive message (see below) count for the question it asks, or for the next message when no question is waiting. A question that was already waiting keeps its own choices.
 * **Sessions.** Calls in one session run one at a time, in order. Calls in different sessions, and declared tool calls, run at the same time. The session's messages have `message.channel` set to `session:<session>` and `message.user` set to the client's name (see [clientId](../reference/mcp.md#McpAdapter)).
-* **Errors.** When a handler throws, the call returns `isError: true` with the text `The bot failed to handle this message: <error>`, plus any replies sent before the failure. The state of a failed turn is not saved, so a dialog that was waiting still waits. A call that takes longer than `turnTimeout` (15 seconds by default) returns `Turn timed out after 15000ms`; the turn keeps running, and anything it sends later goes to the session's outbox.
+* **Errors.** When a handler throws, the call returns `isError: true` with the text `The bot failed to handle this message: <error>`, plus any replies sent before the failure. Changes the failed turn made to the conversation state are not saved, so a dialog that was waiting still waits for its answer. The exception is `bot.beginDialog()` and `bot.replaceDialog()`, which save as soon as they are called. A call that takes longer than `turnTimeout` (15 seconds by default) returns `Turn timed out after 15000ms`; the turn keeps running, and anything it sends later goes to the session's outbox. The next call in that session waits for the turn to finish, for up to `turnTimeout` again, so the two never run at the same time. If the turn is still running by then, the call returns an error and does nothing, and the agent should try again later.
 * **Escaping.** Dialog templates escape `{{vars.x}}` for HTML. The adapter decodes these entities, so `{{vars.url}}` reaches the agent as a plain URL. Set `unescapeHtml: false` to turn this off.
 * Handlers can call `bot.toolError(message)` during a chat turn to mark the call as failed.
 
@@ -188,11 +190,11 @@ controller.on('tool:track_order', async (bot, message) => {
 });
 ```
 
-* The arguments are checked against `inputSchema` before the handler runs. Invalid arguments return a tool error that tells the agent what to fix, such as `Invalid arguments for tool "track_order": missing required property "order_id"`. The check covers `type`, `enum`, `required`, `properties`, `additionalProperties` and `items`; validate other constraints in the handler.
+* The arguments are checked against `inputSchema` before the handler runs. Invalid arguments return a tool error that tells the agent what to fix, such as `Invalid arguments for tool "track_order": missing required property "order_id"`. The check covers `type`, `enum`, `required`, `properties`, `patternProperties`, `additionalProperties` and `items`; validate other constraints in the handler.
 * `message.value` holds the arguments, and `message.mcp` is `{ requestId, tool }`.
 * Text sent with `bot.say()` is returned as a text item. `bot.toolResult(object)` sets the structured result, which is also returned as JSON text for older clients. `bot.toolError(message)` marks the call as failed. A handler that throws also fails the call.
-* A tool with an `outputSchema` must call `bot.toolResult()`, or the call fails.
-* Every call runs in a conversation of its own, which is deleted from storage afterwards. So tool calls never disturb a dialog waiting in a chat session, and they are not queued. Tool handlers should not start dialogs: use the chat tool for conversations.
+* A tool with an `outputSchema` must call `bot.toolResult()` with a result that matches it, or the call fails. The result is checked the same way as the arguments, because clients reject a structured result that does not match the schema. In the example above, an order whose `eta` is `null` would fail, since `eta_minutes` must be a number: declare it as `{ type: ['number', 'null'] }` to allow that.
+* Every call runs in a conversation of its own, `tool:<name>:<n>`, whose state is deleted from storage afterwards. So tool calls never disturb a dialog waiting in a chat session, and they are not queued. Once a call has finished, a later call reuses its conversation id, so storage does not grow with every call. Tool handlers should not start dialogs: use the chat tool for conversations.
 * Declare tools before the client connects. The server tells clients that its tool list does not change.
 
 ### Proactive messages
@@ -206,6 +208,8 @@ await bot.say('Your pizza is on its way.');
 ```
 
 Messages sent outside a tool call go to the session's outbox. The next chat call in that session returns them in `proactive` and at the top of its text, marked `[message received while you were away]`. The adapter also sends each one to the client right away as a `notifications/message` log notification with `data.session` set. Up to `maxOutbox` messages (50 by default) are kept per session, and older ones are dropped first. A proactive bot can also start a dialog in a session with `bot.beginDialog()`; the agent then sees the question on its next chat call.
+
+A session's dialog state belongs to the client: Botkit stores it under the session and `message.user`, which is the [clientId](../reference/mcp.md#McpAdapter). The client id comes from the name the client sends in `initialize`, and is `mcp-client` until then. So start proactive dialogs once the client has connected, for example from a job scheduled during a chat call, and not while the bot starts up. A dialog started before `initialize`, or for a client with another name, is stored under the other id: the agent still receives its messages, but cannot answer its questions.
 
 `adapter.continueConversation(reference, logic)` works the same way. Its turns are not queued behind chat calls, so a scheduled job never waits for a slow chat turn. In the rare case that a job and a chat call change the same session's dialog at the same moment, the later save wins.
 
@@ -236,39 +240,60 @@ It implements the stdio transport and this subset of the protocol, with no depen
 * notifications `notifications/initialized` and `notifications/cancelled` from the client, and `notifications/message` and `notifications/progress` to the client;
 * JSON-RPC batches.
 
-Resources, prompts, sampling, elicitation, completions and the Streamable HTTP transport are not supported. A cancelled request gets no response, but its handler keeps running.
+Resources, prompts, sampling, elicitation, completions and the Streamable HTTP transport are not supported. A cancelled request gets no response, but its handler keeps running. What a cancelled chat call would have returned, the bot's replies and the waiting messages it collected, goes back to the session's outbox for the next call.
 
 ### Keep stdout clean
 
 stdout carries the protocol, so anything else written to it corrupts the stream and breaks the connection.
 
-* While the adapter is open, it sends `console.log`, `console.info`, `console.debug` and `console.dir` to stderr (see the `redirectConsole` option). Create the adapter before the Botkit controller, so this also covers Botkit's own start-up messages.
+* While the adapter is open, it sends `console.log`, `console.info`, `console.debug` and `console.dir` to stderr (see the `redirectConsole` option). Create the adapter before the Botkit controller, so this also covers Botkit's own start-up messages. `controller.shutdown()` leaves the console redirected, so your own `shutdown` handlers cannot write to stdout either. Call `adapter.close()` to restore it.
 * Never call `process.stdout.write()` in your code, and do not use libraries that print to stdout.
 * Pass `disable_console: true` and `disable_webserver: true` to Botkit, unless you also serve the web (see below).
 * `debug` logging, such as `DEBUG=botkit:*`, goes to stderr and is safe.
 
 ### Serve people and agents together
 
-Add the adapter to a bot that already has a primary adapter with `controller.usePlugin()`. People reach the bot through the web adapter, and agents through MCP on stdio:
+An MCP client starts its own copy of an stdio server for every agent session. It runs your command, talks over that process's stdin and stdout, and ends the process when the session ends. So don't attach the McpAdapter to the web bot that people use: every agent session would start another copy of the whole web bot, each trying to bind the web port.
+
+Instead, keep your features in modules and give agents their own entry point, the way the [Ops Desk example](https://github.com/howdyai/botkit/tree/main/packages/examples/ops-desk) does. The two processes run the same handlers and dialogs:
 
 ```javascript
+// web.js: the bot people use, a long-running web service
 const { Botkit } = require('botkit');
 const { WebAdapter } = require('botbuilder-adapter-web');
-const { McpAdapter, McpBotWorker } = require('botbuilder-adapter-mcp');
 
-const mcp = new McpAdapter({ serverInfo: { name: 'pizza-bot', version: '1.0.0' } });
 const controller = new Botkit({ adapter: new WebAdapter() });
-controller.usePlugin(mcp);
-
-controller.hears('hello', 'message', async (bot, message) => {
-    const who = bot instanceof McpBotWorker ? 'agent' : 'human';
-    await bot.reply(message, `Hello, ${ who }!`);
-});
+controller.loadModules(__dirname + '/features');
 ```
 
-For proactive messages to agents, spawn the bot for the MCP adapter: `await controller.spawn({}, mcp)`. Messages from agents have `message.incoming_message.channelId` set to `mcp`. Webhook requests still go to the primary adapter only.
+```javascript
+// mcp.js: the entry point agents start, one process per agent session
+const { Botkit } = require('botkit');
+const { McpAdapter } = require('botbuilder-adapter-mcp');
 
-By default the whole bot shuts down when the agent closes stdin. Pass `shutdownOnClose: false` to keep serving the web after the agent disconnects.
+const controller = new Botkit({
+    adapter: new McpAdapter({ serverInfo: { name: 'pizza-bot', version: '1.0.0' } }),
+    disable_webserver: true,
+    disable_console: true
+});
+controller.loadModules(__dirname + '/features');
+```
+
+```javascript
+// features/hello.js: shared by both entry points
+const { McpBotWorker } = require('botbuilder-adapter-mcp');
+
+module.exports = function(controller) {
+    controller.hears('hello', 'message', async (bot, message) => {
+        const who = bot instanceof McpBotWorker ? 'agent' : 'human';
+        await bot.reply(message, `Hello, ${ who }!`);
+    });
+};
+```
+
+Messages from agents have `message.incoming_message.channelId` set to `mcp`. To share data such as orders or tickets between the two, give both processes the same storage or database. If you use [botkit-plugin-scheduler](../plugins/scheduler.md), enable it in the web process only: the scheduler is designed for one process, and every process that loads it runs every job.
+
+You can still add the adapter to a bot with a different primary adapter by calling `controller.usePlugin(mcp)`, as long as that bot runs as a process the agent starts, not as a shared service. Pass `shutdownOnClose: false` if the bot should keep running after the agent closes stdin.
 
 ### Options
 
@@ -280,9 +305,9 @@ By default the whole bot shuts down when the agent closes stdin. Pass `shutdownO
 | instructions | a description of the chat tool | Instructions for the agent, sent in the `initialize` result.
 | chatTool | `{ name: 'chat' }` | The chat tool's `name`, `title` and `description`, or `false` to offer only declared tools.
 | turnTimeout | `15000` | The longest a tool call may take, in milliseconds. 0 means no limit.
-| redirectConsole | `true` when output is `process.stdout` | Send console output to stderr until the adapter is closed.
+| redirectConsole | `true` when output is `process.stdout` | Send console output to stderr until `adapter.close()`.
 | autoStart | `true` | Start listening when Botkit is ready. Otherwise call `adapter.listen()`.
-| shutdownOnClose | `true` | Call `controller.shutdown()` when stdin closes.
+| shutdownOnClose | `true` | Call `controller.shutdown()` when stdin ends, including when the process has no stdin.
 | maxOutbox | `50` | The most proactive messages kept per session.
 | unescapeHtml | `true` | Decode the HTML entities that dialog templates add.
 
@@ -386,3 +411,4 @@ Botkit is a part of the [Microsoft Bot Framework](https://dev.botframework.com).
 Want to contribute? [Read the contributor guide](https://github.com/howdyai/botkit/blob/master/CONTRIBUTING.md)
 
 Botkit is released under the [MIT Open Source license](https://github.com/howdyai/botkit/blob/master/LICENSE.md)
+
